@@ -15,6 +15,8 @@ enum AppState {
     APP_SYNC_SEND_FLOMO,
     APP_BT_MANAGE,
     APP_FILE_MANAGER,
+    APP_GTD,
+    APP_OUTLINE,
     APP_QUIT,
 };
 
@@ -37,6 +39,7 @@ struct ScreenContext {
 #define KEY_LEFT    0x82
 #define KEY_RIGHT   0x83
 #define KEY_IME_TOGGLE 0x84
+#define KEY_CTRL_ENTER 0x85
 
 // Screen entry points (screens that remain in pjournal_app.cpp)
 void screen_main_init();
@@ -47,3 +50,10 @@ AppState screen_browser_handle(int key, ScreenContext &ctx);
 
 void screen_viewer_init(const std::string &filename);
 AppState screen_viewer_handle(int key, ScreenContext &ctx);
+
+// GTD / Outline screens
+void screen_gtd_init();
+AppState screen_gtd_handle(int key, ScreenContext &ctx);
+
+void screen_outline_init();
+AppState screen_outline_handle(int key, ScreenContext &ctx);

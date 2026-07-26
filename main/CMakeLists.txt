@@ -16,15 +16,17 @@ idf_component_register(SRCS
     "flomo_client.cpp"
     "deepseek_client.cpp"
     "pcf85063.cpp"
+    "json_parser.cpp"
     "json_utils.cpp"
     "ime/IME.cpp"
+    "screen_gtd.cpp"
+    "screen_outline.cpp"
     INCLUDE_DIRS "."
     EMBED_FILES
         "ime/ime_table_pinyin.bin"
         "ime/liangfen.bin"
         "terminus28.fnt"
         "terminus22.fnt"
-        "terminus20.fnt"
     PRIV_REQUIRES
         spi_flash
         nvs_flash

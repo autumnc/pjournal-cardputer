@@ -28,6 +28,7 @@ static const char *TAG = "BtKeybrd";
 #define KEY_LEFT    0x82
 #define KEY_RIGHT   0x83
 #define KEY_IME_TOGGLE 0x84
+#define KEY_CTRL_ENTER 0x85
 
 // HID Usage ID → ASCII
 static const uint8_t s_asc_low[] = {
@@ -235,6 +236,12 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                     // Ctrl+Space → IME toggle
                     uint8_t toggle = KEY_IME_TOGGLE;
                     xQueueSendToBack(s_queue, &toggle, 0);
+                    continue;
+                }
+                if (ctrl && kc == 40) {
+                    // Ctrl+Enter → special key
+                    uint8_t ce = KEY_CTRL_ENTER;
+                    xQueueSendToBack(s_queue, &ce, 0);
                     continue;
                 }
 
@@ -605,6 +612,9 @@ void BtKeyboard::checkKeyRepeat() {
                 } else if (ctrl && kc == 44) {
                     uint8_t toggle = KEY_IME_TOGGLE;
                     xQueueSendToBack(s_queue, &toggle, 0);
+                } else if (ctrl && kc == 40) {
+                    uint8_t ce = KEY_CTRL_ENTER;
+                    xQueueSendToBack(s_queue, &ce, 0);
                 } else {
                     uint8_t ascii = hid_to_ascii(kc, s_last_mod);
                     if (ascii) xQueueSendToBack(s_queue, &ascii, 0);

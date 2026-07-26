@@ -81,6 +81,8 @@ AppState screen_main_handle(int key, ScreenContext &ctx) {
     ui_draw_text_centered(y, "[f] 自由写作"); y += FONT_H;
     if (g_journal.totalEntries() > 0) { ui_draw_text_centered(y, "[v] 查看过往日记"); y += FONT_H; }
     ui_draw_text_centered(y, "[w] 同步WebDAV"); y += FONT_H;
+    ui_draw_text_centered(y, "[t] GTD任务管理"); y += FONT_H;
+    ui_draw_text_centered(y, "[o] 大纲写作"); y += FONT_H;
     ui_draw_text_centered(y, "[s] 设置"); y += FONT_H;
 
     int bpct = battery_pct();
@@ -96,6 +98,8 @@ AppState screen_main_handle(int key, ScreenContext &ctx) {
     else if ((key=='v'||key=='V') && g_journal.totalEntries()>0) ctx.nextState=APP_BROWSER;
     else if (key=='w'||key=='W') ctx.nextState=APP_SYNC_WEBDAV;
     else if (key=='s'||key=='S') ctx.nextState=APP_SETTINGS;
+    else if (key=='t'||key=='T') ctx.nextState=APP_GTD;
+    else if (key=='o'||key=='O') ctx.nextState=APP_OUTLINE;
     else if (key=='q'||key=='Q') ctx.nextState=APP_QUIT;
     return ctx.nextState;
 }

@@ -462,23 +462,48 @@ void IME::lookup() {
         return;
     }
 
-    // Phase 1: user dict single char
+    // Phase 1: user dict (single char + phrases) — priority over dictionary
     {
         std::vector< std::pair<int, std::string> > userSingleFreq;
+        std::vector< std::pair<int, std::string> > userWordFreq;
         for (auto &p : _userWords) {
-            if (p.word.length() != 3) continue;
             if ((int)p.code.length() < qlen) continue;
             if (strncmp(p.code.c_str(), q, qlen) != 0) continue;
-            bool found = false;
-            for (auto &uf : userSingleFreq) {
-                if (uf.second == p.word) {
-                    found = true;
-                    if (uf.first < p.count) uf.first = p.count;
-                    break;
+            if (p.word.length() <= 3) {
+                // single char
+                bool found = false;
+                for (auto &uf : userSingleFreq) {
+                    if (uf.second == p.word) {
+                        found = true;
+                        if (uf.first < p.count) uf.first = p.count;
+                        break;
+                    }
                 }
+                if (!found) userSingleFreq.push_back({p.count, p.word});
+            } else {
+                // phrase
+                bool found = false;
+                for (auto &uf : userWordFreq) {
+                    if (uf.second == p.word) {
+                        found = true;
+                        if (uf.first < p.count) uf.first = p.count;
+                        break;
+                    }
+                }
+                if (!found) userWordFreq.push_back({p.count, p.word});
             }
-            if (!found) userSingleFreq.push_back({p.count, p.word});
         }
+        // Phrases first (higher priority), then single chars
+        std::sort(userWordFreq.begin(), userWordFreq.end(),
+            [](const std::pair<int,std::string> &a, const std::pair<int,std::string> &b) {
+                return a.first > b.first;
+            });
+        for (auto &f : userWordFreq) {
+            _all.push_back(f.second);
+            _candLen.push_back(0);
+            if (_all.size() >= 100) break;
+        }
+        if (_all.size() >= 100) { buildPage(); return; }
         std::sort(userSingleFreq.begin(), userSingleFreq.end(),
             [](const std::pair<int,std::string> &a, const std::pair<int,std::string> &b) {
                 return a.first > b.first;
@@ -525,36 +550,8 @@ void IME::lookup() {
     }
     if (_all.size() >= 100) { buildPage(); return; }
 
-    // Phase 3: user dict phrase match
-    {
-        std::vector< std::pair<int, std::string> > userWordFreq;
-        for (auto &p : _userWords) {
-            if (p.word.length() <= 3) continue;
-            if ((int)p.code.length() < qlen) continue;
-            if (strncmp(p.code.c_str(), q, qlen) != 0) continue;
-            bool found = false;
-            for (auto &uf : userWordFreq) {
-                if (uf.second == p.word) {
-                    found = true;
-                    if (uf.first < p.count) uf.first = p.count;
-                    break;
-                }
-            }
-            if (!found) userWordFreq.push_back({p.count, p.word});
-        }
-        std::sort(userWordFreq.begin(), userWordFreq.end(),
-            [](const std::pair<int,std::string> &a, const std::pair<int,std::string> &b) {
-                return a.first > b.first;
-            });
-        for (auto &f : userWordFreq) {
-            _all.push_back(f.second);
-            _candLen.push_back(0);
-            if (_all.size() >= 100) break;
-        }
-        if (_all.size() >= 100) { buildPage(); return; }
-    }
-
     // Phase 4: phrase prefix match (word dictionary)
+    size_t p4Start = _all.size();
     if (hasVowel && _wordCount > 0 && _wordData) {
         size_t wlo = 0, whi = _wordDataSize;
         if (qlen >= 2) {
@@ -602,22 +599,26 @@ void IME::lookup() {
             }
         }
     }
-    // Sort candidates by consumed length descending (phrases first)
-    if (_all.size() > 1) {
-        std::vector<int> order(_all.size());
-        for (size_t i = 0; i < order.size(); i++) order[i] = (int)i;
-        std::stable_sort(order.begin(), order.end(),
-            [this](int a, int b) { return _candLen[a] > _candLen[b]; });
-        std::vector<std::string> sortedAll;
-        std::vector<int> sortedLen;
-        sortedAll.reserve(_all.size());
-        sortedLen.reserve(_candLen.size());
-        for (int i : order) {
-            sortedAll.push_back(std::move(_all[i]));
-            sortedLen.push_back(_candLen[i]);
+    // Sort Phase 4 entries by consumed length descending
+    {
+        size_t p4End = _all.size();
+        size_t p4Count = p4End - p4Start;
+        if (p4Count > 1) {
+            std::vector<int> order(p4Count);
+            for (size_t i = 0; i < order.size(); i++) order[i] = (int)(p4Start + i);
+            std::stable_sort(order.begin(), order.end(),
+                [this](int a, int b) { return _candLen[a] > _candLen[b]; });
+            std::vector<std::string> sortedAll(_all.begin(), _all.begin() + p4Start);
+            std::vector<int> sortedLen(_candLen.begin(), _candLen.begin() + p4Start);
+            sortedAll.reserve(_all.size());
+            sortedLen.reserve(_candLen.size());
+            for (int i : order) {
+                sortedAll.push_back(std::move(_all[i]));
+                sortedLen.push_back(_candLen[i]);
+            }
+            _all.swap(sortedAll);
+            _candLen.swap(sortedLen);
         }
-        _all.swap(sortedAll);
-        _candLen.swap(sortedLen);
     }
     if (_all.size() >= 100) { buildPage(); return; }
 

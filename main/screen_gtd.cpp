@@ -1,0 +1,2100 @@
+#include "screen_gtd.h"
+#include "font_renderer.h"
+#include "json_parser.h"
+#include "journal_storage.h"
+#include "ui_helpers.h"
+#include "ime/IME.h"
+#include <cstdio>
+#include <cstring>
+#include <ctime>
+#include <algorithm>
+#include <set>
+#include <sys/stat.h>
+
+extern void *g_u8g2;
+extern "C" {
+    extern void u8g2_SetDrawColor(void *u8g2, int color);
+    extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
+    extern void u8g2_DrawHLine(void *u8g2, int x, int y, int w);
+    extern void u8g2_DrawFrame(void *u8g2, int x, int y, int w, int h);
+}
+
+// ── Constants ────────────────────────────────────────────────────────────
+#define DATA_DIR  "/sdcard/gtd"
+#define DATA_FILE DATA_DIR "/gtd.json"
+#define ARCHIVE_DIR DATA_DIR "/archive"
+
+static const char *VIEW_LABELS[] = {"收集箱", "下一步", "等待", "项目", "已完成"};
+enum View { V_INBOX, V_NEXT, V_WAITING, V_PROJECT, V_COMPLETED, V_CONCAT };
+// V_CONCAT used as count, after V_COMPLETED
+static const int V_COUNT = 5;
+
+static const char *STATUS_LABELS[] = {"todo", "doing", "done", "waiting"};
+static const char *STATUS_DISPLAY[] = {"待办", "进行中", "已完成", "等待中"};
+static const char *PRIORITY_LABELS[] = {"A", "B", "C"};
+static const char *PRIORITY_DISPLAY[] = {"A 高", "B 中", "C 低"};
+
+enum Mode { M_BROWSE, M_ADD, M_DETAIL, M_EDIT_FIELD, M_FILTER, M_RENAME, M_CONFIRM, M_ADD_PROJECT, M_RENAME_PROJECT, M_PICKER, M_CALENDAR, M_HELP, M_EDIT_NOTE };
+
+// Picker option for popup panel
+struct PickerOpt {
+    std::string value;   // actual JSON value
+    std::string display; // display text
+};
+
+// ── State ────────────────────────────────────────────────────────────────
+static struct {
+    int view = 0;
+    int sel = 0;
+    int scroll = 0;
+    int mode = M_BROWSE;
+    JsonValue data;           // full task data from file
+    std::vector<int> filtered; // indices into data["tasks"] array
+
+    // detail / edit
+    int detailTaskIdx = -1;   // index in data["tasks"]
+    int detailField = 0;
+
+    // text editing
+    std::string editBuf;
+    int editCur = 0;
+    bool imeActive = false;
+    std::string pendingParent;
+    std::string pendingProject;  // auto-set project for new task in project view
+
+    // filter
+    std::string filterText;
+
+    // Project drill-down
+    std::vector<std::string> projectList;
+    int projectDrillIdx = -1;  // selected project index in projectList, -1 = show list
+
+    // Insertion position for a/i key (index in tasks array, -1 = append)
+    int insertAfter = -1;
+
+    // project selector index (for 'j' type field editing)
+    int projectSelIdx = -1;
+
+    // picker popup
+    std::vector<PickerOpt> pickerOpts;
+    int pickerSel = 0;
+    int pickerField = -1;  // which detail field the picker is for
+
+    // calendar popup
+    int calYear = 2026;
+    int calMonth = 1;
+    int calDay = 1;
+    int calSelDay = 1;
+
+    // help dialog
+    int helpScroll = 0;
+    int helpPrevMode = M_BROWSE;
+
+    // note editor
+    std::vector<std::string> noteLines;
+    int noteRow = 0;    // cursor line
+    int noteCol = 0;    // cursor byte offset in line
+    int noteScroll = 0;
+    std::vector<VRow> noteVrows;
+    bool noteVrowsDirty = true;
+
+    // confirm dialog
+    std::string confirmMsg;
+    int confirmIdx = -1;
+
+    // project rename target
+    std::string renameTargetProject;
+} g;
+
+// ── Tree view (for Project tab drill-down) ──────────────────────────────
+struct GtdTreeItem {
+    int taskIdx;
+    int depth;
+    bool isLast;
+    std::vector<bool> ancLast; // ancestor-is-last at each level 0..depth-1
+};
+static std::vector<GtdTreeItem> g_gtdTree;
+
+static void gtdTreeAddChildren(const JsonValue &tasks, int startFi,
+    int depth, const std::vector<bool> &ancLast,
+    const std::vector<int> &scope, std::vector<bool> &used)
+{
+    if (depth > 50) return;
+    std::string parentId = tasks[scope[startFi]]["id"].asString();
+
+    std::vector<int> childFis;
+    for (int fi = 0; fi < (int)scope.size(); fi++) {
+        if (used[fi]) continue;
+        if (tasks[scope[fi]]["parent"].asString() == parentId)
+            childFis.push_back(fi);
+    }
+
+    for (size_t ci = 0; ci < childFis.size(); ci++) {
+        int fi = childFis[ci];
+        used[fi] = true;
+
+        GtdTreeItem item;
+        item.taskIdx = scope[fi];
+        item.depth = depth;
+        item.isLast = (ci == childFis.size() - 1);
+        item.ancLast = ancLast;
+        g_gtdTree.push_back(item);
+
+        std::vector<bool> childAnc = ancLast;
+        childAnc.push_back(item.isLast);
+        gtdTreeAddChildren(tasks, fi, depth + 1, childAnc, scope, used);
+    }
+}
+
+static void buildGtdTree() {
+    g_gtdTree.clear();
+    if (g.view != V_PROJECT || g.projectDrillIdx < 0) return;
+    auto &tasks = g.data["tasks"];
+    if (!tasks.isArray() || g.filtered.empty()) return;
+
+    // Collect IDs in the project scope for parent-exists checks
+    std::set<std::string> idsInScope;
+    for (int fi : g.filtered) {
+        idsInScope.insert(tasks[fi]["id"].asString());
+    }
+
+    // Copy filtered list as a scope for tree building
+    std::vector<int> scope = g.filtered;
+    std::vector<bool> used(scope.size(), false);
+
+    // Pass 1: add roots (empty parent, or parent not in scope)
+    for (int fi = 0; fi < (int)scope.size(); fi++) {
+        if (used[fi]) continue;
+        std::string pid = tasks[scope[fi]]["parent"].asString();
+        if (pid.empty() || idsInScope.find(pid) == idsInScope.end()) {
+            used[fi] = true;
+            GtdTreeItem item;
+            item.taskIdx = scope[fi];
+            item.depth = 0;
+            item.isLast = true; // tentative
+            g_gtdTree.push_back(item);
+        }
+    }
+
+    // Pass 2: add children recursively for each root
+    // Re-walk the tree to fix isLast and add children properly
+    // (Simpler: rebuild from scratch using the recursive approach)
+    g_gtdTree.clear();
+
+    // Rebuild properly with recursive children
+    for (int fi = 0; fi < (int)scope.size(); fi++) {
+        if (used[fi]) { // still true from Pass 1 for those we marked
+            // These are roots — process them
+        }
+    }
+
+    // Start fresh
+    std::vector<bool> used2(scope.size(), false);
+    std::vector<int> roots;
+    for (int fi = 0; fi < (int)scope.size(); fi++) {
+        std::string pid = tasks[scope[fi]]["parent"].asString();
+        if (pid.empty() || idsInScope.find(pid) == idsInScope.end()) {
+            roots.push_back(fi);
+        }
+    }
+    // Determine isLast for each root
+    for (size_t ri = 0; ri < roots.size(); ri++) {
+        int fi = roots[ri];
+        used2[fi] = true;
+        GtdTreeItem item;
+        item.taskIdx = scope[fi];
+        item.depth = 0;
+        item.isLast = (ri == roots.size() - 1);
+        g_gtdTree.push_back(item);
+
+        std::vector<bool> childAnc;
+        childAnc.push_back(item.isLast);
+        gtdTreeAddChildren(tasks, fi, 1, childAnc, scope, used2);
+    }
+
+    // Pass 3: any remaining orphans (circular refs etc.) as roots
+    for (int fi = 0; fi < (int)scope.size(); fi++) {
+        if (used2[fi]) continue;
+        used2[fi] = true;
+        GtdTreeItem item;
+        item.taskIdx = scope[fi];
+        item.depth = 0;
+        item.isLast = true;
+        g_gtdTree.push_back(item);
+    }
+}
+
+// ── Filter helpers ───────────────────────────────────────────────────────
+static bool taskMatchesView(const JsonValue &task, int view) {
+    std::string status = task["status"].asString("todo");
+    if (view == V_INBOX)     return status == "todo";
+    if (view == V_NEXT)      return status == "doing";
+    if (view == V_WAITING)   return status == "waiting";
+    if (view == V_PROJECT)   return !task["project"].asString().empty();
+    if (view == V_COMPLETED) return status == "done";
+    return false;
+}
+
+static bool isInProjectList() { return g.view == V_PROJECT && g.projectDrillIdx < 0; }
+
+static void rebuildFilter() {
+    g.filtered.clear();
+    auto &tasks = g.data["tasks"];
+    if (!tasks.isArray()) return;
+    for (int i = 0; i < (int)tasks.size(); i++) {
+        auto &t = tasks[i];
+        if (!taskMatchesView(t, g.view)) continue;
+        if (g.view == V_PROJECT && g.projectDrillIdx >= 0) {
+            std::string proj = t["project"].asString();
+            if (proj.empty() || proj != g.projectList[g.projectDrillIdx])
+                continue;
+        }
+        if (!g.filterText.empty()) {
+            std::string title = t["title"].asString();
+            std::string note  = t["note"].asString();
+            if (title.find(g.filterText) == std::string::npos &&
+                note.find(g.filterText) == std::string::npos)
+                continue;
+        }
+        g.filtered.push_back(i);
+    }
+    if (g.sel >= (int)g.filtered.size()) g.sel = (int)g.filtered.size() - 1;
+    if (g.sel < 0) g.sel = 0;
+
+    // Build tree view and reorder filtered to tree order for project drill-down
+    if (g.view == V_PROJECT && g.projectDrillIdx >= 0) {
+        buildGtdTree();
+        g.filtered.clear();
+        for (auto &ti : g_gtdTree) g.filtered.push_back(ti.taskIdx);
+        if (g.sel >= (int)g.filtered.size()) g.sel = (int)g.filtered.size() - 1;
+        if (g.sel < 0) g.sel = 0;
+    }
+}
+
+static void buildProjectList() {
+    g.projectList.clear();
+    // Add projects from stored "projects" array
+    auto &projs = g.data["projects"];
+    if (projs.isArray()) {
+        for (int i = 0; i < (int)projs.size(); i++) {
+            std::string name = projs[i].asString();
+            if (name.empty()) continue;
+            bool dup = false;
+            for (auto &p : g.projectList) if (p == name) { dup = true; break; }
+            if (!dup) g.projectList.push_back(name);
+        }
+    }
+    // Add projects derived from tasks
+    auto &tasks = g.data["tasks"];
+    if (tasks.isArray()) {
+        for (int i = 0; i < (int)tasks.size(); i++) {
+            std::string proj = tasks[i]["project"].asString();
+            if (proj.empty()) continue;
+            bool dup = false;
+            for (auto &p : g.projectList) if (p == proj) { dup = true; break; }
+            if (!dup) g.projectList.push_back(proj);
+        }
+    }
+    std::sort(g.projectList.begin(), g.projectList.end());
+}
+
+// ── Data I/O ─────────────────────────────────────────────────────────────
+static void loadData() {
+    auto v = JsonValue::loadFromFile(DATA_FILE);
+    if (v.isNull() || !v.has("tasks") || !v["tasks"].isArray()) {
+        g.data = JsonValue::object();
+        g.data.set("tasks", JsonValue::array());
+    } else {
+        g.data = v;
+        // Purge null-type tasks from old bug
+        auto &tasks = g.data["tasks"];
+        int write = 0;
+        for (int i = 0; i < (int)tasks.size(); i++) {
+            if (!tasks[i].isNull())
+                tasks.elements[write++] = tasks[i];
+        }
+        tasks.elements.resize(write);
+    }
+    if (!g.data.has("projects") || !g.data["projects"].isArray())
+        g.data.set("projects", JsonValue::array());
+    g.view = 0; g.sel = 0; g.scroll = 0;
+    rebuildFilter();
+}
+
+static void saveData() {
+    if (!JsonValue::saveToFile(DATA_FILE, g.data)) {
+        // Save failed — try ensuring directory exists and retry once
+        mkdir(DATA_DIR, 0755);
+        JsonValue::saveToFile(DATA_FILE, g.data);
+    }
+}
+
+// ── ID generator ─────────────────────────────────────────────────────────
+static std::string makeId() {
+    time_t now; time(&now); struct tm *tm = localtime(&now);
+    char buf[32];
+    static int seq = 0;
+    snprintf(buf, sizeof(buf), "%02d%02d%02d_%02d%02d_%d",
+             tm->tm_year % 100, tm->tm_mon + 1, tm->tm_mday,
+             tm->tm_hour, tm->tm_min, seq++);
+    return buf;
+}
+// ── Export markdown ──────────────────────────────────────────────────────
+static std::string exportMD() {
+    std::string md = "# GTD 任务列表\n\n";
+    auto &tasks = g.data["tasks"];
+    if (!tasks.isArray()) return md;
+    for (int i = 0; i < (int)tasks.size(); i++) {
+        auto &t = tasks[i];
+        std::string status = t["status"].asString("todo");
+        std::string pri = t["priority"].asString();
+        std::string title = t["title"].asString();
+
+        const char *mark = "[ ]";
+        if (status == "doing") mark = "[→]";
+        else if (status == "done") mark = "[✓]";
+        else if (status == "waiting") mark = "[~]";
+
+        md += "- " + std::string(mark) + " " + title;
+        if (!pri.empty()) md += " **" + pri + "**";
+        md += "\n";
+    }
+    return md;
+}
+
+// ── UI drawing ───────────────────────────────────────────────────────────
+
+#define IME_CODE_Y (STATUS_Y - 2*FONT_H + g_font.ascent())
+#define IME_CAND_Y (STATUS_Y - FONT_H + g_font.ascent() - 3)
+
+static void drawIMEStatus() {
+    if (!g_ime.composing()) return;
+    std::string code = g_ime.displayCode();
+    int total = g_ime.totalCandidates();
+    int pageSize = g_ime.pageSize();
+    int curPage = g_ime.currentPage();
+    int totalPages = (total + pageSize - 1) / pageSize;
+    if (totalPages < 1) totalPages = 1;
+    char pageInfo[32];
+    snprintf(pageInfo, sizeof(pageInfo), "%d/%d", curPage, totalPages);
+    int sepY = IME_CODE_Y - 4;
+    int codeBaseline = sepY - 7;
+    {
+        int cw = g_font.textWidth(code.c_str()) + 8;
+        u8g2_SetDrawColor(g_u8g2, 1);
+        u8g2_DrawBox(g_u8g2, 4, codeBaseline - g_font.ascent(), cw, FONT_H);
+        u8g2_SetDrawColor(g_u8g2, 0);
+        g_font.drawText(4, codeBaseline, code.c_str(), false);
+        u8g2_SetDrawColor(g_u8g2, 1);
+    }
+    {
+        int tw = g_font.textWidth(pageInfo);
+        int pw = tw + 8;
+        int px = SCREEN_W - pw - 4;
+        u8g2_SetDrawColor(g_u8g2, 1);
+        u8g2_DrawBox(g_u8g2, px, codeBaseline - g_font.ascent(), pw, FONT_H);
+        u8g2_SetDrawColor(g_u8g2, 0);
+        g_font.drawText(px + 4, codeBaseline, pageInfo, false);
+        u8g2_SetDrawColor(g_u8g2, 1);
+    }
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W);
+    u8g2_SetDrawColor(g_u8g2, 1);
+    auto &cands = g_ime.candidates();
+    std::string candLine;
+    for (int i = 0; i < (int)cands.size(); i++) {
+        char idx[16];
+        snprintf(idx, sizeof(idx), "%d.", (i % pageSize) + 1);
+        std::string part = std::string(" ") + idx + cands[i];
+        int curW = g_font.textWidth(candLine.c_str());
+        int partW = g_font.textWidth(part.c_str());
+        if (curW + partW + 8 > SCREEN_W) break;
+        candLine += part;
+    }
+    {
+        int cw = g_font.textWidth(candLine.c_str()) + 8;
+        u8g2_SetDrawColor(g_u8g2, 1);
+        u8g2_DrawBox(g_u8g2, 4, IME_CAND_Y - g_font.ascent(), cw, FONT_H);
+        u8g2_SetDrawColor(g_u8g2, 0);
+        g_font.drawText(4, IME_CAND_Y, candLine.c_str(), false);
+        u8g2_SetDrawColor(g_u8g2, 1);
+    }
+}
+
+static void drawTabBar() {
+    int x = 0;
+    int tw = SCREEN_W / V_COUNT;
+    for (int v = 0; v < V_COUNT; v++) {
+        bool act = (v == g.view);
+        if (act) {
+            u8g2_SetDrawColor(g_u8g2, 0);
+            u8g2_DrawBox(g_u8g2, x, 0, tw, FONT_H + 2);
+            u8g2_SetDrawColor(g_u8g2, 1);
+            g_font.drawText(x + (tw - g_font.textWidth(VIEW_LABELS[v])) / 2,
+                            g_font.ascent(), VIEW_LABELS[v], false);
+        } else {
+            u8g2_SetDrawColor(g_u8g2, 0);
+            g_font.drawText(x + (tw - g_font.textWidth(VIEW_LABELS[v])) / 2,
+                            g_font.ascent(), VIEW_LABELS[v], false);
+        }
+        x += tw;
+    }
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawHLine(g_u8g2, 0, FONT_H + 2, SCREEN_W);
+}
+
+static const char *statusIcon(const std::string &s) {
+    if (s == "doing")   return "[→]";
+    if (s == "done")    return "[✓]";
+    if (s == "waiting") return "[~]";
+    return "[ ]";
+}
+
+static void drawDetail();  // forward declaration
+static void drawList();    // forward declaration
+static void drawHelp();    // forward declaration
+
+static void drawList() {
+    ui_clear();
+    drawTabBar();
+
+    int y = FONT_H + 6 + LINE_SPACING;
+
+    // Project list (top level)
+    if (g.view == V_PROJECT && g.projectDrillIdx < 0) {
+        buildProjectList();
+        int vis = (STATUS_Y - y + LINE_SPACING - 1) / LINE_SPACING;
+        if (vis < 1) vis = 1;
+        if (g.sel < g.scroll) g.scroll = g.sel;
+        if (g.sel >= g.scroll + vis) g.scroll = g.sel - vis + 1;
+        for (int i = 0; i < vis && (g.scroll + i) < (int)g.projectList.size(); i++) {
+            bool sel = (g.scroll + i == g.sel);
+            char buf[64];
+            snprintf(buf, sizeof(buf), "◆ %s", g.projectList[g.scroll + i].c_str());
+            ui_draw_text(4, y + i * LINE_SPACING, buf, sel);
+        }
+        if (g.projectList.empty()) {
+            ui_draw_text(4, y, "暂无项目 — 按n新建");
+        }
+        char sl[96];
+        snprintf(sl, sizeof(sl), "Enter展开 n:新建 d:删除 r:重命名 %d个项目", (int)g.projectList.size());
+        ui_draw_status(sl, "");
+        drawIMEStatus();
+        return;
+    }
+
+    // Project tree view (drill-down)
+    if (g.view == V_PROJECT && g.projectDrillIdx >= 0) {
+        if (g_gtdTree.empty()) {
+            ui_draw_text(8, y, "此项目暂无任务 — 按a添加");
+            char sl[96];
+            snprintf(sl, sizeof(sl), "a:添加 Tab:切换");
+            ui_draw_status(sl, "");
+            drawIMEStatus();
+            return;
+        }
+        auto &tasks = g.data["tasks"];
+        int maxY = g_ime.composing() ? (IME_CODE_Y - 4) : STATUS_Y;
+        int vis = (maxY - y + LINE_SPACING - 1) / LINE_SPACING;
+        if (vis < 1) vis = 1;
+        if (g.sel < g.scroll) g.scroll = g.sel;
+        if (g.sel >= g.scroll + vis) g.scroll = g.sel - vis + 1;
+
+        for (int i = 0; i < vis && (g.scroll + i) < (int)g_gtdTree.size(); i++) {
+            auto &ti = g_gtdTree[g.scroll + i];
+            bool sel = (g.scroll + i == g.sel);
+            auto &t = tasks[ti.taskIdx];
+            std::string title = t["title"].asString();
+            std::string status = t["status"].asString("todo");
+            std::string pri = t["priority"].asString();
+
+            // Build tree prefix using ├─ └─ │ symbols
+            std::string prefix;
+            if (ti.depth > 0) {
+                for (int a = 0; a < ti.depth; a++)
+                    prefix += ti.ancLast[a] ? "  " : "│ ";
+                prefix += ti.isLast ? "└─ " : "├─ ";
+            } else {
+                prefix = "◆ ";
+            }
+
+            char line[96];
+            snprintf(line, sizeof(line), "%s%s %s", prefix.c_str(), statusIcon(status), title.c_str());
+            ui_draw_text(4, y + i * LINE_SPACING, line, sel);
+
+            // Right-side info: priority badge position
+            int pri_w = 0, pri_x = SCREEN_W;
+            if (!pri.empty()) {
+                pri_w = g_font.textWidth(pri.c_str()) + 4;
+                pri_x = SCREEN_W - pri_w - 4;
+            }
+
+            // Progress + date before priority
+            std::string rightInfo;
+            int pct = (int)t["progress"].asNumber(0);
+            std::string due = t["due"].asString();
+            if (pct > 0) {
+                char buf[16]; snprintf(buf, sizeof(buf), "%d%%", pct);
+                rightInfo += buf;
+            }
+            if (!due.empty()) {
+                std::string dd;
+                size_t nd = 0;
+                for (char c : due) if (c == '-') nd++;
+                if (nd >= 2 && due.length() >= 5) dd = due.substr(due.length() - 5);
+                else dd = due;
+                if (!dd.empty()) {
+                    if (!rightInfo.empty()) rightInfo += " ";
+                    rightInfo += dd;
+                }
+            }
+            if (!rightInfo.empty()) {
+                int info_w = g_font.textWidth(rightInfo.c_str());
+                int info_x = pri_x - 6 - info_w;
+                g_font.drawText(info_x, y + i * LINE_SPACING, rightInfo.c_str(), false);
+            }
+
+            if (!pri.empty()) {
+                u8g2_SetDrawColor(g_u8g2, 0);
+                u8g2_DrawBox(g_u8g2, pri_x, y + i * LINE_SPACING - g_font.ascent(), pri_w, FONT_H);
+                u8g2_SetDrawColor(g_u8g2, 1);
+                g_font.drawText(pri_x + 2, y + i * LINE_SPACING, pri.c_str(), true);
+                u8g2_SetDrawColor(g_u8g2, 0);
+            }
+        }
+
+        char sl[96];
+        snprintf(sl, sizeof(sl), "a:添加 i:子任务 e:重命名 Enter:详情 Space:状态 d:删除 %d项", (int)g_gtdTree.size());
+        ui_draw_status(sl, "");
+        drawIMEStatus();
+        return;
+    }
+
+    int maxY = g_ime.composing() ? (IME_CODE_Y - 4) : STATUS_Y;
+    int vis = (maxY - y + LINE_SPACING - 1) / LINE_SPACING;
+    if (vis < 1) vis = 1;
+
+    if (g.sel < g.scroll) g.scroll = g.sel;
+    if (g.sel >= g.scroll + vis) g.scroll = g.sel - vis + 1;
+
+    auto &tasks = g.data["tasks"];
+    for (int i = 0; i < vis && (g.scroll + i) < (int)g.filtered.size(); i++) {
+        int ti = g.filtered[g.scroll + i];
+        auto &t = tasks[ti];
+        bool sel = (g.scroll + i == g.sel);
+        std::string title = t["title"].asString();
+        std::string status = t["status"].asString("todo");
+        std::string pri = t["priority"].asString();
+        std::string parent = t["parent"].asString();
+
+        char line[128];
+        if (sel) {
+            snprintf(line, sizeof(line), "%s %s", statusIcon(status), title.c_str());
+        } else {
+            snprintf(line, sizeof(line), "%s %s", statusIcon(status), title.c_str());
+        }
+
+        int indent = 0;
+        if (!parent.empty()) indent = 1;
+        int lx = 8 + indent * 12;
+
+        ui_draw_text(lx, y + i * LINE_SPACING, line, sel);
+
+        // Right-side info: priority badge position
+        int pri_w = 0, pri_x = SCREEN_W;
+        if (!pri.empty()) {
+            pri_w = g_font.textWidth(pri.c_str()) + 4;
+            pri_x = SCREEN_W - pri_w - 4;
+        }
+
+        // Progress + date before priority
+        std::string rightInfo;
+        int pct = (int)t["progress"].asNumber(0);
+        std::string due = t["due"].asString();
+        if (pct > 0) {
+            char buf[16]; snprintf(buf, sizeof(buf), "%d%%", pct);
+            rightInfo += buf;
+        }
+        if (!due.empty()) {
+            std::string dd;
+            size_t nd = 0;
+            for (char c : due) if (c == '-') nd++;
+            if (nd >= 2 && due.length() >= 5) dd = due.substr(due.length() - 5);
+            else dd = due;
+            if (!dd.empty()) {
+                if (!rightInfo.empty()) rightInfo += " ";
+                rightInfo += dd;
+            }
+        }
+        if (!rightInfo.empty()) {
+            int info_w = g_font.textWidth(rightInfo.c_str());
+            int info_x = pri_x - 6 - info_w;
+            g_font.drawText(info_x, y + i * LINE_SPACING, rightInfo.c_str(), false);
+        }
+
+        if (!pri.empty()) {
+            u8g2_SetDrawColor(g_u8g2, 0);
+            u8g2_DrawBox(g_u8g2, pri_x, y + i * LINE_SPACING - g_font.ascent(), pri_w, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 1);
+            g_font.drawText(pri_x + 2, y + i * LINE_SPACING, pri.c_str(), true);
+            u8g2_SetDrawColor(g_u8g2, 0);
+        }
+    }
+
+    if (!g.filterText.empty() && !g_ime.composing()) {
+        char fb[64];
+        snprintf(fb, sizeof(fb), "筛选: %s", g.filterText.c_str());
+        ui_draw_text(4, STATUS_Y - LINE_SPACING + 2, fb, true);
+    }
+
+    char statusLine[96];
+    snprintf(statusLine, sizeof(statusLine), "a:添加 e:重命名 Enter:详情 Space:状态 d:删除 Tab:切换 /:筛选 %d任务", (int)g.filtered.size());
+    ui_draw_status(statusLine, "");
+
+    drawIMEStatus();
+}
+
+// ── Draw add-task input ──────────────────────────────────────────────────
+static void drawAdd() {
+    ui_clear();
+    const char *addTitle = "添加新任务";
+    if (g.mode == M_RENAME) addTitle = "重命名任务";
+    else if (g.mode == M_ADD_PROJECT) addTitle = "新建项目";
+    else if (g.mode == M_RENAME_PROJECT) addTitle = "重命名项目";
+    ui_draw_text_centered(28, addTitle, false, true);
+    u8g2_DrawHLine(g_u8g2, 0, 28 + g_font.descent() + 4, SCREEN_W);
+
+    std::string display = g.editBuf.empty() ? " " : g.editBuf;
+    int ty = 28 + g_font.descent() + 12 + g_font.ascent();
+    ui_draw_text(4, ty, display.c_str());
+    // cursor
+    int cx = g_font.textWidth(g.editBuf.substr(0, g.editCur).c_str());
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawBox(g_u8g2, 4 + cx, ty + 4, 8, 3);
+    u8g2_SetDrawColor(g_u8g2, 1);
+
+    // IME at bottom of screen, no status bar reservation
+    if (g_ime.composing()) {
+        std::string code = g_ime.displayCode();
+        int total = g_ime.totalCandidates();
+        int pageSize = g_ime.pageSize();
+        int curPage = g_ime.currentPage();
+        int totalPages = (total + pageSize - 1) / pageSize;
+        if (totalPages < 1) totalPages = 1;
+        char pageInfo[32];
+        snprintf(pageInfo, sizeof(pageInfo), "%d/%d", curPage, totalPages);
+
+        int candBaseline = SCREEN_H - 9;
+        int sepY = candBaseline - FONT_H - 4;
+        int codeBaseline = sepY - 7;
+
+        // Code line
+        {
+            int cw = g_font.textWidth(code.c_str()) + 8;
+            u8g2_SetDrawColor(g_u8g2, 1);
+            u8g2_DrawBox(g_u8g2, 4, codeBaseline - g_font.ascent(), cw, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 0);
+            g_font.drawText(4, codeBaseline, code.c_str(), false);
+            u8g2_SetDrawColor(g_u8g2, 1);
+        }
+        // Page info
+        {
+            int tw = g_font.textWidth(pageInfo);
+            int pw = tw + 8;
+            int px = SCREEN_W - pw - 4;
+            u8g2_SetDrawColor(g_u8g2, 1);
+            u8g2_DrawBox(g_u8g2, px, codeBaseline - g_font.ascent(), pw, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 0);
+            g_font.drawText(px + 4, codeBaseline, pageInfo, false);
+            u8g2_SetDrawColor(g_u8g2, 1);
+        }
+        // Separator
+        u8g2_SetDrawColor(g_u8g2, 0);
+        u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W);
+        u8g2_SetDrawColor(g_u8g2, 1);
+        // Candidates
+        auto &cands = g_ime.candidates();
+        std::string candLine;
+        for (int i = 0; i < (int)cands.size(); i++) {
+            char idx[16];
+            snprintf(idx, sizeof(idx), "%d.", (i % pageSize) + 1);
+            std::string part = std::string(" ") + idx + cands[i];
+            int curW = g_font.textWidth(candLine.c_str());
+            int partW = g_font.textWidth(part.c_str());
+            if (curW + partW + 8 > SCREEN_W) break;
+            candLine += part;
+        }
+        {
+            int cw = g_font.textWidth(candLine.c_str()) + 8;
+            u8g2_SetDrawColor(g_u8g2, 1);
+            u8g2_DrawBox(g_u8g2, 4, candBaseline - g_font.ascent(), cw, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 0);
+            g_font.drawText(4, candBaseline, candLine.c_str(), false);
+            u8g2_SetDrawColor(g_u8g2, 1);
+        }
+    }
+    u8g2_SetDrawColor(g_u8g2, 0);
+    ui_commit();
+}
+
+static const char *HELP_LINES[] = {
+    "── 列表视图 ──",
+    "j/↓   下移",
+    "k/↑   上移",
+    "a     添加任务",
+    "i     添加子任务",
+    "e     重命名",
+    "Enter 详情",
+    "Space 切换状态",
+    "d     删除",
+    "Tab   切换标签",
+    "/     筛选",
+    "r     重命名项目",
+    "n     新建项目",
+    "",
+    "── 任务详情 ──",
+    "j/↓   下一字段",
+    "k/↑   上一字段",
+    "Enter 编辑字段",
+    "Esc   返回",
+    "优先级/状态/项目: 弹出选择",
+    "截止日期: 日历选择",
+    "Backspace 清除日期",
+    "",
+    "── 日历对话框 ──",
+    "←→    逐日选择",
+    "↑↓    按周跳转",
+    "h     上月",
+    "l     下月",
+    "Enter 确认",
+    "Esc   取消",
+    "",
+    "── 添加/重命名 ──",
+    "Ctrl+Space 切换输入法",
+    "Enter 确认",
+    "Esc   取消",
+    "",
+    "── 备注编辑 ──",
+    "Enter 换行",
+    "Tab   保存",
+    "Esc   取消",
+    "",
+    "── 通用 ──",
+    "?     显示帮助",
+    "q/Esc 返回",
+};
+static const int HELP_LINE_COUNT = sizeof(HELP_LINES) / sizeof(HELP_LINES[0]);
+
+static void drawHelp() {
+    // Draw underlying screen first
+    if (g.mode == M_HELP && g.helpPrevMode == M_BROWSE) drawList();
+    else drawDetail();
+
+    int boxW = 300;
+    int boxH = 250;
+    int boxX = (SCREEN_W - boxW) / 2;
+    int boxY = (SCREEN_H - boxH) / 2;
+
+    // Opaque white background
+    u8g2_SetDrawColor(g_u8g2, 1);
+    u8g2_DrawBox(g_u8g2, boxX, boxY, boxW, boxH);
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawFrame(g_u8g2, boxX, boxY, boxW, boxH);
+
+    // Title
+    int titleY = boxY + 8 + g_font.ascent();
+    g_font.drawText(boxX + (boxW - g_font.textWidth("快捷键帮助")) / 2, titleY, "快捷键帮助", false);
+
+    // Separator
+    u8g2_DrawHLine(g_u8g2, boxX + 4, titleY + g_font.descent() + 4, boxW - 8);
+
+    // Content area
+    int contentY = titleY + g_font.descent() + 10;
+    int contentMaxY = boxY + boxH - 8;
+    int maxVis = (contentMaxY - contentY) / LINE_SPACING;
+    if (maxVis < 1) maxVis = 1;
+
+    int maxScroll = HELP_LINE_COUNT - maxVis;
+    if (maxScroll < 0) maxScroll = 0;
+    if (g.helpScroll > maxScroll) g.helpScroll = maxScroll;
+    if (g.helpScroll < 0) g.helpScroll = 0;
+
+    for (int i = 0; i < maxVis && (g.helpScroll + i) < HELP_LINE_COUNT; i++) {
+        int ly = contentY + i * LINE_SPACING;
+        const char *line = HELP_LINES[g.helpScroll + i];
+        // Section headers start with ─ (0xE2 in UTF-8)
+        bool isHeader = ((unsigned char)line[0] == 0xE2);
+        ui_draw_text(boxX + 12, ly + g_font.ascent(), line, false, isHeader);
+    }
+}
+
+struct DetailField {
+    const char *label;  // display label
+    const char *key;    // actual JSON key
+    char type; // 's'=string, 'p'=priority toggle, 't'=status toggle, 'n'=number, 'j'=project selector
+};
+
+static const DetailField DETAIL_FIELDS[] = {
+    {"标题",     "title",    's'},
+    {"优先级",   "priority", 'p'},
+    {"状态",     "status",   't'},
+    {"项目",     "project",  'j'},
+    {"截止日期", "due",      'd'},
+    {"情境",     "context",  's'},
+    {"进度",     "progress", 'n'},
+    {"备注",     "note",     'm'},
+};
+static const int NUM_DETAIL_FIELDS = sizeof(DETAIL_FIELDS) / sizeof(DETAIL_FIELDS[0]);
+
+static void openPicker(int fieldIdx) {
+    auto &df = DETAIL_FIELDS[fieldIdx];
+    auto &task = g.data["tasks"][g.detailTaskIdx];
+    g.pickerOpts.clear();
+    g.pickerField = fieldIdx;
+
+    if (df.type == 'p') {
+        for (int i = 0; i < 3; i++)
+            g.pickerOpts.push_back({PRIORITY_LABELS[i], PRIORITY_DISPLAY[i]});
+        std::string cur = task["priority"].asString();
+        if (cur.empty()) cur = "B";
+        g.pickerSel = 0;
+        for (int i = 0; i < 3; i++) if (PRIORITY_LABELS[i] == cur) g.pickerSel = i;
+    } else if (df.type == 't') {
+        for (int i = 0; i < 4; i++)
+            g.pickerOpts.push_back({STATUS_LABELS[i], STATUS_DISPLAY[i]});
+        std::string cur = task["status"].asString("todo");
+        g.pickerSel = 0;
+        for (int i = 0; i < 4; i++) if (STATUS_LABELS[i] == cur) g.pickerSel = i;
+    } else if (df.type == 'j') {
+        buildProjectList();
+        g.pickerOpts.push_back({"", "(无)"});
+        for (auto &p : g.projectList)
+            g.pickerOpts.push_back({p, p});
+        std::string cur = task["project"].asString();
+        g.pickerSel = 0;
+        for (int i = 0; i < (int)g.pickerOpts.size(); i++)
+            if (g.pickerOpts[i].value == cur) { g.pickerSel = i; break; }
+    }
+
+    g.mode = M_PICKER;
+}
+
+static void drawPicker() {
+    // Draw detail underneath first
+    drawDetail();
+
+    int n = (int)g.pickerOpts.size();
+    if (n == 0) return;
+
+    int maxVis = 6;
+    int boxW = 250;
+    int boxH = maxVis * LINE_SPACING + 24 + 15;
+    int boxX = (SCREEN_W - boxW) / 2;
+    int boxY = (SCREEN_H - boxH) / 2;
+
+    // Scroll to keep selection visible
+    int scroll = 0;
+    if (n > maxVis) {
+        scroll = g.pickerSel - maxVis / 2;
+        if (scroll < 0) scroll = 0;
+        if (scroll + maxVis > n) scroll = n - maxVis;
+    }
+
+    // Opaque white background
+    u8g2_SetDrawColor(g_u8g2, 1);
+    u8g2_DrawBox(g_u8g2, boxX, boxY, boxW, boxH);
+    // Black border frame
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawFrame(g_u8g2, boxX, boxY, boxW, boxH);
+
+    // Draw options
+    int vis = n > maxVis ? maxVis : n;
+    for (int i = 0; i < vis; i++) {
+        int oi = scroll + i;
+        int iy = boxY + 27 + i * LINE_SPACING;
+        bool sel = (oi == g.pickerSel);
+        if (sel) {
+            u8g2_SetDrawColor(g_u8g2, 0);
+            u8g2_DrawBox(g_u8g2, boxX + 4, iy - g_font.ascent(), boxW - 8, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 1);
+            g_font.drawText(boxX + 20, iy, g.pickerOpts[oi].display.c_str(), true);
+            u8g2_SetDrawColor(g_u8g2, 0);
+        } else {
+            g_font.drawText(boxX + 20, iy, g.pickerOpts[oi].display.c_str(), false);
+        }
+    }
+
+    // Scroll indicators
+    if (n > maxVis) {
+        if (scroll > 0) {
+            char si[16]; snprintf(si, sizeof(si), "▲%d", scroll);
+            g_font.drawText(boxX + boxW - g_font.textWidth(si) - 6, boxY + 27 + g_font.ascent(), si, false);
+        }
+        if (scroll + maxVis < n) {
+            char si[16]; snprintf(si, sizeof(si), "▼%d", n - scroll - maxVis);
+            g_font.drawText(boxX + boxW - g_font.textWidth(si) - 6, boxY + 27 + (vis - 1) * LINE_SPACING + g_font.ascent(), si, false);
+        }
+    }
+}
+
+static int daysInMonth(int year, int month) {
+    static const int dim[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+    int d = dim[month];
+    if (month == 2 && (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0))) d = 29;
+    return d;
+}
+
+// day of week: 0=Mon .. 6=Sun
+static int dayOfWeek(int year, int month, int day) {
+    struct tm t = {};
+    t.tm_year = year - 1900;
+    t.tm_mon = month - 1;
+    t.tm_mday = day;
+    mktime(&t);
+    int w = t.tm_wday;  // 0=Sun
+    return w == 0 ? 6 : w - 1;
+}
+
+static void openCalendar() {
+    auto &task = g.data["tasks"][g.detailTaskIdx];
+    std::string due = task["due"].asString();
+    time_t now_t; time(&now_t); struct tm *now_tm = localtime(&now_t);
+
+    if (due.length() >= 10) {
+        g.calYear = atoi(due.substr(0, 4).c_str());
+        g.calMonth = atoi(due.substr(5, 2).c_str());
+        g.calDay = atoi(due.substr(8, 2).c_str());
+    } else {
+        g.calYear = now_tm->tm_year + 1900;
+        g.calMonth = now_tm->tm_mon + 1;
+        g.calDay = now_tm->tm_mday;
+    }
+    g.calSelDay = g.calDay;
+    g.mode = M_CALENDAR;
+}
+
+static void drawCalendar() {
+    drawDetail();
+
+    int boxW = 280;
+    int boxH = 220;
+    int boxX = (SCREEN_W - boxW) / 2;
+    int boxY = (SCREEN_H - boxH) / 2;
+
+    // Opaque white background
+    u8g2_SetDrawColor(g_u8g2, 1);
+    u8g2_DrawBox(g_u8g2, boxX, boxY, boxW, boxH);
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawFrame(g_u8g2, boxX, boxY, boxW, boxH);
+
+    // Month/year header
+    char hdr[32];
+    snprintf(hdr, sizeof(hdr), "%d年%d月", g.calYear, g.calMonth);
+    int hdrW = g_font.textWidth(hdr);
+    g_font.drawText(boxX + (boxW - hdrW) / 2, boxY + 12 + g_font.ascent(), hdr, false);
+
+    // Navigation hints: h=prev month, l=next month
+    g_font.drawText(boxX + 8, boxY + 12 + g_font.ascent(), "h", false);
+    g_font.drawText(boxX + boxW - 8 - g_font.textWidth("l"), boxY + 12 + g_font.ascent(), "l", false);
+
+    // Weekday header
+    const char *wdnames[] = {"一","二","三","四","五","六","日"};
+    int colW = boxW / 7;
+    int hdrY = boxY + 12 + FONT_H + 4;
+    for (int i = 0; i < 7; i++) {
+        int cx = boxX + i * colW + (colW - g_font.textWidth(wdnames[i])) / 2;
+        g_font.drawText(cx, hdrY + g_font.ascent(), wdnames[i], false);
+    }
+
+    // Separator line
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawHLine(g_u8g2, boxX + 4, hdrY + FONT_H + 2, boxW - 8);
+
+    // Day grid
+    int firstDow = dayOfWeek(g.calYear, g.calMonth, 1);
+    int dim = daysInMonth(g.calYear, g.calMonth);
+    int gridY = hdrY + FONT_H + 21;
+
+    time_t now_t; time(&now_t); struct tm *now_tm = localtime(&now_t);
+    int todayDay = (now_tm->tm_year + 1900 == g.calYear && now_tm->tm_mon + 1 == g.calMonth)
+                   ? now_tm->tm_mday : 0;
+
+    for (int d = 1; d <= dim; d++) {
+        int dow = (firstDow + d - 1) % 7;
+        int row = (firstDow + d - 1) / 7;
+        int cx = boxX + dow * colW;
+        int cy = gridY + row * LINE_SPACING;
+
+        bool sel = (d == g.calSelDay);
+        bool today = (d == todayDay);
+
+        char ds[16];
+        snprintf(ds, sizeof(ds), "%d", d);
+        int tw = g_font.textWidth(ds);
+        int dx = cx + (colW - tw) / 2;
+
+        if (sel) {
+            u8g2_SetDrawColor(g_u8g2, 0);
+            u8g2_DrawBox(g_u8g2, cx + 2, cy - g_font.ascent(), colW - 4, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 1);
+            g_font.drawText(dx, cy, ds, true);
+            u8g2_SetDrawColor(g_u8g2, 0);
+        } else {
+            if (today) {
+                // Underline today
+                g_font.drawText(dx, cy, ds, false);
+                u8g2_DrawHLine(g_u8g2, dx, cy + 3, tw);
+            } else {
+                g_font.drawText(dx, cy, ds, false);
+            }
+        }
+    }
+}
+
+static void rebuildNoteVrows() {
+    if (g.noteVrowsDirty) {
+        g.noteVrows = buildVrows(g.noteLines);
+        g.noteVrowsDirty = false;
+    }
+}
+
+static void openNoteEditor() {
+    auto &task = g.data["tasks"][g.detailTaskIdx];
+    std::string note = task["note"].asString();
+    g.noteLines.clear();
+    size_t pos = 0;
+    while (pos < note.length()) {
+        size_t nl = note.find('\n', pos);
+        g.noteLines.push_back((nl == std::string::npos) ? note.substr(pos) : note.substr(pos, nl - pos));
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    if (g.noteLines.empty()) g.noteLines.push_back("");
+    g.noteRow = 0;
+    g.noteCol = (int)g.noteLines[0].length();
+    g.noteScroll = 0;
+    g.noteVrowsDirty = true;
+    g.imeActive = true;
+    g_ime.setActive(true);
+    g.mode = M_EDIT_NOTE;
+}
+
+static void drawNoteEditor() {
+    ui_clear();
+    ui_draw_text(4, g_font.ascent(), "备注编辑", false, true);
+    u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
+
+    rebuildNoteVrows();
+
+    int contentY = FONT_H + 8 + LINE_SPACING;
+    int maxY = g_ime.composing() ? (STATUS_Y - 2 * LINE_SPACING) : STATUS_Y;
+    int vis = (maxY - contentY) / LINE_SPACING;
+    if (vis < 1) vis = 1;
+
+    // Find cursor vrow
+    int cursorVrow = 0;
+    for (int i = 0; i < (int)g.noteVrows.size(); i++) {
+        if (g.noteVrows[i].lineIdx == g.noteRow &&
+            g.noteCol >= g.noteVrows[i].start &&
+            g.noteCol <= g.noteVrows[i].end) {
+            cursorVrow = i;
+            break;
+        }
+    }
+
+    // Scroll
+    if (cursorVrow < g.noteScroll) g.noteScroll = cursorVrow;
+    if (cursorVrow >= g.noteScroll + vis) g.noteScroll = cursorVrow - vis + 1;
+
+    // Draw vrows
+    for (int i = 0; i < vis && (g.noteScroll + i) < (int)g.noteVrows.size(); i++) {
+        auto &vr = g.noteVrows[g.noteScroll + i];
+        int ly = contentY + i * LINE_SPACING;
+        std::string text = g.noteLines[vr.lineIdx].substr(vr.start, vr.end - vr.start);
+        ui_draw_text(4, ly, text.c_str(), false);
+    }
+
+    // Draw cursor
+    {
+        auto &vr = g.noteVrows[cursorVrow];
+        std::string before = g.noteLines[vr.lineIdx].substr(vr.start, g.noteCol - vr.start);
+        int cx = 4 + g_font.textWidth(before.c_str());
+        int cy = contentY + (cursorVrow - g.noteScroll) * LINE_SPACING;
+        u8g2_SetDrawColor(g_u8g2, 0);
+        u8g2_DrawBox(g_u8g2, cx, cy + 4, 8, 3);
+        u8g2_SetDrawColor(g_u8g2, 1);
+    }
+    u8g2_SetDrawColor(g_u8g2, 0);
+
+    // IME at bottom
+    if (g_ime.composing()) {
+        std::string code = g_ime.displayCode();
+        int total = g_ime.totalCandidates();
+        int pageSize = g_ime.pageSize();
+        int curPage = g_ime.currentPage();
+        int totalPages = (total + pageSize - 1) / pageSize;
+        if (totalPages < 1) totalPages = 1;
+        char pageInfo[32];
+        snprintf(pageInfo, sizeof(pageInfo), "%d/%d", curPage, totalPages);
+
+        int candBaseline = STATUS_Y - 9;
+        int sepY = candBaseline - FONT_H - 4;
+        int codeBaseline = sepY - 7;
+        {
+            int cw = g_font.textWidth(code.c_str()) + 8;
+            u8g2_SetDrawColor(g_u8g2, 1);
+            u8g2_DrawBox(g_u8g2, 4, codeBaseline - g_font.ascent(), cw, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 0);
+            g_font.drawText(4, codeBaseline, code.c_str(), false);
+            u8g2_SetDrawColor(g_u8g2, 1);
+        }
+        {
+            int tw = g_font.textWidth(pageInfo);
+            int pw = tw + 8;
+            int px = SCREEN_W - pw - 4;
+            u8g2_SetDrawColor(g_u8g2, 1);
+            u8g2_DrawBox(g_u8g2, px, codeBaseline - g_font.ascent(), pw, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 0);
+            g_font.drawText(px + 4, codeBaseline, pageInfo, false);
+            u8g2_SetDrawColor(g_u8g2, 1);
+        }
+        u8g2_SetDrawColor(g_u8g2, 0);
+        u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W);
+        u8g2_SetDrawColor(g_u8g2, 1);
+        auto &cands = g_ime.candidates();
+        std::string candLine;
+        for (int i = 0; i < (int)cands.size(); i++) {
+            char idx[16];
+            snprintf(idx, sizeof(idx), "%d.", (i % pageSize) + 1);
+            std::string part = std::string(" ") + idx + cands[i];
+            int curW = g_font.textWidth(candLine.c_str());
+            int partW = g_font.textWidth(part.c_str());
+            if (curW + partW + 8 > SCREEN_W) break;
+            candLine += part;
+        }
+        {
+            int cw = g_font.textWidth(candLine.c_str()) + 8;
+            u8g2_SetDrawColor(g_u8g2, 1);
+            u8g2_DrawBox(g_u8g2, 4, candBaseline - g_font.ascent(), cw, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 0);
+            g_font.drawText(4, candBaseline, candLine.c_str(), false);
+            u8g2_SetDrawColor(g_u8g2, 1);
+        }
+    }
+    u8g2_SetDrawColor(g_u8g2, 0);
+    ui_draw_status("Enter换行 Ctrl+S保存 ESC取消", "");
+    ui_commit();
+}
+
+static void drawDetail() {
+    auto &tasks = g.data["tasks"];
+    if (!tasks.isArray() || g.detailTaskIdx < 0 || g.detailTaskIdx >= (int)tasks.size()) return;
+    auto &task = tasks[g.detailTaskIdx];
+
+    ui_clear();
+    ui_draw_text(4, g_font.ascent(), "任务详情", false, true);
+    u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
+
+    int y = FONT_H + 8 + LINE_SPACING;
+    int maxY = (g.mode == M_EDIT_FIELD && g_ime.composing()) ? (IME_CODE_Y - 4) : STATUS_Y;
+    int vis = (maxY - y + LINE_SPACING - 1) / LINE_SPACING;
+    if (vis < 1) vis = 1;
+
+    int fScroll = (g.detailField / vis) * vis;
+    for (int i = 0; i < vis && (fScroll + i) < NUM_DETAIL_FIELDS; i++) {
+        int fi = fScroll + i;
+        auto &df = DETAIL_FIELDS[fi];
+        bool sel = (fi == g.detailField);
+        bool editing = (g.mode == M_EDIT_FIELD && fi == g.detailField);
+
+        std::string val;
+        if (editing) {
+            // Show live edit buffer
+            val = g.editBuf;
+            if (val.empty()) val = " ";
+        } else {
+            switch (df.type) {
+            case 's': val = task[df.key].asString(); break;
+            case 'j': {
+                val = task["project"].asString();
+                if (val.empty()) val = "(无)";
+                break;
+            }
+            case 'p': {
+                std::string pv = task["priority"].asString();
+                if (pv.empty()) pv = "B";
+                for (int k = 0; k < 3; k++) if (PRIORITY_LABELS[k] == pv) { val = PRIORITY_DISPLAY[k]; break; }
+                if (val.empty()) val = pv;
+                break;
+            }
+            case 't': {
+                std::string sv = task["status"].asString("todo");
+                for (int k = 0; k < 4; k++) if (STATUS_LABELS[k] == sv) { val = STATUS_DISPLAY[k]; break; }
+                if (val.empty()) val = sv;
+                break;
+            }
+            case 'n': val = std::to_string(task["progress"].asInt(0)) + "%"; break;
+            case 'd': {
+                val = task["due"].asString();
+                if (val.empty()) val = "(未设)";
+                break;
+            }
+            case 'm': {
+                val = task[df.key].asString();
+                if (val.empty()) val = "(空)";
+                else {
+                    size_t nl = val.find('\n');
+                    if (nl != std::string::npos) val = val.substr(0, nl) + "…";
+                }
+                break;
+            }
+            }
+        }
+        if (val.empty()) val = "-";
+
+        char buf[80];
+        snprintf(buf, sizeof(buf), "%s: %s", df.label, val.c_str());
+        ui_draw_text(8, y + i * LINE_SPACING, buf, sel);
+
+        // Draw cursor when editing string/number/multiline fields
+        if (editing && (df.type == 's' || df.type == 'n' || df.type == 'm')) {
+            std::string prefix = std::string(df.label) + ": ";
+            int px = 8 + g_font.textWidth(prefix.c_str());
+            int cx = px + g_font.textWidth(g.editBuf.substr(0, g.editCur).c_str());
+            u8g2_SetDrawColor(g_u8g2, 0);
+            u8g2_DrawBox(g_u8g2, cx, y + i * LINE_SPACING + 4, 8, 3);
+            u8g2_SetDrawColor(g_u8g2, 1);
+        }
+    }
+
+    // Show sub-task hierarchy below fields
+    {
+        std::string taskId = task["id"].asString();
+        std::string parentId = task["parent"].asString();
+        int ySub = y + vis * LINE_SPACING + 4;
+
+        // Show parent task
+        if (!parentId.empty()) {
+            for (int k = 0; k < (int)tasks.size(); k++) {
+                if (tasks[k]["id"].asString() == parentId) {
+                    std::string pStatus = tasks[k]["status"].asString("todo");
+                    char pbuf[80];
+                    snprintf(pbuf, sizeof(pbuf), "↑ %s %s", statusIcon(pStatus), tasks[k]["title"].asString().c_str());
+                    if (ySub + LINE_SPACING <= STATUS_Y)
+                        ui_draw_text(8, ySub, pbuf, false);
+                    ySub += LINE_SPACING;
+                    break;
+                }
+            }
+        }
+
+        // Show child tasks
+        int childCount = 0;
+        for (int k = 0; k < (int)tasks.size(); k++) {
+            if (tasks[k]["parent"].asString() == taskId) {
+                childCount++;
+                if (ySub + LINE_SPACING <= STATUS_Y) {
+                    std::string cStatus = tasks[k]["status"].asString("todo");
+                    char cbuf[80];
+                    snprintf(cbuf, sizeof(cbuf), "├─ %s %s", statusIcon(cStatus), tasks[k]["title"].asString().c_str());
+                    ui_draw_text(8, ySub, cbuf, false);
+                }
+                ySub += LINE_SPACING;
+            }
+        }
+        // Fix last child connector
+        if (childCount > 0) {
+            // Redraw last child with └─
+            int lastY = ySub - LINE_SPACING;
+            if (lastY + LINE_SPACING <= STATUS_Y + LINE_SPACING) {
+                // Find last child again
+                int cc = 0;
+                for (int k = 0; k < (int)tasks.size(); k++) {
+                    if (tasks[k]["parent"].asString() == taskId) {
+                        cc++;
+                        if (cc == childCount) {
+                            std::string cStatus = tasks[k]["status"].asString("todo");
+                            char cbuf[80];
+                            snprintf(cbuf, sizeof(cbuf), "└─ %s %s", statusIcon(cStatus), tasks[k]["title"].asString().c_str());
+                            if (lastY + LINE_SPACING <= STATUS_Y)
+                                ui_draw_text(8, lastY, cbuf, false);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    {
+        bool editingM = (g.mode == M_EDIT_FIELD && DETAIL_FIELDS[g.detailField].type == 'm');
+        if (editingM)
+            ui_draw_status("Enter换行 Tab保存 ↑↓选择 ESC返回", "");
+        else
+            ui_draw_status("Enter编辑 ↑↓选择 ESC返回 ?", "帮助");
+    }
+    drawIMEStatus();
+}
+
+// ── Screen entry ─────────────────────────────────────────────────────────
+void screen_gtd_init() {
+    mkdir(DATA_DIR, 0755);
+    g.mode = M_BROWSE;
+    g.view = 0;
+    g.sel = 0;
+    g.scroll = 0;
+    g.detailTaskIdx = -1;
+    g.editBuf.clear();
+    g.editCur = 0;
+    g.imeActive = false;
+    g.pendingParent.clear();
+    g.filterText.clear();
+    g.projectDrillIdx = -1;
+    g.insertAfter = -1;
+    g_ime.setActive(false);
+    loadData();
+}
+
+// ── Main handle ──────────────────────────────────────────────────────────
+AppState screen_gtd_handle(int key, ScreenContext &ctx) {
+    auto &tasks = g.data["tasks"];
+
+    // ── M_ADD: adding new task ──────────────────────────────────────
+    if (g.mode == M_ADD) {
+        if (g.imeActive && key != 0) {
+            std::string imeOut;
+            if (g_ime.handleKey(key, imeOut)) {
+                if (!imeOut.empty()) {
+                    g.editBuf.insert(g.editCur, imeOut);
+                    g.editCur += (int)imeOut.length();
+                }
+                drawAdd();
+                return APP_GTD;
+            }
+        }
+        if (key == KEY_IME_TOGGLE) {
+            g.imeActive = !g.imeActive;
+            g_ime.setActive(g.imeActive);
+            drawAdd();
+            return APP_GTD;
+        }
+        if (key == 0x1B) {
+            g.mode = M_BROWSE;
+            g.imeActive = false; g_ime.setActive(false);
+            g.insertAfter = -1;
+            g.pendingParent.clear();
+        } else if (key == 0x0A || key == 0x0D) {
+            if (!g.editBuf.empty()) {
+                JsonValue t;
+                t.set("id", makeId());
+                t.set("title", g.editBuf);
+                t.set("priority", "B");
+                t.set("status", "todo");
+                t.set("due", "");
+                t.set("progress", 0);
+                t.set("note", "");
+                t.set("context", "");
+                t.set("project", g.pendingProject.empty() ? std::string("") : g.pendingProject);
+                t.set("parent", g.pendingParent);
+                t.set("created", [](){
+                    time_t n; time(&n); struct tm *tm = localtime(&n);
+                    char b[16]; strftime(b, sizeof(b), "%Y-%m-%d", tm); return std::string(b);
+                }());
+                t.set("completed", "");
+                if (g.insertAfter >= 0 && g.insertAfter < (int)tasks.size())
+                    tasks.elements.insert(tasks.elements.begin() + g.insertAfter + 1, t);
+                else
+                    tasks.pushBack(t);
+                saveData();
+                rebuildFilter();
+                g.pendingParent.clear();
+                g.pendingProject.clear();
+                g.insertAfter = -1;
+            }
+            g.mode = M_BROWSE;
+            g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x7F || key == 0x08) {
+            if (g.editCur > 0) {
+                int prev = g.editCur - 1;
+                while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--;
+                g.editBuf.erase(prev, g.editCur - prev);
+                g.editCur = prev;
+            }
+        } else if (key == KEY_LEFT) {
+            if (g.editCur > 0) {
+                g.editCur--;
+                while (g.editCur > 0 && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur--;
+            }
+        } else if (key == KEY_RIGHT) {
+            if (g.editCur < (int)g.editBuf.length()) {
+                g.editCur++;
+                while (g.editCur < (int)g.editBuf.length() && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur++;
+            }
+        } else if (key >= 0x20 && key <= 0x7E) {
+            g.editBuf.insert(g.editCur, 1, (char)key);
+            g.editCur++;
+        }
+        drawAdd();
+        return APP_GTD;
+    }
+
+    // ── M_RENAME: quick rename task title ───────────────────────────────
+    if (g.mode == M_RENAME) {
+        if (g.imeActive && key != 0) {
+            std::string imeOut;
+            if (g_ime.handleKey(key, imeOut)) {
+                if (!imeOut.empty()) {
+                    g.editBuf.insert(g.editCur, imeOut);
+                    g.editCur += (int)imeOut.length();
+                }
+                drawAdd();
+                return APP_GTD;
+            }
+        }
+        if (key == KEY_IME_TOGGLE) {
+            g.imeActive = !g.imeActive;
+            g_ime.setActive(g.imeActive);
+            drawAdd();
+            return APP_GTD;
+        }
+        if (key == 0x1B) {
+            g.mode = M_BROWSE;
+            g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x0A || key == 0x0D) {
+            if (!g.editBuf.empty() && g.detailTaskIdx >= 0 && g.detailTaskIdx < (int)tasks.size()) {
+                tasks[g.detailTaskIdx].set("title", g.editBuf);
+                saveData();
+                rebuildFilter();
+            }
+            g.mode = M_BROWSE;
+            g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x7F || key == 0x08) {
+            if (g.editCur > 0) {
+                int prev = g.editCur - 1;
+                while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--;
+                g.editBuf.erase(prev, g.editCur - prev);
+                g.editCur = prev;
+            }
+        } else if (key == KEY_LEFT) {
+            if (g.editCur > 0) {
+                g.editCur--;
+                while (g.editCur > 0 && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur--;
+            }
+        } else if (key == KEY_RIGHT) {
+            if (g.editCur < (int)g.editBuf.length()) {
+                g.editCur++;
+                while (g.editCur < (int)g.editBuf.length() && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur++;
+            }
+        } else if (key >= 0x20 && key <= 0x7E) {
+            g.editBuf.insert(g.editCur, 1, (char)key);
+            g.editCur++;
+        }
+        drawAdd();
+        return APP_GTD;
+    }
+
+    // ── M_CONFIRM: confirmation dialog ────────────────────────────────
+    if (g.mode == M_CONFIRM) {
+        ui_clear();
+        ui_draw_text_centered(SCREEN_H / 2, g.confirmMsg.c_str(), false, true);
+        ui_draw_status("Enter确认 ESC取消", "");
+        ui_commit();
+        if (key == 0x0A || key == 0x0D) {
+            int idx = g.confirmIdx;
+            if (idx >= 0 && idx < (int)tasks.size()) {
+                tasks.elements.erase(tasks.elements.begin() + idx);
+                saveData();
+                rebuildFilter();
+                ctx.statusMessage = "已删除";
+            }
+            g.mode = M_BROWSE;
+        } else if (key == 0x1B) {
+            g.mode = M_BROWSE;
+        }
+        return APP_GTD;
+    }
+
+    // ── M_ADD_PROJECT / M_RENAME_PROJECT ─────────────────────────────
+    if (g.mode == M_ADD_PROJECT || g.mode == M_RENAME_PROJECT) {
+        if (g.imeActive && key != 0) {
+            std::string imeOut;
+            if (g_ime.handleKey(key, imeOut)) {
+                if (!imeOut.empty()) { g.editBuf.insert(g.editCur, imeOut); g.editCur += (int)imeOut.length(); }
+                drawAdd(); return APP_GTD;
+            }
+        }
+        if (key == KEY_IME_TOGGLE) { g.imeActive = !g.imeActive; g_ime.setActive(g.imeActive); drawAdd(); return APP_GTD; }
+        if (key == 0x1B) {
+            g.mode = M_BROWSE; g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x0A || key == 0x0D) {
+            if (!g.editBuf.empty()) {
+                auto &projs = g.data["projects"];
+                if (g.mode == M_ADD_PROJECT) {
+                    // Add new project name to stored list
+                    projs.pushBack(g.editBuf);
+                    saveData();
+                    buildProjectList();
+                } else if (g.mode == M_RENAME_PROJECT) {
+                    // Rename: update all tasks + stored projects list
+                    for (int i = 0; i < (int)tasks.size(); i++) {
+                        if (tasks[i]["project"].asString() == g.renameTargetProject)
+                            tasks[i].set("project", g.editBuf);
+                    }
+                    for (int i = 0; i < (int)projs.size(); i++) {
+                        if (projs[i].asString() == g.renameTargetProject) {
+                            projs.elements[i] = g.editBuf;
+                        }
+                    }
+                    saveData();
+                    buildProjectList();
+                }
+            }
+            g.mode = M_BROWSE; g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x7F || key == 0x08) {
+            if (g.editCur > 0) { int prev = g.editCur - 1; while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--; g.editBuf.erase(prev, g.editCur - prev); g.editCur = prev; }
+        } else if (key >= 0x20 && key <= 0x7E) { g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++; }
+        drawAdd();
+        return APP_GTD;
+    }
+
+    // ── M_DETAIL: task detail view ───────────────────────────────────
+    // ── M_EDIT_FIELD: editing a field inside detail ──────────────────
+    // ── M_PICKER: popup selector for p/t/j fields ───────────────────
+    // ── M_CALENDAR: date picker for due field ────────────────────────
+    if (g.mode == M_DETAIL || g.mode == M_EDIT_FIELD || g.mode == M_PICKER || g.mode == M_CALENDAR) {
+        if (g.mode == M_CALENDAR) {
+            if (key == 0x1B) {
+                g.mode = M_DETAIL;
+            } else if (key == KEY_LEFT) {
+                // Previous day
+                if (g.calSelDay > 1) g.calSelDay--;
+            } else if (key == KEY_RIGHT) {
+                // Next day
+                int dim = daysInMonth(g.calYear, g.calMonth);
+                if (g.calSelDay < dim) g.calSelDay++;
+            } else if (key == KEY_UP || key == 'k') {
+                g.calSelDay -= 7;
+                if (g.calSelDay < 1) g.calSelDay = 1;
+            } else if (key == KEY_DOWN || key == 'j') {
+                g.calSelDay += 7;
+                int dim = daysInMonth(g.calYear, g.calMonth);
+                if (g.calSelDay > dim) g.calSelDay = dim;
+            } else if (key == 'h' || key == 'H') {
+                // Previous month
+                g.calMonth--;
+                if (g.calMonth < 1) { g.calMonth = 12; g.calYear--; }
+                int dim = daysInMonth(g.calYear, g.calMonth);
+                if (g.calSelDay > dim) g.calSelDay = dim;
+            } else if (key == 'l' || key == 'L') {
+                // Next month
+                g.calMonth++;
+                if (g.calMonth > 12) { g.calMonth = 1; g.calYear++; }
+                int dim = daysInMonth(g.calYear, g.calMonth);
+                if (g.calSelDay > dim) g.calSelDay = dim;
+            } else if (key == 0x0A || key == 0x0D) {
+                // Confirm date
+                auto &task = tasks[g.detailTaskIdx];
+                char ds[16];
+                snprintf(ds, sizeof(ds), "%04d-%02d-%02d", g.calYear, g.calMonth, g.calSelDay);
+                task.set("due", ds);
+                saveData();
+                rebuildFilter();
+                g.mode = M_DETAIL;
+            } else if (key == 0x7F || key == 0x08) {
+                // Clear date
+                auto &task = tasks[g.detailTaskIdx];
+                task.set("due", "");
+                saveData();
+                rebuildFilter();
+                g.mode = M_DETAIL;
+            }
+            drawCalendar();
+            ui_commit();
+            return APP_GTD;
+        }
+
+        if (g.mode == M_PICKER) {
+            if (key == 0x1B) {
+                g.mode = M_DETAIL;
+            } else if (key == KEY_UP || key == 'k') {
+                if (g.pickerSel > 0) g.pickerSel--;
+            } else if (key == KEY_DOWN || key == 'j') {
+                if (g.pickerSel < (int)g.pickerOpts.size() - 1) g.pickerSel++;
+            } else if (key == 0x0A || key == 0x0D) {
+                // Apply selection
+                auto &task = tasks[g.detailTaskIdx];
+                auto &df = DETAIL_FIELDS[g.pickerField];
+                std::string val = g.pickerOpts[g.pickerSel].value;
+                if (df.type == 'p') task.set("priority", val);
+                else if (df.type == 't') task.set("status", val);
+                else if (df.type == 'j') task.set("project", val);
+                saveData();
+                if (g.view == V_PROJECT) buildProjectList();
+                rebuildFilter();
+                g.mode = M_DETAIL;
+            }
+            drawPicker();
+            ui_commit();
+            return APP_GTD;
+        }
+
+        if (g.mode == M_EDIT_FIELD) {
+            auto &task = tasks[g.detailTaskIdx];
+            auto &df = DETAIL_FIELDS[g.detailField];
+
+            if (g.imeActive && key != 0) {
+                std::string imeOut;
+                if (g_ime.handleKey(key, imeOut)) {
+                    if (!imeOut.empty()) {
+                        g.editBuf.insert(g.editCur, imeOut);
+                        g.editCur += (int)imeOut.length();
+                    }
+                    drawDetail();
+                    ui_commit();
+                    return APP_GTD;
+                }
+            }
+            if (key == KEY_IME_TOGGLE) {
+                g.imeActive = !g.imeActive;
+                g_ime.setActive(g.imeActive);
+                drawDetail();
+                ui_commit();
+                return APP_GTD;
+            }
+
+            if (key == 0x1B) {
+                g.mode = M_DETAIL;
+                g.imeActive = false; g_ime.setActive(false);
+            } else if ((key == 0x0A || key == 0x0D) && df.type == 'm') {
+                // Multi-line: Enter inserts newline
+                g.editBuf.insert(g.editCur, 1, '\n');
+                g.editCur++;
+            } else if (key == '\t' && df.type == 'm') {
+                // Tab commits multi-line note
+                task.set(df.key, g.editBuf);
+                saveData();
+                rebuildFilter();
+                g.mode = M_DETAIL;
+                g.imeActive = false; g_ime.setActive(false);
+            } else if ((key == 0x0A || key == 0x0D) && df.type != 'm') {
+                // Commit field value
+                if (df.type == 's')
+                    task.set(df.key, g.editBuf);
+                else if (df.type == 'n')
+                    task.set("progress", std::stoi(g.editBuf));
+                saveData();
+                if (g.view == V_PROJECT) buildProjectList();
+                rebuildFilter();
+                g.mode = M_DETAIL;
+                g.imeActive = false; g_ime.setActive(false);
+            } else if (key == 0x7F || key == 0x08) {
+                if (g.editCur > 0) {
+                    int prev = g.editCur - 1;
+                    while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--;
+                    g.editBuf.erase(prev, g.editCur - prev);
+                    g.editCur = prev;
+                }
+            } else if (key == KEY_LEFT) {
+                if (g.editCur > 0) { g.editCur--;
+                    while (g.editCur > 0 && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur--; }
+            } else if (key == KEY_RIGHT) {
+                if (g.editCur < (int)g.editBuf.length()) { g.editCur++;
+                    while (g.editCur < (int)g.editBuf.length() && ((unsigned char)g.editBuf[g.editCur] & 0xC0) == 0x80) g.editCur++; }
+            } else if (key >= 0x20 && key <= 0x7E) {
+                g.editBuf.insert(g.editCur, 1, (char)key);
+                g.editCur++;
+            }
+            drawDetail();
+            ui_commit();
+            return APP_GTD;
+        }
+
+        // M_DETAIL navigation
+        if (key == 0x1B || key == 'q' || key == 'Q') {
+            g.mode = M_BROWSE;
+        } else if (key == KEY_UP || key == 'k') {
+            if (g.detailField > 0) g.detailField--;
+        } else if (key == KEY_DOWN || key == 'j') {
+            if (g.detailField < NUM_DETAIL_FIELDS - 1) g.detailField++;
+        } else if (key == 0x0A || key == 0x0D) {
+            auto &df = DETAIL_FIELDS[g.detailField];
+            auto &task = tasks[g.detailTaskIdx];
+            // Open picker for selection types, calendar for date, text editor for string/number
+            switch (df.type) {
+            case 'p': case 't': case 'j':
+                openPicker(g.detailField);
+                break;
+            case 'd':
+                openCalendar();
+                break;
+            case 's':
+                g.editBuf = task[df.key].asString();
+                g.editCur = (int)g.editBuf.length();
+                g.imeActive = true;
+                g_ime.setActive(true);
+                g.mode = M_EDIT_FIELD;
+                break;
+            case 'm':
+                openNoteEditor();
+                break;
+            case 'n':
+                g.editBuf = std::to_string(task["progress"].asInt(0));
+                g.editCur = (int)g.editBuf.length();
+                g.imeActive = false;
+                g_ime.setActive(false);
+                g.mode = M_EDIT_FIELD;
+                break;
+            }
+        } else if (key == '?') {
+            g.helpScroll = 0;
+            g.helpPrevMode = M_DETAIL;
+            g.mode = M_HELP;
+            drawHelp();
+            ui_commit();
+            return APP_GTD;
+        }
+
+        drawDetail();
+        ui_commit();
+        return APP_GTD;
+    }
+
+    // ── M_HELP: shortcut help dialog ─────────────────────────────────
+    if (g.mode == M_HELP) {
+        if (key == 0x1B || key == 'q' || key == 'Q' || key == 0x0A || key == 0x0D) {
+            g.mode = g.helpPrevMode;
+        } else if (key == KEY_UP || key == 'k') {
+            if (g.helpScroll > 0) g.helpScroll--;
+        } else if (key == KEY_DOWN || key == 'j') {
+            g.helpScroll++;
+        } else if (key == KEY_LEFT) {
+            g.helpScroll -= 5;
+            if (g.helpScroll < 0) g.helpScroll = 0;
+        } else if (key == KEY_RIGHT) {
+            g.helpScroll += 5;
+        }
+        drawHelp();
+        ui_commit();
+        return APP_GTD;
+    }
+
+    // ── M_EDIT_NOTE: multi-line note editor ──────────────────────────
+    if (g.mode == M_EDIT_NOTE) {
+        if (g.imeActive && key != 0) {
+            std::string imeOut;
+            if (g_ime.handleKey(key, imeOut)) {
+                if (!imeOut.empty()) {
+                    g.noteLines[g.noteRow].insert(g.noteCol, imeOut);
+                    g.noteCol += (int)imeOut.length();
+                    g.noteVrowsDirty = true;
+                }
+                drawNoteEditor();
+                return APP_GTD;
+            }
+        }
+        if (key == KEY_IME_TOGGLE) {
+            g.imeActive = !g.imeActive;
+            g_ime.setActive(g.imeActive);
+            drawNoteEditor();
+            return APP_GTD;
+        }
+
+        if (key == 0x1B) {
+            // Cancel
+            g.mode = M_DETAIL;
+            g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x13 || key == KEY_CTRL_ENTER) {
+            // Ctrl+S or Ctrl+Enter — save
+            std::string text;
+            for (size_t i = 0; i < g.noteLines.size(); i++) {
+                if (i > 0) text += '\n';
+                text += g.noteLines[i];
+            }
+            auto &task = tasks[g.detailTaskIdx];
+            task.set("note", text);
+            saveData();
+            g.mode = M_DETAIL;
+            g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x0A || key == 0x0D) {
+            // Enter — insert newline
+            std::string rest = g.noteLines[g.noteRow].substr(g.noteCol);
+            g.noteLines[g.noteRow].erase(g.noteCol);
+            g.noteLines.insert(g.noteLines.begin() + g.noteRow + 1, rest);
+            g.noteRow++;
+            g.noteCol = 0;
+            g.noteVrowsDirty = true;
+        } else if (key == 0x7F || key == 0x08) {
+            // Backspace
+            if (g.noteCol > 0) {
+                int prev = g.noteCol - 1;
+                while (prev > 0 && ((unsigned char)g.noteLines[g.noteRow][prev] & 0xC0) == 0x80) prev--;
+                g.noteLines[g.noteRow].erase(prev, g.noteCol - prev);
+                g.noteCol = prev;
+                g.noteVrowsDirty = true;
+            } else if (g.noteRow > 0) {
+                // Join with previous line
+                g.noteCol = (int)g.noteLines[g.noteRow - 1].length();
+                g.noteLines[g.noteRow - 1] += g.noteLines[g.noteRow];
+                g.noteLines.erase(g.noteLines.begin() + g.noteRow);
+                g.noteRow--;
+                g.noteVrowsDirty = true;
+            }
+        } else if (key == KEY_UP || key == 'k') {
+            if (g.noteRow > 0) {
+                g.noteRow--;
+                if (g.noteCol > (int)g.noteLines[g.noteRow].length())
+                    g.noteCol = (int)g.noteLines[g.noteRow].length();
+            }
+        } else if (key == KEY_DOWN || key == 'j') {
+            if (g.noteRow < (int)g.noteLines.size() - 1) {
+                g.noteRow++;
+                if (g.noteCol > (int)g.noteLines[g.noteRow].length())
+                    g.noteCol = (int)g.noteLines[g.noteRow].length();
+            }
+        } else if (key == KEY_LEFT) {
+            if (g.noteCol > 0) {
+                g.noteCol--;
+                while (g.noteCol > 0 && ((unsigned char)g.noteLines[g.noteRow][g.noteCol] & 0xC0) == 0x80) g.noteCol--;
+            } else if (g.noteRow > 0) {
+                g.noteRow--;
+                g.noteCol = (int)g.noteLines[g.noteRow].length();
+            }
+        } else if (key == KEY_RIGHT) {
+            if (g.noteCol < (int)g.noteLines[g.noteRow].length()) {
+                g.noteCol++;
+                while (g.noteCol < (int)g.noteLines[g.noteRow].length() && ((unsigned char)g.noteLines[g.noteRow][g.noteCol] & 0xC0) == 0x80) g.noteCol++;
+            } else if (g.noteRow < (int)g.noteLines.size() - 1) {
+                g.noteRow++;
+                g.noteCol = 0;
+            }
+        } else if (key >= 0x20 && key <= 0x7E) {
+            g.noteLines[g.noteRow].insert(g.noteCol, 1, (char)key);
+            g.noteCol++;
+            g.noteVrowsDirty = true;
+        }
+        drawNoteEditor();
+        return APP_GTD;
+    }
+
+    // ── M_FILTER: filter input ──────────────────────────────────────
+    if (g.mode == M_FILTER) {
+        if (g.imeActive && key != 0) {
+            std::string imeOut;
+            if (g_ime.handleKey(key, imeOut)) {
+                if (!imeOut.empty()) {
+                    g.filterText += imeOut;
+                }
+                rebuildFilter();
+                drawList();
+                ui_commit();
+                return APP_GTD;
+            }
+        }
+        if (key == KEY_IME_TOGGLE) {
+            g.imeActive = !g.imeActive;
+            g_ime.setActive(g.imeActive);
+            drawList();
+            ui_commit();
+            return APP_GTD;
+        }
+        if (key == 0x1B) {
+            g.mode = M_BROWSE;
+            g.imeActive = false; g_ime.setActive(false);
+            g.filterText.clear();
+            rebuildFilter();
+        } else if (key == 0x0A || key == 0x0D) {
+            g.mode = M_BROWSE;
+            g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x7F || key == 0x08) {
+            if (!g.filterText.empty()) {
+                g.filterText.pop_back();
+                rebuildFilter();
+            }
+        } else if (key >= 0x20 && key <= 0x7E) {
+            g.filterText += (char)key;
+            rebuildFilter();
+        }
+        drawList();
+        ui_commit();
+        return APP_GTD;
+    }
+
+    // ── M_BROWSE: main list view ─────────────────────────────────────
+    // Project list management (only in project list view)
+    if (isInProjectList()) {
+        if (key == 'n' || key == 'N') {
+            g.mode = M_ADD_PROJECT;
+            g.editBuf.clear();
+            g.editCur = 0;
+            g.imeActive = true;
+            g_ime.setActive(true);
+        }
+        if ((key == 'd' || key == 'D') && g.sel < (int)g.projectList.size()) {
+            std::string projName = g.projectList[g.sel];
+            int taskCount = 0;
+            for (int i = 0; i < (int)tasks.size(); i++) {
+                if (tasks[i]["project"].asString() == projName) taskCount++;
+            }
+            if (taskCount > 0) {
+                ctx.statusMessage = "项目非空，无法删除";
+            } else {
+                // Remove from stored projects list
+                auto &projs = g.data["projects"];
+                for (int i = (int)projs.size() - 1; i >= 0; i--) {
+                    if (projs[i].asString() == projName)
+                        projs.elements.erase(projs.elements.begin() + i);
+                }
+                saveData();
+                buildProjectList();
+                if (g.sel >= (int)g.projectList.size()) g.sel = (int)g.projectList.size() - 1;
+                if (g.sel < 0) g.sel = 0;
+                ctx.statusMessage = "已删除项目";
+            }
+        }
+        if ((key == 'r' || key == 'R') && g.sel < (int)g.projectList.size()) {
+            g.renameTargetProject = g.projectList[g.sel];
+            g.mode = M_RENAME_PROJECT;
+            g.editBuf = g.projectList[g.sel];
+            g.editCur = (int)g.editBuf.length();
+            g.imeActive = true;
+            g_ime.setActive(true);
+        }
+    }
+
+    if (key == 'q' || key == 'Q' || key == 0x1B) {
+        g_ime.setActive(false);
+        ctx.nextState = APP_MAIN;
+        return APP_MAIN;
+    }
+
+    if (key == '\t') {
+        g.view = (g.view + 1) % V_COUNT;
+        g.sel = 0; g.scroll = 0;
+        g.projectDrillIdx = -1;
+        if (g.view == V_PROJECT) buildProjectList();
+        rebuildFilter();
+    }
+
+    if (key == 'k' || key == KEY_UP) {
+        if (g.sel > 0) g.sel--;
+    }
+    if (key == 'j' || key == KEY_DOWN) {
+        if (g.sel < (int)g.filtered.size() - 1) g.sel++;
+    }
+
+    if (key == 'a' || key == 'A') {
+        g.mode = M_ADD;
+        g.editBuf.clear();
+        g.editCur = 0;
+        g.imeActive = true;
+        g_ime.setActive(true);
+        // same-level: inherit parent and project from selected task, insert after
+        if (g.sel < (int)g.filtered.size()) {
+            g.pendingParent = tasks[g.filtered[g.sel]]["parent"].asString();
+            g.insertAfter = g.filtered[g.sel];
+        } else {
+            g.pendingParent.clear();
+            g.insertAfter = -1;
+        }
+        // In project drill-down, auto-set project for new task
+        if (g.view == V_PROJECT && g.projectDrillIdx >= 0 && g.projectDrillIdx < (int)g.projectList.size()) {
+            g.pendingProject = g.projectList[g.projectDrillIdx];
+        } else {
+            g.pendingProject.clear();
+        }
+    }
+
+    if (key == ' ' && g.sel < (int)g.filtered.size()) {
+        auto &task = tasks[g.filtered[g.sel]];
+        std::string s = task["status"].asString("todo");
+        if (s == "todo") task.set("status", "doing");
+        else if (s == "doing") { task.set("status", "done");
+            time_t n; time(&n); struct tm *tm = localtime(&n);
+            char b[16]; strftime(b, sizeof(b), "%Y-%m-%d", tm);
+            task.set("completed", std::string(b));
+        }
+        else if (s == "done") task.set("status", "waiting");
+        else task.set("status", "todo");
+        saveData();
+        rebuildFilter();
+    }
+
+    if (key == 0x0A || key == 0x0D) {
+        if (isInProjectList()) {
+            // Project list: drill into selected project
+            if (g.sel < (int)g.projectList.size()) {
+                g.projectDrillIdx = g.sel;
+                g.sel = 0; g.scroll = 0;
+                rebuildFilter();
+            }
+        } else if (g.sel < (int)g.filtered.size()) {
+            // All tabs: open detail panel
+            g.detailTaskIdx = g.filtered[g.sel];
+            g.detailField = 0;
+            g.mode = M_DETAIL;
+            drawDetail();
+            ui_commit();
+            return APP_GTD;
+        }
+    }
+
+    if ((key == 'i' || key == 'I') && g.sel < (int)g.filtered.size()) {
+        // add subtask under selected, insert after parent
+        auto &parentTask = tasks[g.filtered[g.sel]];
+        g.pendingParent = parentTask["id"].asString();
+        g.insertAfter = g.filtered[g.sel];
+        g.mode = M_ADD;
+        g.editBuf.clear();
+        g.editCur = 0;
+        g.imeActive = true;
+        g_ime.setActive(true);
+    }
+
+    if (key == '/') {
+        g.mode = M_FILTER;
+        g.imeActive = true;
+        g_ime.setActive(true);
+    }
+
+    if (key == 'e' || key == 'E') {
+        if (g.sel < (int)g.filtered.size()) {
+            g.detailTaskIdx = g.filtered[g.sel];
+            g.editBuf = tasks[g.detailTaskIdx]["title"].asString();
+            g.editCur = (int)g.editBuf.length();
+            g.imeActive = true;
+            g_ime.setActive(true);
+            g.mode = M_RENAME;
+            drawAdd();  // reuse add-task overlay for rename
+            ui_commit();
+            return APP_GTD;
+        }
+    }
+
+    if (key == 0x05) {  // Ctrl+E — export
+        std::string md = exportMD();
+        time_t now; time(&now); struct tm *tm = localtime(&now);
+        char fname[64];
+        strftime(fname, sizeof(fname), "/sdcard/gtd/gtd_export_%Y%m%d_%H%M%S.md", tm);
+        g_journal.saveEntryRaw(std::string(fname).c_str() + 12, md);
+        ctx.statusMessage = "已导出Markdown";
+    }
+
+    if ((key == 'd' || key == 'D') && g.sel < (int)g.filtered.size()) {
+        int idx = g.filtered[g.sel];
+        g.confirmIdx = idx;
+        g.confirmMsg = std::string("删除任务「") + tasks[idx]["title"].asString() + "」?";
+        g.mode = M_CONFIRM;
+    }
+
+    if (key == '?') {
+        g.helpScroll = 0;
+        g.helpPrevMode = M_BROWSE;
+        g.mode = M_HELP;
+        drawHelp();
+        ui_commit();
+        return APP_GTD;
+    }
+
+    drawList();
+    ui_commit();
+    return APP_GTD;
+}

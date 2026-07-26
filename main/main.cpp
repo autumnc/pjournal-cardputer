@@ -10,6 +10,8 @@
 #include "pjournal_app.h"
 #include "screen_editor.h"
 #include "screen_settings.h"
+#include "screen_gtd.h"
+#include "screen_outline.h"
 #include "screen_bt_manage.h"
 #include "screen_file_manager.h"
 #include "u8g2_st7305.h"
@@ -98,13 +100,9 @@ extern "C" void app_main() {
     // Initialize battery ADC
     battery_init();
 
-    // Initialize font renderer
+    // Initialize font renderer (default 22pt for non-editor screens)
     g_font.begin();
-    // Apply saved font size
-    {
-        int fs = g_settings.fontSize();
-        if (fs != 28) g_font.setSize(fs);
-    }
+    g_font.setSize(22);
 
     // Initialize display
     initDisplay();
@@ -198,11 +196,8 @@ extern "C" void app_main() {
     // Initialize IME
     auto &ime = IME::getInstance();
     ime.begin();
-    // Set candidate page size based on font size
-    {
-        int fs = g_font.fontSize();
-        ime.setPageSize(fs <= 20 ? 9 : fs <= 22 ? 7 : 5);
-    }
+    // Set candidate page size based on default 22pt font
+    ime.setPageSize(7);
 
     // Initialize Bluetooth keyboard
     ESP_LOGI(TAG, "Starting Bluetooth...");
@@ -353,11 +348,17 @@ extern "C" void app_main() {
         }
         switch (currentState) {
         case APP_MAIN:
+            g_font.setSize(22);
             if (key > 0) currentState = screen_main_handle(key, ctx);
             else { screen_main_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(200)); }  // 200ms for power saving
             break;
 
         case APP_EDITOR: {
+            g_font.setSize(g_settings.fontSize());
+            {
+                int fs = g_font.fontSize();
+                IME::getInstance().setPageSize(fs <= 22 ? 7 : 5);
+            }
             static bool editorInited = false;
             if (!editorInited) { screen_editor_init(ctx); editorInited = true; }
             if (key > 0) currentState = screen_editor_handle(key, ctx);
@@ -368,6 +369,7 @@ extern "C" void app_main() {
         }
 
         case APP_BROWSER: {
+            g_font.setSize(22);
             static bool browserInited = false;
             if (!browserInited) { screen_browser_init(); browserInited = true; }
             if (key > 0) currentState = screen_browser_handle(key, ctx);
@@ -377,6 +379,7 @@ extern "C" void app_main() {
         }
 
         case APP_VIEWER: {
+            g_font.setSize(22);
             static bool viewerInited = false;
             if (!viewerInited) { screen_viewer_init(ctx.selectedEntry); viewerInited = true; }
             if (key > 0) currentState = screen_viewer_handle(key, ctx);
@@ -386,6 +389,8 @@ extern "C" void app_main() {
         }
 
         case APP_SETTINGS: {
+            g_font.setSize(22);
+            IME::getInstance().setPageSize(7);
             static bool settingsInited = false;
             if (!settingsInited) { screen_settings_init(); settingsInited = true; }
             if (key > 0) currentState = screen_settings_handle(key, ctx);
@@ -395,6 +400,7 @@ extern "C" void app_main() {
         }
 
         case APP_BT_MANAGE: {
+            g_font.setSize(22);
             static bool btInited = false;
             if (!btInited) { screen_bt_manage_init(); btInited = true; }
             if (key > 0) currentState = screen_bt_manage_handle(key, ctx);
@@ -404,11 +410,34 @@ extern "C" void app_main() {
         }
 
         case APP_FILE_MANAGER: {
+            g_font.setSize(22);
             static bool fileMgrInited = false;
             if (!fileMgrInited) { screen_file_manager_init(); fileMgrInited = true; }
             if (key > 0) currentState = screen_file_manager_handle(key, ctx);
             else { screen_file_manager_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(200)); }
             if (currentState != APP_FILE_MANAGER) fileMgrInited = false;
+            break;
+        }
+
+        case APP_GTD: {
+            g_font.setSize(22);
+            IME::getInstance().setPageSize(7);
+            static bool gtdInited = false;
+            if (!gtdInited) { screen_gtd_init(); gtdInited = true; }
+            if (key > 0) currentState = screen_gtd_handle(key, ctx);
+            else { screen_gtd_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
+            if (currentState != APP_GTD) gtdInited = false;
+            break;
+        }
+
+        case APP_OUTLINE: {
+            g_font.setSize(22);
+            IME::getInstance().setPageSize(7);
+            static bool outlineInited = false;
+            if (!outlineInited) { screen_outline_init(); outlineInited = true; }
+            if (key > 0) currentState = screen_outline_handle(key, ctx);
+            else { screen_outline_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
+            if (currentState != APP_OUTLINE) outlineInited = false;
             break;
         }
 
