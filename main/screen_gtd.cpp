@@ -34,7 +34,7 @@ static const char *STATUS_DISPLAY[] = {"待办", "进行中", "已完成", "等�
 static const char *PRIORITY_LABELS[] = {"A", "B", "C"};
 static const char *PRIORITY_DISPLAY[] = {"A 高", "B 中", "C 低"};
 
-enum Mode { M_BROWSE, M_ADD, M_DETAIL, M_EDIT_FIELD, M_FILTER, M_RENAME, M_CONFIRM, M_ADD_PROJECT, M_RENAME_PROJECT, M_PICKER, M_CALENDAR, M_HELP, M_EDIT_NOTE };
+enum Mode { M_BROWSE, M_ADD, M_DETAIL, M_EDIT_FIELD, M_FILTER, M_RENAME, M_CONFIRM, M_ADD_PROJECT, M_RENAME_PROJECT, M_PICKER, M_CALENDAR, M_HELP, M_EDIT_NOTE, M_CONTEXT_MGR, M_TAG_MGR, M_ADD_CONTEXT, M_ADD_TAG, M_RENAME_CONTEXT, M_RENAME_TAG };
 
 // Picker option for popup panel
 struct PickerOpt {
@@ -97,6 +97,17 @@ static struct {
     int noteScroll = 0;
     std::vector<VRow> noteVrows;
     bool noteVrowsDirty = true;
+
+    // context/tag management
+    std::vector<std::string> contextList;
+    std::vector<std::string> tagList;
+    std::string filterContext;
+    std::vector<std::string> filterTags;
+    int ctxMgrSel = 0;
+    int tagMgrSel = 0;
+    std::set<int> pickerToggled;  // for multi-select tag picker
+    std::string renameTargetContext;
+    std::string renameTargetTag;
 
     // confirm dialog
     std::string confirmMsg;
@@ -256,6 +267,24 @@ static void rebuildFilter() {
                 note.find(g.filterText) == std::string::npos)
                 continue;
         }
+        if (!g.filterContext.empty()) {
+            if (t["context"].asString() != g.filterContext)
+                continue;
+        }
+        if (!g.filterTags.empty()) {
+            auto &tt = t["tags"];
+            bool hasAll = true;
+            for (auto &ft : g.filterTags) {
+                bool found = false;
+                if (tt.isArray()) {
+                    for (int j = 0; j < (int)tt.size(); j++) {
+                        if (tt[j].asString() == ft) { found = true; break; }
+                    }
+                }
+                if (!found) { hasAll = false; break; }
+            }
+            if (!hasAll) continue;
+        }
         g.filtered.push_back(i);
     }
     if (g.sel >= (int)g.filtered.size()) g.sel = (int)g.filtered.size() - 1;
@@ -298,6 +327,61 @@ static void buildProjectList() {
     std::sort(g.projectList.begin(), g.projectList.end());
 }
 
+static void buildContextList() {
+    g.contextList.clear();
+    auto &ctxs = g.data["contexts"];
+    if (ctxs.isArray()) {
+        for (int i = 0; i < (int)ctxs.size(); i++) {
+            std::string name = ctxs[i].asString();
+            if (name.empty()) continue;
+            bool dup = false;
+            for (auto &c : g.contextList) if (c == name) { dup = true; break; }
+            if (!dup) g.contextList.push_back(name);
+        }
+    }
+    auto &tasks = g.data["tasks"];
+    if (tasks.isArray()) {
+        for (int i = 0; i < (int)tasks.size(); i++) {
+            std::string ctx = tasks[i]["context"].asString();
+            if (ctx.empty()) continue;
+            bool dup = false;
+            for (auto &c : g.contextList) if (c == ctx) { dup = true; break; }
+            if (!dup) g.contextList.push_back(ctx);
+        }
+    }
+    std::sort(g.contextList.begin(), g.contextList.end());
+}
+
+static void buildTagList() {
+    g.tagList.clear();
+    auto &tags = g.data["tags"];
+    if (tags.isArray()) {
+        for (int i = 0; i < (int)tags.size(); i++) {
+            std::string name = tags[i].asString();
+            if (name.empty()) continue;
+            bool dup = false;
+            for (auto &t : g.tagList) if (t == name) { dup = true; break; }
+            if (!dup) g.tagList.push_back(name);
+        }
+    }
+    auto &tasks = g.data["tasks"];
+    if (tasks.isArray()) {
+        for (int i = 0; i < (int)tasks.size(); i++) {
+            auto &tt = tasks[i]["tags"];
+            if (tt.isArray()) {
+                for (int j = 0; j < (int)tt.size(); j++) {
+                    std::string name = tt[j].asString();
+                    if (name.empty()) continue;
+                    bool dup = false;
+                    for (auto &t : g.tagList) if (t == name) { dup = true; break; }
+                    if (!dup) g.tagList.push_back(name);
+                }
+            }
+        }
+    }
+    std::sort(g.tagList.begin(), g.tagList.end());
+}
+
 // ── Data I/O ─────────────────────────────────────────────────────────────
 static void loadData() {
     auto v = JsonValue::loadFromFile(DATA_FILE);
@@ -317,6 +401,10 @@ static void loadData() {
     }
     if (!g.data.has("projects") || !g.data["projects"].isArray())
         g.data.set("projects", JsonValue::array());
+    if (!g.data.has("contexts") || !g.data["contexts"].isArray())
+        g.data.set("contexts", JsonValue::array());
+    if (!g.data.has("tags") || !g.data["tags"].isArray())
+        g.data.set("tags", JsonValue::array());
     g.view = 0; g.sel = 0; g.scroll = 0;
     rebuildFilter();
 }
@@ -564,7 +652,7 @@ static void drawList() {
         }
 
         char sl[96];
-        snprintf(sl, sizeof(sl), "a:添加 i:子任务 e:重命名 Enter:详情 Space:状态 d:删除 %d项", (int)g_gtdTree.size());
+        snprintf(sl, sizeof(sl), "a:添加 i:子任务 r:重命名 Enter:详情 Space:状态 d:删除 %d项", (int)g_gtdTree.size());
         ui_draw_status(sl, "");
         drawIMEStatus();
         return;
@@ -586,12 +674,25 @@ static void drawList() {
         std::string status = t["status"].asString("todo");
         std::string pri = t["priority"].asString();
         std::string parent = t["parent"].asString();
+        std::string ctx = t["context"].asString();
 
-        char line[128];
-        if (sel) {
-            snprintf(line, sizeof(line), "%s %s", statusIcon(status), title.c_str());
-        } else {
-            snprintf(line, sizeof(line), "%s %s", statusIcon(status), title.c_str());
+        char line[160];
+        snprintf(line, sizeof(line), "%s %s", statusIcon(status), title.c_str());
+        if (g.view != V_INBOX && !ctx.empty()) {
+            size_t pos = strlen(line);
+            snprintf(line + pos, sizeof(line) - pos, " @%s", ctx.c_str());
+        }
+        if (g.view != V_INBOX) {
+            auto &tt = t["tags"];
+            if (tt.isArray()) {
+                for (int j = 0; j < (int)tt.size(); j++) {
+                    std::string tn = tt[j].asString();
+                    if (!tn.empty()) {
+                        size_t pos = strlen(line);
+                        snprintf(line + pos, sizeof(line) - pos, " #%s", tn.c_str());
+                    }
+                }
+            }
         }
 
         int indent = 0;
@@ -647,8 +748,21 @@ static void drawList() {
         ui_draw_text(4, STATUS_Y - LINE_SPACING + 2, fb, true);
     }
 
-    char statusLine[96];
-    snprintf(statusLine, sizeof(statusLine), "a:添加 e:重命名 Enter:详情 Space:状态 d:删除 Tab:切换 /:筛选 %d任务", (int)g.filtered.size());
+    // Show active context/tag filter
+    if (!g.filterContext.empty() || !g.filterTags.empty()) {
+        char fb[96];
+        std::string ftxt;
+        if (!g.filterContext.empty()) ftxt += "@" + g.filterContext;
+        for (auto &ft : g.filterTags) {
+            if (!ftxt.empty()) ftxt += " ";
+            ftxt += "#" + ft;
+        }
+        snprintf(fb, sizeof(fb), "过滤: %s", ftxt.c_str());
+        ui_draw_text(4, STATUS_Y - LINE_SPACING + 2 - (g.filterText.empty() ? 0 : LINE_SPACING), fb, true);
+    }
+
+    char statusLine[128];
+    snprintf(statusLine, sizeof(statusLine), "a:添加 r:重命名 Enter:详情 Space:状态 d:删除 c:情境 t:标签 /:筛选 %d任务", (int)g.filtered.size());
     ui_draw_status(statusLine, "");
 
     drawIMEStatus();
@@ -661,11 +775,25 @@ static void drawAdd() {
     if (g.mode == M_RENAME) addTitle = "重命名任务";
     else if (g.mode == M_ADD_PROJECT) addTitle = "新建项目";
     else if (g.mode == M_RENAME_PROJECT) addTitle = "重命名项目";
+    else if (g.mode == M_ADD_CONTEXT) addTitle = "添加情境";
+    else if (g.mode == M_ADD_TAG) addTitle = "添加标签";
+    else if (g.mode == M_RENAME_CONTEXT) addTitle = "重命名情境";
+    else if (g.mode == M_RENAME_TAG) addTitle = "重命名标签";
     ui_draw_text_centered(28, addTitle, false, true);
     u8g2_DrawHLine(g_u8g2, 0, 28 + g_font.descent() + 4, SCREEN_W);
 
+    // Hint for context/tag modes
+    if (g.mode == M_ADD_CONTEXT || g.mode == M_RENAME_CONTEXT)
+        ui_draw_text_centered(28 + FONT_H + 4, "以@开头或直接输入");
+    else if (g.mode == M_ADD_TAG || g.mode == M_RENAME_TAG)
+        ui_draw_text_centered(28 + FONT_H + 4, "以#开头或直接输入");
+
     std::string display = g.editBuf.empty() ? " " : g.editBuf;
-    int ty = 28 + g_font.descent() + 12 + g_font.ascent();
+    int ty;
+    if (g.mode == M_ADD_CONTEXT || g.mode == M_ADD_TAG || g.mode == M_RENAME_CONTEXT || g.mode == M_RENAME_TAG)
+        ty = 28 + FONT_H * 2 + 8 + g_font.ascent();
+    else
+        ty = 28 + g_font.descent() + 12 + g_font.ascent();
     ui_draw_text(4, ty, display.c_str());
     // cursor
     int cx = g_font.textWidth(g.editBuf.substr(0, g.editCur).c_str());
@@ -743,7 +871,7 @@ static const char *HELP_LINES[] = {
     "k/↑   上移",
     "a     添加任务",
     "i     添加子任务",
-    "e     重命名",
+    "r     重命名",
     "Enter 详情",
     "Space 切换状态",
     "d     删除",
@@ -781,6 +909,8 @@ static const char *HELP_LINES[] = {
     "",
     "── 通用 ──",
     "?     显示帮助",
+    "c     情境管理",
+    "t     标签管理",
     "q/Esc 返回",
 };
 static const int HELP_LINE_COUNT = sizeof(HELP_LINES) / sizeof(HELP_LINES[0]);
@@ -840,7 +970,8 @@ static const DetailField DETAIL_FIELDS[] = {
     {"状态",     "status",   't'},
     {"项目",     "project",  'j'},
     {"截止日期", "due",      'd'},
-    {"情境",     "context",  's'},
+    {"情境",     "context",  'c'},
+    {"标签",     "tags",     'g'},
     {"进度",     "progress", 'n'},
     {"备注",     "note",     'm'},
 };
@@ -874,6 +1005,32 @@ static void openPicker(int fieldIdx) {
         g.pickerSel = 0;
         for (int i = 0; i < (int)g.pickerOpts.size(); i++)
             if (g.pickerOpts[i].value == cur) { g.pickerSel = i; break; }
+    } else if (df.type == 'c') {
+        buildContextList();
+        g.pickerOpts.push_back({"", "(无)"});
+        for (auto &c : g.contextList)
+            g.pickerOpts.push_back({c, "@" + c});
+        std::string cur = task["context"].asString();
+        g.pickerSel = 0;
+        for (int i = 0; i < (int)g.pickerOpts.size(); i++)
+            if (g.pickerOpts[i].value == cur) { g.pickerSel = i; break; }
+    } else if (df.type == 'g') {
+        buildTagList();
+        for (auto &t : g.tagList)
+            g.pickerOpts.push_back({t, "#" + t});
+        g.pickerSel = 0;
+        g.pickerToggled.clear();
+        auto &tt = task["tags"];
+        if (tt.isArray()) {
+            for (int i = 0; i < (int)g.pickerOpts.size(); i++) {
+                for (int j = 0; j < (int)tt.size(); j++) {
+                    if (g.pickerOpts[i].value == tt[j].asString()) {
+                        g.pickerToggled.insert(i);
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     g.mode = M_PICKER;
@@ -909,18 +1066,24 @@ static void drawPicker() {
 
     // Draw options
     int vis = n > maxVis ? maxVis : n;
+    bool isTagPicker = (g.pickerField >= 0 && g.pickerField < NUM_DETAIL_FIELDS && DETAIL_FIELDS[g.pickerField].type == 'g');
     for (int i = 0; i < vis; i++) {
         int oi = scroll + i;
         int iy = boxY + 27 + i * LINE_SPACING;
         bool sel = (oi == g.pickerSel);
+        bool toggled = isTagPicker && g.pickerToggled.count(oi);
+        // For tag picker: show [✓] or [ ] prefix
+        std::string display;
+        if (isTagPicker) display = toggled ? "[✓]" : "[ ]";
+        display += g.pickerOpts[oi].display;
         if (sel) {
             u8g2_SetDrawColor(g_u8g2, 0);
             u8g2_DrawBox(g_u8g2, boxX + 4, iy - g_font.ascent(), boxW - 8, FONT_H);
             u8g2_SetDrawColor(g_u8g2, 1);
-            g_font.drawText(boxX + 20, iy, g.pickerOpts[oi].display.c_str(), true);
+            g_font.drawText(boxX + 8, iy, display.c_str(), true);
             u8g2_SetDrawColor(g_u8g2, 0);
         } else {
-            g_font.drawText(boxX + 20, iy, g.pickerOpts[oi].display.c_str(), false);
+            g_font.drawText(boxX + 8, iy, display.c_str(), false);
         }
     }
 
@@ -1248,6 +1411,22 @@ static void drawDetail() {
                 }
                 break;
             }
+            case 'c': {
+                val = task["context"].asString();
+                if (val.empty()) val = "(无)";
+                else val = "@" + val;
+                break;
+            }
+            case 'g': {
+                auto &tt = task["tags"];
+                if (tt.isArray() && tt.size() > 0) {
+                    for (int j = 0; j < (int)tt.size(); j++) {
+                        if (j > 0) val += " ";
+                        val += "#" + tt[j].asString();
+                    }
+                } else val = "(无)";
+                break;
+            }
             }
         }
         if (val.empty()) val = "-";
@@ -1393,6 +1572,7 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
                 t.set("progress", 0);
                 t.set("note", "");
                 t.set("context", "");
+                t.set("tags", JsonValue::array());
                 t.set("project", g.pendingProject.empty() ? std::string("") : g.pendingProject);
                 t.set("parent", g.pendingParent);
                 t.set("created", [](){
@@ -1514,7 +1694,7 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
     }
 
     // ── M_ADD_PROJECT / M_RENAME_PROJECT ─────────────────────────────
-    if (g.mode == M_ADD_PROJECT || g.mode == M_RENAME_PROJECT) {
+    if (g.mode == M_ADD_PROJECT || g.mode == M_RENAME_PROJECT || g.mode == M_RENAME_CONTEXT || g.mode == M_RENAME_TAG) {
         if (g.imeActive && key != 0) {
             std::string imeOut;
             if (g_ime.handleKey(key, imeOut)) {
@@ -1546,6 +1726,43 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
                     }
                     saveData();
                     buildProjectList();
+                } else if (g.mode == M_RENAME_CONTEXT) {
+                    // Rename context: update all tasks + stored list
+                    auto &ctxArr = g.data["contexts"];
+                    for (int i = 0; i < (int)tasks.size(); i++) {
+                        if (tasks[i]["context"].asString() == g.renameTargetContext)
+                            tasks[i].set("context", g.editBuf);
+                    }
+                    for (int i = 0; i < (int)ctxArr.size(); i++) {
+                        if (ctxArr[i].asString() == g.renameTargetContext)
+                            ctxArr.elements[i] = g.editBuf;
+                    }
+                    if (g.filterContext == g.renameTargetContext)
+                        g.filterContext = g.editBuf;
+                    saveData();
+                    buildContextList();
+                } else if (g.mode == M_RENAME_TAG) {
+                    // Rename tag: update all tasks + stored list
+                    auto &tagArr = g.data["tags"];
+                    for (int i = 0; i < (int)tasks.size(); i++) {
+                        auto &tt = tasks[i]["tags"];
+                        if (tt.isArray()) {
+                            for (int j = 0; j < (int)tt.size(); j++) {
+                                if (tt[j].asString() == g.renameTargetTag)
+                                    tt.elements[j] = g.editBuf;
+                            }
+                        }
+                    }
+                    for (int i = 0; i < (int)tagArr.size(); i++) {
+                        if (tagArr[i].asString() == g.renameTargetTag)
+                            tagArr.elements[i] = g.editBuf;
+                    }
+                    for (int i = 0; i < (int)g.filterTags.size(); i++) {
+                        if (g.filterTags[i] == g.renameTargetTag)
+                            g.filterTags[i] = g.editBuf;
+                    }
+                    saveData();
+                    buildTagList();
                 }
             }
             g.mode = M_BROWSE; g.imeActive = false; g_ime.setActive(false);
@@ -1613,20 +1830,35 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
         }
 
         if (g.mode == M_PICKER) {
+            auto &df = DETAIL_FIELDS[g.pickerField];
             if (key == 0x1B) {
                 g.mode = M_DETAIL;
             } else if (key == KEY_UP || key == 'k') {
                 if (g.pickerSel > 0) g.pickerSel--;
             } else if (key == KEY_DOWN || key == 'j') {
                 if (g.pickerSel < (int)g.pickerOpts.size() - 1) g.pickerSel++;
+            } else if (key == ' ' && df.type == 'g') {
+                // Toggle multi-select for tags
+                if (g.pickerToggled.count(g.pickerSel))
+                    g.pickerToggled.erase(g.pickerSel);
+                else
+                    g.pickerToggled.insert(g.pickerSel);
             } else if (key == 0x0A || key == 0x0D) {
                 // Apply selection
                 auto &task = tasks[g.detailTaskIdx];
-                auto &df = DETAIL_FIELDS[g.pickerField];
                 std::string val = g.pickerOpts[g.pickerSel].value;
                 if (df.type == 'p') task.set("priority", val);
                 else if (df.type == 't') task.set("status", val);
                 else if (df.type == 'j') task.set("project", val);
+                else if (df.type == 'c') task.set("context", val);
+                else if (df.type == 'g') {
+                    JsonValue tags(JsonValue::array());
+                    for (int i = 0; i < (int)g.pickerOpts.size(); i++) {
+                        if (g.pickerToggled.count(i))
+                            tags.pushBack(g.pickerOpts[i].value);
+                    }
+                    task.set("tags", tags);
+                }
                 saveData();
                 if (g.view == V_PROJECT) buildProjectList();
                 rebuildFilter();
@@ -1720,7 +1952,7 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
             auto &task = tasks[g.detailTaskIdx];
             // Open picker for selection types, calendar for date, text editor for string/number
             switch (df.type) {
-            case 'p': case 't': case 'j':
+            case 'p': case 't': case 'j': case 'c': case 'g':
                 openPicker(g.detailField);
                 break;
             case 'd':
@@ -1755,6 +1987,158 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         drawDetail();
         ui_commit();
+        return APP_GTD;
+    }
+
+    // ── M_CONTEXT_MGR / M_TAG_MGR / M_ADD_CONTEXT / M_ADD_TAG ──────────
+    if (g.mode == M_CONTEXT_MGR || g.mode == M_TAG_MGR) {
+        bool isCtx = (g.mode == M_CONTEXT_MGR);
+        auto &list = isCtx ? g.contextList : g.tagList;
+        int &sel = isCtx ? g.ctxMgrSel : g.tagMgrSel;
+        const char *title = isCtx ? "情境管理" : "标签管理";
+        char prefix = isCtx ? '@' : '#';
+
+        if (key == 0x1B || key == 'q' || key == 'Q') {
+            g.mode = M_BROWSE;
+        } else if (key == KEY_UP || key == 'k') {
+            if (sel > 0) sel--;
+        } else if (key == KEY_DOWN || key == 'j') {
+            if (sel < (int)list.size() - 1) sel++;
+        } else if (key == 'a' || key == 'A') {
+            g.mode = isCtx ? M_ADD_CONTEXT : M_ADD_TAG;
+            g.editBuf.clear(); g.editCur = 0;
+            g.imeActive = true; g_ime.setActive(true);
+        } else if ((key == 'd' || key == 'D') && sel < (int)list.size()) {
+            std::string name = list[sel];
+            // Remove from stored list
+            auto &arr = isCtx ? g.data["contexts"] : g.data["tags"];
+            for (int i = (int)arr.size() - 1; i >= 0; i--)
+                if (arr[i].asString() == name) arr.elements.erase(arr.elements.begin() + i);
+            // Clear from tasks
+            auto &tasks = g.data["tasks"];
+            if (isCtx) {
+                for (int i = 0; i < (int)tasks.size(); i++)
+                    if (tasks[i]["context"].asString() == name) tasks[i].set("context", "");
+                if (g.filterContext == name) g.filterContext.clear();
+            } else {
+                for (int i = 0; i < (int)tasks.size(); i++) {
+                    auto &tt = tasks[i]["tags"];
+                    if (tt.isArray()) {
+                        for (int j = (int)tt.size() - 1; j >= 0; j--)
+                            if (tt[j].asString() == name) tt.elements.erase(tt.elements.begin() + j);
+                    }
+                }
+                for (int i = (int)g.filterTags.size() - 1; i >= 0; i--)
+                    if (g.filterTags[i] == name) g.filterTags.erase(g.filterTags.begin() + i);
+            }
+            saveData();
+            if (isCtx) buildContextList(); else buildTagList();
+            if (sel >= (int)list.size()) sel = (int)list.size() - 1;
+            if (sel < 0) sel = 0;
+            rebuildFilter();
+        } else if (key == 0x0A || key == 0x0D) {
+            if (sel < (int)list.size()) {
+                if (isCtx) {
+                    g.filterContext = (g.filterContext == list[sel]) ? "" : list[sel];
+                } else {
+                    std::string name = list[sel];
+                    bool found = false;
+                    for (int i = 0; i < (int)g.filterTags.size(); i++) {
+                        if (g.filterTags[i] == name) { g.filterTags.erase(g.filterTags.begin() + i); found = true; break; }
+                    }
+                    if (!found) g.filterTags.push_back(name);
+                }
+                rebuildFilter();
+            }
+        } else if (key == ' ' && !isCtx && sel < (int)list.size()) {
+            // Tag multi-select toggle
+            std::string name = list[sel];
+            bool found = false;
+            for (int i = 0; i < (int)g.filterTags.size(); i++) {
+                if (g.filterTags[i] == name) { g.filterTags.erase(g.filterTags.begin() + i); found = true; break; }
+            }
+            if (!found) g.filterTags.push_back(name);
+            rebuildFilter();
+        } else if ((key == 'r' || key == 'R') && sel < (int)list.size()) {
+            g.mode = isCtx ? M_RENAME_CONTEXT : M_RENAME_TAG;
+            g.editBuf = list[sel];
+            g.editCur = (int)g.editBuf.length();
+            g.imeActive = true; g_ime.setActive(true);
+            if (isCtx) g.renameTargetContext = list[sel];
+            else g.renameTargetTag = list[sel];
+        }
+
+        // Draw
+        ui_clear(); int y = FONT_H + 6 + LINE_SPACING;
+        ui_draw_text(4, FONT_H, title, false, true);
+        u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
+        int maxY = STATUS_Y;
+        int vis = (maxY - y + LINE_SPACING - 1) / LINE_SPACING;
+        if (vis < 1) vis = 1;
+        if (sel < g.scroll) g.scroll = sel;
+        if (sel >= g.scroll + vis) g.scroll = sel - vis + 1;
+
+        for (int i = 0; i < vis && (g.scroll + i) < (int)list.size(); i++) {
+            int idx = g.scroll + i;
+            bool s = (idx == sel);
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%c%s", prefix, list[idx].c_str());
+            ui_draw_text(8, y + i * LINE_SPACING, buf, s);
+            // Show filter indicator
+            if (isCtx && g.filterContext == list[idx]) {
+                g_font.drawText(SCREEN_W - g_font.textWidth("●") - 4, y + i * LINE_SPACING, "●", false);
+            }
+            if (!isCtx) {
+                bool active = false;
+                for (auto &ft : g.filterTags) if (ft == list[idx]) { active = true; break; }
+                if (active) g_font.drawText(SCREEN_W - g_font.textWidth("●") - 4, y + i * LINE_SPACING, "●", false);
+            }
+        }
+        if (list.empty()) ui_draw_text(8, y, "暂无 — 按a添加");
+
+        // Show active filter
+        char sl[96];
+        if (isCtx)
+            snprintf(sl, sizeof(sl), "a:添加 d:删除 r:重命名 Enter:筛选 Esc:返回 %d项", (int)list.size());
+        else
+            snprintf(sl, sizeof(sl), "a:添加 d:删除 r:重命名 Enter/Space:筛选 Esc:返回 %d项", (int)list.size());
+        ui_draw_status(sl, "");
+        drawIMEStatus(); ui_commit();
+        return APP_GTD;
+    }
+
+    // M_ADD_CONTEXT / M_ADD_TAG
+    if (g.mode == M_ADD_CONTEXT || g.mode == M_ADD_TAG) {
+        bool isCtx = (g.mode == M_ADD_CONTEXT);
+        if (g.imeActive && key != 0) {
+            std::string imeOut;
+            if (g_ime.handleKey(key, imeOut)) {
+                if (!imeOut.empty()) { g.editBuf.insert(g.editCur, imeOut); g.editCur += (int)imeOut.length(); }
+                drawAdd(); return APP_GTD;
+            }
+        }
+        if (key == KEY_IME_TOGGLE) { g.imeActive = !g.imeActive; g_ime.setActive(g.imeActive); drawAdd(); return APP_GTD; }
+
+        if (key == 0x1B) {
+            g.mode = isCtx ? M_CONTEXT_MGR : M_TAG_MGR;
+            g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x0A || key == 0x0D) {
+            if (!g.editBuf.empty()) {
+                std::string name = g.editBuf;
+                if (!name.empty() && (name[0] == '@' || name[0] == '#')) name = name.substr(1);
+                if (!name.empty()) {
+                    auto &arr = isCtx ? g.data["contexts"] : g.data["tags"];
+                    arr.pushBack(name);
+                    saveData();
+                    if (isCtx) buildContextList(); else buildTagList();
+                }
+            }
+            g.mode = isCtx ? M_CONTEXT_MGR : M_TAG_MGR;
+            g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x7F || key == 0x08) {
+            if (g.editCur > 0) { int prev = g.editCur - 1; while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--; g.editBuf.erase(prev, g.editCur - prev); g.editCur = prev; }
+        } else if (key >= 0x20 && key <= 0x7E) { g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++; }
+        drawAdd();
         return APP_GTD;
     }
 
@@ -1961,6 +2345,12 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
     }
 
     if (key == 'q' || key == 'Q' || key == 0x1B) {
+        if (!g.filterContext.empty() || !g.filterTags.empty()) {
+            g.filterContext.clear();
+            g.filterTags.clear();
+            rebuildFilter();
+            return APP_GTD;
+        }
         g_ime.setActive(false);
         ctx.nextState = APP_MAIN;
         return APP_MAIN;
@@ -2055,7 +2445,19 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
         g_ime.setActive(true);
     }
 
-    if (key == 'e' || key == 'E') {
+    if (key == 'c' || key == 'C') {
+        buildContextList();
+        g.ctxMgrSel = 0;
+        g.mode = M_CONTEXT_MGR;
+    }
+
+    if (key == 't' || key == 'T') {
+        buildTagList();
+        g.tagMgrSel = 0;
+        g.mode = M_TAG_MGR;
+    }
+
+    if (key == 'r' || key == 'R') {
         if (g.sel < (int)g.filtered.size()) {
             g.detailTaskIdx = g.filtered[g.sel];
             g.editBuf = tasks[g.detailTaskIdx]["title"].asString();
