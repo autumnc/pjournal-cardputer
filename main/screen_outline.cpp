@@ -45,7 +45,7 @@ static void drawFileIcon(int x, int baseline) {
 
 #define OUTLINE_DIR "/sdcard/outline"
 
-enum Mode { M_PROJECTS, M_BROWSE, M_ADD_PROJECT, M_ADD_HEADING, M_ADD_SUB, M_FILTER, M_EDIT_NOTE, M_CONFIRM };
+enum Mode { M_PROJECTS, M_BROWSE, M_DETAIL, M_ADD_PROJECT, M_ADD_HEADING, M_ADD_SUB, M_FILTER, M_EDIT_NOTE, M_SUMMARY, M_HELP, M_CONFIRM };
 
 // ── State ────────────────────────────────────────────────────────────────
 static struct {
@@ -74,7 +74,20 @@ static struct {
 
     // heading whose note is being edited (index into nodes)
     int editNoteIdx = -1;
-    bool editingTitle = false;  // true = editing title, false = editing note
+    bool editingTitle = false;
+    bool editingKeyword = false;
+
+    // detail view
+    int detailNodeIdx = -1;
+    int detailField = 0;
+
+    // summary dialog
+    int summaryScroll = 0;
+    int summaryNodeIdx = -1;
+
+    // help dialog
+    int helpScroll = 0;
+    int helpPrevMode = M_BROWSE;
 
     // post-editor file copy
     std::string pendingOutlineTarget; // real path to copy editor output to
@@ -349,13 +362,280 @@ static void drawInputOverlay(const char *title) {
     ui_draw_text_centered(28, title, false, true);
     u8g2_DrawHLine(g_u8g2, 0, 28 + g_font.descent() + 4, SCREEN_W);
     std::string display = g.editBuf.empty() ? " " : g.editBuf;
-    int ty = 28 + g_font.descent() + 4 + g_font.ascent();
+    int ty = 28 + g_font.descent() + 12 + g_font.ascent();
     ui_draw_text(4, ty, display.c_str());
     int cx = g_font.textWidth(g.editBuf.substr(0, g.editCur).c_str());
     u8g2_SetDrawColor(g_u8g2, 0);
     u8g2_DrawBox(g_u8g2, 4 + cx, ty + 4, 8, 3);
     u8g2_SetDrawColor(g_u8g2, 1);
-    drawIMEStatus();
+
+    // IME at bottom of screen, same as GTD drawAdd
+    if (g_ime.composing()) {
+        std::string code = g_ime.displayCode();
+        int total = g_ime.totalCandidates();
+        int pageSize = g_ime.pageSize();
+        int curPage = g_ime.currentPage();
+        int totalPages = (total + pageSize - 1) / pageSize;
+        if (totalPages < 1) totalPages = 1;
+        char pageInfo[32];
+        snprintf(pageInfo, sizeof(pageInfo), "%d/%d", curPage, totalPages);
+
+        int candBaseline = SCREEN_H - 9;
+        int sepY = candBaseline - FONT_H - 4;
+        int codeBaseline = sepY - 7;
+
+        {
+            int cw = g_font.textWidth(code.c_str()) + 8;
+            u8g2_SetDrawColor(g_u8g2, 1);
+            u8g2_DrawBox(g_u8g2, 4, codeBaseline - g_font.ascent(), cw, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 0);
+            g_font.drawText(4, codeBaseline, code.c_str(), false);
+            u8g2_SetDrawColor(g_u8g2, 1);
+        }
+        {
+            int tw = g_font.textWidth(pageInfo);
+            int pw = tw + 8;
+            int px = SCREEN_W - pw - 4;
+            u8g2_SetDrawColor(g_u8g2, 1);
+            u8g2_DrawBox(g_u8g2, px, codeBaseline - g_font.ascent(), pw, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 0);
+            g_font.drawText(px + 4, codeBaseline, pageInfo, false);
+            u8g2_SetDrawColor(g_u8g2, 1);
+        }
+        u8g2_SetDrawColor(g_u8g2, 0);
+        u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W);
+        u8g2_SetDrawColor(g_u8g2, 1);
+        auto &cands = g_ime.candidates();
+        std::string candLine;
+        for (int i = 0; i < (int)cands.size(); i++) {
+            char idx[16];
+            snprintf(idx, sizeof(idx), "%d.", (i % pageSize) + 1);
+            std::string part = std::string(" ") + idx + cands[i];
+            int curW = g_font.textWidth(candLine.c_str());
+            int partW = g_font.textWidth(part.c_str());
+            if (curW + partW + 8 > SCREEN_W) break;
+            candLine += part;
+        }
+        {
+            int cw = g_font.textWidth(candLine.c_str()) + 8;
+            u8g2_SetDrawColor(g_u8g2, 1);
+            u8g2_DrawBox(g_u8g2, 4, candBaseline - g_font.ascent(), cw, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 0);
+            g_font.drawText(4, candBaseline, candLine.c_str(), false);
+            u8g2_SetDrawColor(g_u8g2, 1);
+        }
+    }
+    u8g2_SetDrawColor(g_u8g2, 0);
+    ui_commit();
+}
+
+static void drawProjectList();
+static void drawOutline();
+static void drawOutlineDetail();
+static void drawHelp();
+
+static const char *HELP_LINES[] = {
+    "── 项目列表 ──",
+    "↑↓    选择",
+    "Enter 打开项目",
+    "n     新建项目",
+    "d     删除项目",
+    "q/Esc 返回",
+    "",
+    "── 大纲列表 ──",
+    "↑↓    选择",
+    "a     添加标题",
+    "i     添加子标题",
+    "r     重命名",
+    "Enter 详情面板",
+    "f     关联文件",
+    "s     摘要",
+    "d     删除标题",
+    "Tab   切换项目",
+    "/     筛选",
+    "j/k   上/下移任务",
+    "h/l   提/降层级",
+    "q/Esc 返回项目",
+    "",
+    "── 详情面板 ──",
+    "↑↓    选择字段",
+    "Enter 编辑字段",
+    "f     关联文件",
+    "s     摘要",
+    "Esc   返回",
+    "",
+    "── 通用 ──",
+    "?     显示帮助",
+};
+static const int HELP_LINE_COUNT = sizeof(HELP_LINES) / sizeof(HELP_LINES[0]);
+
+static void drawHelp() {
+    if (g.mode == M_HELP && g.helpPrevMode == M_PROJECTS) drawProjectList();
+    else if (g.mode == M_HELP && g.helpPrevMode == M_DETAIL) drawOutlineDetail();
+    else drawOutline();
+
+    int boxW = 300, boxH = 250;
+    int boxX = (SCREEN_W - boxW) / 2;
+    int boxY = (SCREEN_H - boxH) / 2;
+    u8g2_SetDrawColor(g_u8g2, 1);
+    u8g2_DrawBox(g_u8g2, boxX, boxY, boxW, boxH);
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawFrame(g_u8g2, boxX, boxY, boxW, boxH);
+
+    int titleY = boxY + 8 + g_font.ascent();
+    g_font.drawText(boxX + (boxW - g_font.textWidth("快捷键帮助")) / 2, titleY, "快捷键帮助", false);
+    u8g2_DrawHLine(g_u8g2, boxX + 4, titleY + g_font.descent() + 4, boxW - 8);
+
+    int contentY = titleY + g_font.descent() + 10;
+    int contentMaxY = boxY + boxH - 8;
+    int maxVis = (contentMaxY - contentY) / LINE_SPACING;
+    if (maxVis < 1) maxVis = 1;
+    int maxScroll = HELP_LINE_COUNT - maxVis;
+    if (maxScroll < 0) maxScroll = 0;
+    if (g.helpScroll > maxScroll) g.helpScroll = maxScroll;
+    if (g.helpScroll < 0) g.helpScroll = 0;
+
+    for (int i = 0; i < maxVis && (g.helpScroll + i) < HELP_LINE_COUNT; i++) {
+        int ly = contentY + i * LINE_SPACING;
+        const char *line = HELP_LINES[g.helpScroll + i];
+        bool isHeader = ((unsigned char)line[0] == 0xE2);
+        ui_draw_text(boxX + 12, ly + g_font.ascent(), line, false, isHeader);
+    }
+
+    ui_draw_status("↑↓滚动 Esc返回", "");
+    u8g2_SetDrawColor(g_u8g2, 0);
+    ui_commit();
+}
+
+static void drawOutlineDetail() {
+    ui_clear();
+    if (!g.nodes || g.detailNodeIdx < 0 || g.detailNodeIdx >= (int)g.nodeCount) return;
+    auto &node = (*g.nodes)[g.detailNodeIdx];
+    std::string title = node["title"].asString();
+    int y = g_font.ascent();
+    ui_draw_text(4, y, title.c_str(), false, true);
+    u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
+    y = FONT_H + 8 + LINE_SPACING;
+
+    struct Field { const char *label; const char *key; char type; };
+    static const Field fields[] = {
+        {"标题",   "title",    's'},
+        {"关键词", "keywords", 's'},
+        {"备注",   "note",     'm'},
+    };
+    static const int NF = 3;
+
+    for (int i = 0; i < NF; i++) {
+        bool sel = (i == g.detailField);
+        auto &f = fields[i];
+        std::string val;
+        if (f.type == 'm') {
+            val = node[f.key].asString();
+            if (val.empty()) val = "(空)";
+            else {
+                size_t nl = val.find('\n');
+                if (nl != std::string::npos) val = val.substr(0, nl) + "…";
+            }
+        } else {
+            val = node[f.key].asString();
+            if (val.empty()) val = "(空)";
+        }
+        char buf[80];
+        snprintf(buf, sizeof(buf), "%s: %s", f.label, val.c_str());
+        ui_draw_text(8, y + i * LINE_SPACING, buf, sel);
+    }
+
+    // Show associated file
+    std::string file = node["file"].asString();
+    if (!file.empty()) {
+        char fbuf[80];
+        snprintf(fbuf, sizeof(fbuf), "文件: %s", file.c_str());
+        ui_draw_text(8, y + NF * LINE_SPACING, fbuf, false);
+    }
+
+    ui_draw_status("Enter编辑 ↑↓选择 f:关联 Esc返回", "");
+    drawIMEStatus(); ui_commit();
+}
+
+static void drawSummary() {
+    int boxX = (SCREEN_W - 300) / 2;
+    int boxY = (SCREEN_H - 250) / 2;
+    int boxW = 300, boxH = 250;
+    u8g2_SetDrawColor(g_u8g2, 1);
+    u8g2_DrawBox(g_u8g2, boxX, boxY, boxW, boxH);
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawFrame(g_u8g2, boxX, boxY, boxW, boxH);
+    ui_draw_text_centered(boxY + FONT_H, "摘要", false, true);
+
+    if (!g.nodes || g.summaryNodeIdx < 0 || g.summaryNodeIdx >= (int)g.nodeCount) return;
+    auto &node = (*g.nodes)[g.summaryNodeIdx];
+    int textX = boxX + 8;
+    int y = boxY + FONT_H + 8;
+    int contentW = boxW - 16;
+
+    // Separator under title
+    u8g2_DrawHLine(g_u8g2, boxX + 4, y, boxW - 8);
+    y += 8;
+
+    // Keywords
+    std::string kw = node["keywords"].asString();
+    char line[128];
+    snprintf(line, sizeof(line), "关键词: %s", kw.empty() ? "(无)" : kw.c_str());
+    ui_draw_text(textX, y, line, false);
+    y += LINE_SPACING;
+
+    // Notes - inline word-wrap
+    std::string note = node["note"].asString();
+    if (note.empty()) {
+        ui_draw_text(textX, y, "备注: (无)", false);
+    } else {
+        ui_draw_text(textX, y, "备注:", false);
+        y += LINE_SPACING;
+        std::vector<std::string> noteLines;
+        std::string curLine;
+        for (size_t k = 0; k < note.size(); k++) {
+            if (note[k] == '\n') { noteLines.push_back(curLine); curLine.clear(); }
+            else curLine += note[k];
+        }
+        if (!curLine.empty() || noteLines.empty()) noteLines.push_back(curLine);
+        std::vector<std::string> wrapped;
+        for (auto &nl : noteLines) {
+            int pos = 0;
+            int len = (int)nl.length();
+            while (pos < len) {
+                int end = pos;
+                int lastBreak = -1;
+                while (end < len) {
+                    std::string sub = nl.substr(pos, end - pos + 1);
+                    if (g_font.textWidth(sub.c_str()) > contentW) break;
+                    if (nl[end] == ' ') lastBreak = end + 1;
+                    end++;
+                }
+                if (end >= len) { wrapped.push_back(nl.substr(pos)); break; }
+                if (lastBreak > pos) {
+                    wrapped.push_back(nl.substr(pos, lastBreak - pos));
+                    pos = lastBreak;
+                    while (pos < len && nl[pos] == ' ') pos++;
+                } else if (end > pos) {
+                    wrapped.push_back(nl.substr(pos, end - pos));
+                    pos = end;
+                } else {
+                    wrapped.push_back(nl.substr(pos, 1));
+                    pos++;
+                }
+            }
+        }
+        int textAreaH = boxY + boxH - 16 - y;
+        int maxVis = textAreaH / LINE_SPACING;
+        if (maxVis < 1) maxVis = 1;
+        if (g.summaryScroll > (int)wrapped.size() - maxVis) g.summaryScroll = (int)wrapped.size() - maxVis;
+        if (g.summaryScroll < 0) g.summaryScroll = 0;
+        for (int i = 0; i < maxVis && (g.summaryScroll + i) < (int)wrapped.size(); i++)
+            g_font.drawText(textX, y + i * LINE_SPACING, wrapped[g.summaryScroll + i].c_str(), false);
+    }
+
+    ui_draw_status("\xe2\x86\x91\xe2\x86\x93\xe6\xbb\x9a\xe5\x8a\xa8 Esc\xe8\xbf\x94\xe5\x9b\x9e", "");
+    u8g2_SetDrawColor(g_u8g2, 0);
     ui_commit();
 }
 
@@ -424,8 +704,23 @@ static void drawOutline() {
         snprintf(buf, sizeof(buf), "%s%s", tprefix.c_str(), title.c_str());
         ui_draw_text(8, y + i * LINE_SPACING, buf, sel);
 
-        // show file indicator
+        // show [K] [M] indicators before file icon
+        int rightX = SCREEN_W - 4;
         std::string file = node["file"].asString();
+        if (!file.empty()) rightX -= FILE_ICON_W;
+        std::string keywords = node["keywords"].asString();
+        std::string note = node["note"].asString();
+        if (!note.empty()) {
+            int mw = g_font.textWidth("[M]") + 2;
+            rightX -= mw;
+            g_font.drawText(rightX, y + i * LINE_SPACING, "[M]", sel);
+        }
+        if (!keywords.empty()) {
+            int kw = g_font.textWidth("[K]") + 2;
+            rightX -= kw;
+            g_font.drawText(rightX, y + i * LINE_SPACING, "[K]", sel);
+        }
+        // show file indicator
         if (!file.empty()) {
             drawFileIcon(SCREEN_W - FILE_ICON_W - 4, y + i * LINE_SPACING);
         }
@@ -437,7 +732,7 @@ static void drawOutline() {
         ui_draw_text(4, STATUS_Y - LINE_SPACING + 2, fb, true);
     }
 
-    ui_draw_status("a:标题 i:子标题 e:重命名 d:删除 c:清除关联 Enter:编辑 Tab:项目 /:筛选", "");
+    ui_draw_status("a:标题 i:子标题 r:重命名 d:删除 s:摘要 f:文件 Enter:详情 /:筛选", "");
 
     if (composingFilter) drawIMEStatus();
 }
@@ -496,8 +791,11 @@ void screen_outline_init() {
     g.editNoteIdx = -1;
     g.editingTitle = false;
     g_ime.setActive(false);
-    g.nodes = nullptr;
-    g.nodeCount = 0;
+
+    if (!returningFromEditor) {
+        g.nodes = nullptr;
+        g.nodeCount = 0;
+    }
 
     g.projects = listProjects();
     g_filteredIdx.clear();
@@ -586,6 +884,81 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
         return APP_OUTLINE;
     }
 
+    // ── M_DETAIL ──────────────────────────────────────────────────
+    if (g.mode == M_DETAIL) {
+        if (key == 0x1B || key == 'q' || key == 'Q') {
+            g.mode = M_BROWSE;
+        } else if (key == KEY_UP) {
+            if (g.detailField > 0) g.detailField--;
+        } else if (key == KEY_DOWN) {
+            if (g.detailField < 2) g.detailField++;
+        } else if (key == 0x0A || key == 0x0D) {
+            if (!g.nodes || g.detailNodeIdx < 0 || g.detailNodeIdx >= (int)g.nodeCount) { g.mode = M_BROWSE; }
+            else {
+                auto &node = (*g.nodes)[g.detailNodeIdx];
+                if (g.detailField == 0) {
+                    g.editNoteIdx = g.detailNodeIdx;
+                    g.editingTitle = true;
+                    g.editingKeyword = false;
+                    g.editBuf = node["title"].asString();
+                    g.editCur = (int)g.editBuf.length();
+                    g.imeActive = true; g_ime.setActive(true);
+                    g.mode = M_EDIT_NOTE;
+                } else if (g.detailField == 1) {
+                    g.editNoteIdx = g.detailNodeIdx;
+                    g.editingKeyword = true;
+                    g.editBuf = node["keywords"].asString();
+                    g.editCur = (int)g.editBuf.length();
+                    g.imeActive = true; g_ime.setActive(true);
+                    g.mode = M_EDIT_NOTE;
+                } else {
+                    g.editNoteIdx = g.detailNodeIdx;
+                    g.editingTitle = false;
+                    g.editingKeyword = false;
+                    g.editBuf = node["note"].asString();
+                    g.editCur = (int)g.editBuf.length();
+                    g.imeActive = true; g_ime.setActive(true);
+                    g.mode = M_EDIT_NOTE;
+                }
+            }
+        } else if (key == 's' || key == 'S') {
+            g.summaryNodeIdx = g.detailNodeIdx;
+            g.summaryScroll = 0;
+            g.mode = M_SUMMARY;
+        } else if ((key == 'f' || key == 'F') && g.nodes && g.detailNodeIdx >= 0 && (size_t)g.detailNodeIdx < g.nodeCount) {
+            auto &node = (*g.nodes)[g.detailNodeIdx];
+            std::string file = node["file"].asString();
+            std::string title = node["title"].asString();
+            if (file.empty()) {
+                file = safeFilename(title);
+                node.set("file", file);
+                saveOutline();
+            }
+            std::string fullPath = ensureContentFile(g.projects[g.curProject], file);
+            std::string content = readContentFile(fullPath);
+            std::string body = extractBody(content);
+            if (body.empty()) body = content;
+            ctx.editContent = body;
+            g.pendingJournalFile = std::string("__outline_") + file;
+            ctx.editFilename = g.pendingJournalFile;
+            g.pendingOutlineTarget = fullPath;
+            ctx.prevState = APP_OUTLINE;
+            ctx.nextState = APP_EDITOR;
+            return APP_EDITOR;
+        }
+        if (key == '?') {
+            g.helpScroll = 0;
+            g.helpPrevMode = M_DETAIL;
+            g.mode = M_HELP;
+            drawHelp();
+            ui_commit();
+            return APP_OUTLINE;
+        }
+
+        drawOutlineDetail();
+        return APP_OUTLINE;
+    }
+
     // ── M_EDIT_NOTE ──────────────────────────────────────────────────
     if (g.mode == M_EDIT_NOTE) {
         if (g.imeActive && key != 0) {
@@ -595,24 +968,26 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                     g.editBuf.insert(g.editCur, imeOut);
                     g.editCur += (int)imeOut.length();
                 }
-                drawInputOverlay("编辑备注"); return APP_OUTLINE;
+                drawInputOverlay(g.editingTitle ? "编辑标题" : (g.editingKeyword ? "编辑关键词" : "编辑备注")); return APP_OUTLINE;
             }
         }
         if (key == KEY_IME_TOGGLE) {
             g.imeActive = !g.imeActive; g_ime.setActive(g.imeActive);
-            drawInputOverlay("编辑备注"); return APP_OUTLINE;
+            drawInputOverlay(g.editingTitle ? "编辑标题" : (g.editingKeyword ? "编辑关键词" : "编辑备注")); return APP_OUTLINE;
         }
         if (key == 0x1B) {
-            g.mode = M_BROWSE; g.imeActive = false; g_ime.setActive(false);
+            g.mode = M_DETAIL; g.imeActive = false; g_ime.setActive(false);
         } else if (key == 0x0A || key == 0x0D) {
             if (g.editNoteIdx >= 0 && g.nodes && (size_t)g.editNoteIdx < g.nodeCount) {
                 if (g.editingTitle)
                     (*g.nodes)[g.editNoteIdx].set("title", g.editBuf);
+                else if (g.editingKeyword)
+                    (*g.nodes)[g.editNoteIdx].set("keywords", g.editBuf);
                 else
                     (*g.nodes)[g.editNoteIdx].set("note", g.editBuf);
                 saveOutline();
             }
-            g.mode = M_BROWSE; g.imeActive = false; g_ime.setActive(false);
+            g.mode = M_DETAIL; g.imeActive = false; g_ime.setActive(false);
         } else if (key == 0x7F || key == 0x08) {
             if (g.editCur > 0) {
                 int prev = g.editCur - 1;
@@ -628,7 +1003,42 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
         } else if (key >= 0x20 && key <= 0x7E) {
             g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++;
         }
-        drawInputOverlay("编辑备注");
+        drawInputOverlay(g.editingTitle ? "编辑标题" : (g.editingKeyword ? "编辑关键词" : "编辑备注"));
+        return APP_OUTLINE;
+    }
+
+
+    // ── M_SUMMARY ──────────────────────────────────────────────────
+    if (g.mode == M_SUMMARY) {
+        if (key == 0x1B || key == 'q' || key == 'Q') {
+            g.mode = M_BROWSE;
+        } else if (key == KEY_UP) {
+            if (g.summaryScroll > 0) g.summaryScroll--;
+            drawOutline(); drawSummary();
+            return APP_OUTLINE;
+        } else if (key == KEY_DOWN) {
+            g.summaryScroll++;
+            drawOutline(); drawSummary();
+            return APP_OUTLINE;
+        }
+        drawOutline(); drawSummary();
+        return APP_OUTLINE;
+    }
+
+    // ── M_HELP ─────────────────────────────────────────────────────
+    if (g.mode == M_HELP) {
+        if (key == 0x1B || key == 'q' || key == 'Q' || key == 0x0A || key == 0x0D) {
+            g.mode = g.helpPrevMode;
+        } else if (key == KEY_UP) {
+            if (g.helpScroll > 0) g.helpScroll--;
+        } else if (key == KEY_DOWN) {
+            g.helpScroll++;
+        } else if (key == KEY_LEFT) {
+            if (g.helpScroll > 5) g.helpScroll -= 5; else g.helpScroll = 0;
+        } else if (key == KEY_RIGHT) {
+            g.helpScroll += 5;
+        }
+        drawHelp();
         return APP_OUTLINE;
     }
 
@@ -728,6 +1138,15 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             g.mode = M_CONFIRM;
         }
 
+        if (key == '?') {
+            g.helpScroll = 0;
+            g.helpPrevMode = M_PROJECTS;
+            g.mode = M_HELP;
+            drawHelp();
+            ui_commit();
+            return APP_OUTLINE;
+        }
+
         drawProjectList(); ui_commit();
         return APP_OUTLINE;
     }
@@ -754,12 +1173,39 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             }
         }
 
-        if (key == 'k' || key == KEY_UP) {
+        if (key == KEY_UP) {
             if (g.sel > 0) g.sel--;
         }
-        if (key == 'j' || key == KEY_DOWN) {
+        if (key == KEY_DOWN) {
             int maxIdx = g.filterText.empty() ? (int)g.nodeCount : (int)g_filteredIdx.size();
             if (g.sel < maxIdx - 1) g.sel++;
+        }
+
+        // hjkl: reorder and hierarchy
+        if (g.nodes && g.nodeCount > 0 && g.filterText.empty()) {
+            int idx = g.sel;
+            if (idx >= 0 && (size_t)idx < g.nodeCount) {
+                if (key == 'j' && idx > 0) {
+                    std::swap((*g.nodes)[idx], (*g.nodes)[idx - 1]);
+                    g.sel--;
+                    saveOutline();
+                } else if (key == 'k' && idx < (int)g.nodeCount - 1) {
+                    std::swap((*g.nodes)[idx], (*g.nodes)[idx + 1]);
+                    g.sel++;
+                    saveOutline();
+                } else if (key == 'h') {
+                    auto &node = (*g.nodes)[idx];
+                    int lvl = node["level"].asInt(0);
+                    if (lvl > 0) { node.set("level", lvl - 1); saveOutline(); }
+                } else if (key == 'l') {
+                    auto &node = (*g.nodes)[idx];
+                    int lvl = node["level"].asInt(0);
+                    if (idx > 0) {
+                        int prevLvl = (*g.nodes)[idx - 1]["level"].asInt(0);
+                        if (lvl <= prevLvl) { node.set("level", lvl + 1); saveOutline(); }
+                    }
+                }
+            }
         }
 
         if (key == 'a' || key == 'A') {
@@ -813,8 +1259,8 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             g.imeActive = true; g_ime.setActive(true);
         }
 
-        if (key == 'e' || key == 'E') {
-            // Edit heading title/note
+        if (key == 'r' || key == 'R') {
+            // Rename heading title
             int idx = g.filterText.empty() ? g.sel : (g.sel < (int)g_filteredIdx.size() ? g_filteredIdx[g.sel] : -1);
             if (idx >= 0 && g.nodes && (size_t)idx < g.nodeCount) {
                 g.editNoteIdx = idx;
@@ -826,6 +1272,20 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 g.mode = M_EDIT_NOTE;
                 drawInputOverlay("编辑标题");
                 ui_commit();
+                return APP_OUTLINE;
+            }
+        }
+
+
+
+        // s: summary
+        if ((key == 's' || key == 'S') && g.nodes && g.nodeCount > 0) {
+            int idx = g.filterText.empty() ? g.sel : (g.sel < (int)g_filteredIdx.size() ? g_filteredIdx[g.sel] : -1);
+            if (idx >= 0 && (size_t)idx < g.nodeCount) {
+                g.summaryNodeIdx = idx;
+                g.summaryScroll = 0;
+                g.mode = M_SUMMARY;
+                drawOutline(); drawSummary();
                 return APP_OUTLINE;
             }
         }
@@ -871,7 +1331,17 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
         }
 
         if (key == 0x0A || key == 0x0D) {
-            // Enter: open/create associated content file
+            // Enter: open detail panel
+            int idx = g.filterText.empty() ? g.sel : (g.sel < (int)g_filteredIdx.size() ? g_filteredIdx[g.sel] : -1);
+            if (idx >= 0 && g.nodes && (size_t)idx < g.nodeCount) {
+                g.detailNodeIdx = idx;
+                g.detailField = 0;
+                g.mode = M_DETAIL;
+            }
+        }
+
+        // f: associate/open content file
+        if (key == 'f' || key == 'F') {
             int idx = g.filterText.empty() ? g.sel : (g.sel < (int)g_filteredIdx.size() ? g_filteredIdx[g.sel] : -1);
             if (idx >= 0 && g.nodes && (size_t)idx < g.nodeCount) {
                 auto &node = (*g.nodes)[idx];
@@ -886,11 +1356,9 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 std::string fullPath = ensureContentFile(g.projects[g.curProject], file);
                 std::string content = readContentFile(fullPath);
 
-                // strip journal header if present
                 std::string body = extractBody(content);
                 if (body.empty()) body = content;
 
-                // set up editor
                 ctx.editContent = body;
                 g.pendingJournalFile = std::string("__outline_") + file;
                 ctx.editFilename = g.pendingJournalFile;
@@ -899,6 +1367,15 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 ctx.nextState = APP_EDITOR;
                 return APP_EDITOR;
             }
+        }
+
+        if (key == '?') {
+            g.helpScroll = 0;
+            g.helpPrevMode = M_BROWSE;
+            g.mode = M_HELP;
+            drawHelp();
+            ui_commit();
+            return APP_OUTLINE;
         }
 
         drawOutline(); ui_commit();
@@ -945,6 +1422,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 node.set("level", newLevel);
                 node.set("file", "");
                 node.set("note", "");
+                node.set("keywords", "");
                 if (g.insertAfter >= 0 && g.insertAfter < (int)g.nodes->size())
                     g.nodes->insert(g.nodes->begin() + g.insertAfter + 1, node);
                 else
