@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <cstddef>
 
+#include "symbol_glyphs.h"
+
 // Font renderer: reads from embedded terminus28.fnt / terminus22.fnt blobs
 class FontRenderer {
 public:
@@ -52,6 +54,9 @@ private:
 
     // Draw a single glyph at (x, y)
     void drawGlyph(int x, int y, const GlyphMeta *meta, bool invert);
+
+    // Draw a symbol glyph from the TTF supplement table
+    void drawSymbolGlyph(int x, int y, const SymbolGlyph *sym, bool invert);
 
     // Parse font header from a blob pointer
     bool parseBlob(const uint8_t *blob, size_t sz);

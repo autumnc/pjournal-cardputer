@@ -159,7 +159,13 @@ int FontRenderer::textWidth(const char *text) {
     while (*text) {
         uint32_t cp = utf8Decode(text);
         if (cp == 0) continue;
-        w += charWidth(cp);
+        auto *m = findGlyph(cp);
+        if (m) {
+            w += m->advance;
+        } else {
+            auto *sym = getSymbolGlyph(cp, font_size_);
+            w += sym ? sym->advance : (line_height_ / 2);
+        }
     }
     return w;
 }
@@ -199,6 +205,31 @@ void FontRenderer::drawGlyph(int x, int y, const GlyphMeta *meta, bool invert) {
     }
 }
 
+void FontRenderer::drawSymbolGlyph(int x, int y, const SymbolGlyph *sym, bool invert) {
+    if (!g_u8g2 || !sym) return;
+    int bw = sym->width;
+    int bh = sym->height;
+    int xo = sym->x_off;
+    int yo = sym->y_off;
+    int row_bytes = (bw + 7) / 8;
+    const uint8_t *bits = sym->bitmap;
+
+    int draw_x = x + xo;
+    int draw_y = y - yo;
+
+    for (int row = 0; row < bh; row++) {
+        for (int col = 0; col < bw; col++) {
+            int byte_idx = row * row_bytes + col / 8;
+            int bit = 7 - (col % 8);
+            bool on = (bits[byte_idx] >> bit) & 1;
+            if (invert) on = !on;
+            if (on) {
+                u8g2_DrawPixel(g_u8g2, draw_x + col, draw_y + row);
+            }
+        }
+    }
+}
+
 int FontRenderer::drawText(int x, int y, const char *text, bool invert) {
     int orig_x = x;
     while (*text) {
@@ -209,7 +240,13 @@ int FontRenderer::drawText(int x, int y, const char *text, bool invert) {
             drawGlyph(x, y, meta, invert);
             x += meta->advance;
         } else {
-            x += line_height_ / 2;
+            auto *sym = getSymbolGlyph(cp, font_size_);
+            if (sym) {
+                drawSymbolGlyph(x, y, sym, invert);
+                x += sym->advance;
+            } else {
+                x += line_height_ / 2;
+            }
         }
     }
     return x - orig_x;

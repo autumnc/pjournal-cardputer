@@ -11,6 +11,9 @@
 #include <sys/stat.h>
 #include <algorithm>
 #include <unistd.h>
+#include <set>
+
+#define KEY_CTRL_ENTER 0x85
 
 extern void *g_u8g2;
 extern "C" {
@@ -45,7 +48,7 @@ static void drawFileIcon(int x, int baseline) {
 
 #define OUTLINE_DIR "/sdcard/outline"
 
-enum Mode { M_PROJECTS, M_BROWSE, M_DETAIL, M_ADD_PROJECT, M_ADD_HEADING, M_ADD_SUB, M_FILTER, M_EDIT_NOTE, M_SUMMARY, M_HELP, M_CONFIRM };
+enum Mode { M_PROJECTS, M_BROWSE, M_DETAIL, M_ADD_PROJECT, M_ADD_HEADING, M_ADD_SUB, M_FILTER, M_EDIT_NOTE, M_EDIT_NOTE_ML, M_SUMMARY, M_HELP, M_BOOKMARK_MGR, M_CONFIRM };
 
 // ── State ────────────────────────────────────────────────────────────────
 static struct {
@@ -84,6 +87,20 @@ static struct {
     // summary dialog
     int summaryScroll = 0;
     int summaryNodeIdx = -1;
+
+    // fold state
+    std::set<int> foldedNodes;  // indices of folded (collapsed) nodes
+
+    // bookmark state
+    int bmMgrSel = 0;
+
+    // multi-line note editor
+    std::vector<std::string> noteLines;
+    int noteRow = 0;
+    int noteCol = 0;
+    int noteScroll = 0;
+    std::vector<VRow> noteVrows;
+    bool noteVrowsDirty = true;
 
     // help dialog
     int helpScroll = 0;
@@ -143,6 +160,11 @@ static void loadOutline() {
             nodes.elements[write++] = nodes[i];
     }
     nodes.elements.resize(write);
+
+    // Ensure bookmarks before taking address of nodes.elements,
+    // since set() may reallocate memberValues and invalidate the pointer.
+    if (!g.outlineData.has("bookmarks") || !g.outlineData["bookmarks"].isArray())
+        g.outlineData.set("bookmarks", JsonValue::array());
 
     g.nodes = &g.outlineData["nodes"].elements;
     g.nodeCount = g.outlineData["nodes"].size();
@@ -219,14 +241,23 @@ static std::vector<int> g_filteredIdx;
 static void rebuildFilter() {
     g_filteredIdx.clear();
     if (!g.nodes) return;
+    // Build set of nodes hidden by folding
+    std::set<int> hiddenByFold;
+    for (int fi : g.foldedNodes) {
+        if (fi < 0 || (size_t)fi >= g.nodeCount) continue;
+        int foldLvl = (*g.nodes)[fi]["level"].asInt(0);
+        for (int j = fi + 1; j < (int)g.nodeCount; j++) {
+            if ((*g.nodes)[j]["level"].asInt(0) <= foldLvl) break;
+            hiddenByFold.insert(j);
+        }
+    }
     for (size_t i = 0; i < g.nodeCount; i++) {
+        if (hiddenByFold.count((int)i)) continue;
         if (g.filterText.empty()) {
             g_filteredIdx.push_back((int)i);
         } else {
             std::string title = (*g.nodes)[i]["title"].asString();
-            std::string note  = (*g.nodes)[i]["note"].asString();
-            if (title.find(g.filterText) != std::string::npos ||
-                note.find(g.filterText) != std::string::npos)
+            if (title.find(g.filterText) != std::string::npos)
                 g_filteredIdx.push_back((int)i);
         }
     }
@@ -431,6 +462,7 @@ static void drawInputOverlay(const char *title) {
 
 static void drawProjectList();
 static void drawOutline();
+static void drawBookmarkMgr();
 static void drawOutlineDetail();
 static void drawHelp();
 
@@ -575,7 +607,7 @@ static void drawSummary() {
 
     // Separator under title
     u8g2_DrawHLine(g_u8g2, boxX + 4, y, boxW - 8);
-    y += 8;
+    y += 8 + 15;
 
     // Keywords
     std::string kw = node["keywords"].asString();
@@ -584,45 +616,43 @@ static void drawSummary() {
     ui_draw_text(textX, y, line, false);
     y += LINE_SPACING;
 
-    // Notes - inline word-wrap
+    // Notes - inline word-wrap, continues on same line after "备注:"
     std::string note = node["note"].asString();
     if (note.empty()) {
         ui_draw_text(textX, y, "备注: (无)", false);
     } else {
-        ui_draw_text(textX, y, "备注:", false);
-        y += LINE_SPACING;
-        std::vector<std::string> noteLines;
-        std::string curLine;
-        for (size_t k = 0; k < note.size(); k++) {
-            if (note[k] == '\n') { noteLines.push_back(curLine); curLine.clear(); }
-            else curLine += note[k];
-        }
-        if (!curLine.empty() || noteLines.empty()) noteLines.push_back(curLine);
+        // Flatten note into a single line (replace newlines with spaces)
+        std::string flatNote;
+        for (char c : note) { flatNote += (c == '\n') ? ' ' : c; }
+        std::string prefix = "备注: ";
+        int prefixW = g_font.textWidth(prefix.c_str());
+        int noteX = textX;
+        // First line starts after "备注:" prefix
+        std::string firstLine = prefix + flatNote;
+        // Word-wrap the combined text within contentW
         std::vector<std::string> wrapped;
-        for (auto &nl : noteLines) {
-            int pos = 0;
-            int len = (int)nl.length();
-            while (pos < len) {
-                int end = pos;
-                int lastBreak = -1;
-                while (end < len) {
-                    std::string sub = nl.substr(pos, end - pos + 1);
-                    if (g_font.textWidth(sub.c_str()) > contentW) break;
-                    if (nl[end] == ' ') lastBreak = end + 1;
-                    end++;
-                }
-                if (end >= len) { wrapped.push_back(nl.substr(pos)); break; }
-                if (lastBreak > pos) {
-                    wrapped.push_back(nl.substr(pos, lastBreak - pos));
-                    pos = lastBreak;
-                    while (pos < len && nl[pos] == ' ') pos++;
-                } else if (end > pos) {
-                    wrapped.push_back(nl.substr(pos, end - pos));
-                    pos = end;
-                } else {
-                    wrapped.push_back(nl.substr(pos, 1));
-                    pos++;
-                }
+        int pos = 0;
+        int len = (int)firstLine.length();
+        while (pos < len) {
+            int end = pos;
+            int lastBreak = -1;
+            while (end < len) {
+                std::string sub = firstLine.substr(pos, end - pos + 1);
+                if (g_font.textWidth(sub.c_str()) > contentW) break;
+                if (firstLine[end] == ' ') lastBreak = end + 1;
+                end++;
+            }
+            if (end >= len) { wrapped.push_back(firstLine.substr(pos)); break; }
+            if (lastBreak > pos) {
+                wrapped.push_back(firstLine.substr(pos, lastBreak - pos));
+                pos = lastBreak;
+                while (pos < len && firstLine[pos] == ' ') pos++;
+            } else if (end > pos) {
+                wrapped.push_back(firstLine.substr(pos, end - pos));
+                pos = end;
+            } else {
+                wrapped.push_back(firstLine.substr(pos, 1));
+                pos++;
             }
         }
         int textAreaH = boxY + boxH - 16 - y;
@@ -639,12 +669,37 @@ static void drawSummary() {
     ui_commit();
 }
 
+static void drawBookmarkMgr() {
+    ui_clear();
+    ui_draw_text(4, g_font.ascent(), "书签管理", false, true);
+    u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
+    int y = FONT_H + 8 + LINE_SPACING;
+    auto &bmArr = g.outlineData["bookmarks"];
+    int bmCount = bmArr.isArray() ? (int)bmArr.size() : 0;
+    int vis = (STATUS_Y - y + LINE_SPACING - 1) / LINE_SPACING;
+    if (vis < 1) vis = 1;
+    if (g.bmMgrSel < g.scroll) g.scroll = g.bmMgrSel;
+    if (g.bmMgrSel >= g.scroll + vis) g.scroll = g.bmMgrSel - vis + 1;
+    for (int i = 0; i < vis && (g.scroll + i) < bmCount; i++) {
+        int bi = g.scroll + i;
+        auto &bm = bmArr[bi];
+        std::string bmTitle = bm["title"].asString();
+        bool sel = (bi == g.bmMgrSel);
+        ui_draw_text(8, y + i * LINE_SPACING, bmTitle.c_str(), sel);
+    }
+    if (bmCount == 0) ui_draw_text(8, y, "暂无书签 — 在大纲中按m添加");
+    char sl[96];
+    snprintf(sl, sizeof(sl), "Enter:跳转 d:删除 Esc:返回 %d项", bmCount);
+    ui_draw_status(sl, "");
+    drawIMEStatus(); ui_commit();
+}
+
 static void drawProjectList() {
     ui_clear();
     ui_draw_text(4, g_font.ascent(), "选择项目", false, true);
     u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
 
-    int y = FONT_H + 8 + LINE_SPACING;
+    int y = FONT_H + 8 + LINE_SPACING + 2;
     int vis = (STATUS_Y - y + LINE_SPACING - 1) / LINE_SPACING;
     if (vis < 1) vis = 1;
 
@@ -701,13 +756,35 @@ static void drawOutline() {
 
         char buf[96];
         std::string tprefix = g.filterText.empty() ? nodeTreePrefix(ni) : std::string(lvl * 2, ' ');
-        snprintf(buf, sizeof(buf), "%s%s", tprefix.c_str(), title.c_str());
+        // Check if this node has children (for fold indicator)
+        bool hasChildren = false;
+        if (ni + 1 < (int)g.nodeCount && (*g.nodes)[ni + 1]["level"].asInt(0) > lvl)
+            hasChildren = true;
+        bool isFolded = g.foldedNodes.count(ni) > 0;
+        std::string foldMark;
+        if (hasChildren && isFolded) foldMark = "▸ ";
+        else if (hasChildren) foldMark = "▾ ";
+        snprintf(buf, sizeof(buf), "%s%s%s", tprefix.c_str(), foldMark.c_str(), title.c_str());
         ui_draw_text(8, y + i * LINE_SPACING, buf, sel);
 
-        // show [K] [M] indicators before file icon
+        // Bookmark indicator
+        auto &bmArr = g.outlineData["bookmarks"];
+        bool isBookmarked = false;
+        std::string nodeId = node["id"].asString();
+        if (bmArr.isArray()) {
+            for (int bi = 0; bi < (int)bmArr.size(); bi++)
+                if (bmArr[bi]["id"].asString() == nodeId) { isBookmarked = true; break; }
+        }
+
+        // show indicators: ★ [K] [M] before file icon
         int rightX = SCREEN_W - 4;
         std::string file = node["file"].asString();
         if (!file.empty()) rightX -= FILE_ICON_W;
+        if (isBookmarked) {
+            int bw = g_font.textWidth("★") + 2;
+            rightX -= bw;
+            g_font.drawText(rightX, y + i * LINE_SPACING, "★", sel);
+        }
         std::string keywords = node["keywords"].asString();
         std::string note = node["note"].asString();
         if (!note.empty()) {
@@ -722,7 +799,7 @@ static void drawOutline() {
         }
         // show file indicator
         if (!file.empty()) {
-            drawFileIcon(SCREEN_W - FILE_ICON_W - 4, y + i * LINE_SPACING);
+            drawFileIcon(SCREEN_W - FILE_ICON_W - 4, y + i * LINE_SPACING + 2);
         }
     }
 
@@ -732,7 +809,7 @@ static void drawOutline() {
         ui_draw_text(4, STATUS_Y - LINE_SPACING + 2, fb, true);
     }
 
-    ui_draw_status("a:标题 i:子标题 r:重命名 d:删除 s:摘要 f:文件 Enter:详情 /:筛选", "");
+    ui_draw_status("a:标题 i:子标题 r:重命名 d:删除 s:摘要 f:文件 m:书签 b:书签管理 /:筛选", "");
 
     if (composingFilter) drawIMEStatus();
 }
@@ -859,24 +936,42 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
 
     // ── M_FILTER ─────────────────────────────────────────────────────
     if (g.mode == M_FILTER) {
+        // Esc always exits filter mode, even when IME is active
+        if (key == 0x1B) {
+            g.mode = M_BROWSE; g.imeActive = false; g_ime.setActive(false);
+            g.filterText.clear(); rebuildFilter();
+            drawOutline(); ui_commit(); return APP_OUTLINE;
+        }
+        // Backspace: if IME is composing, let it handle; otherwise delete from filterText
+        if ((key == 0x7F || key == 0x08) && g.imeActive && g_ime.composing()) {
+            std::string imeOut;
+            g_ime.handleKey(key, imeOut);
+            drawOutline(); ui_commit(); return APP_OUTLINE;
+        }
+        if ((key == 0x7F || key == 0x08) && (!g.imeActive || !g_ime.composing())) {
+            if (!g.filterText.empty()) {
+                int len = (int)g.filterText.size();
+                while (len > 1 && ((unsigned char)g.filterText[len - 1] & 0xC0) == 0x80) len--;
+                g.filterText.erase(len - 1);
+                rebuildFilter();
+            }
+            drawOutline(); ui_commit(); return APP_OUTLINE;
+        }
         if (g.imeActive && key != 0) {
             std::string imeOut;
             if (g_ime.handleKey(key, imeOut)) {
                 if (!imeOut.empty()) { g.filterText += imeOut; rebuildFilter(); }
                 drawOutline(); ui_commit(); return APP_OUTLINE;
             }
+            // IME consumed the key (still composing) — don't add to filterText
+            drawOutline(); ui_commit(); return APP_OUTLINE;
         }
         if (key == KEY_IME_TOGGLE) {
             g.imeActive = !g.imeActive; g_ime.setActive(g.imeActive);
             drawOutline(); ui_commit(); return APP_OUTLINE;
         }
-        if (key == 0x1B) {
+        if (key == 0x0A || key == 0x0D) {
             g.mode = M_BROWSE; g.imeActive = false; g_ime.setActive(false);
-            g.filterText.clear(); rebuildFilter();
-        } else if (key == 0x0A || key == 0x0D) {
-            g.mode = M_BROWSE; g.imeActive = false; g_ime.setActive(false);
-        } else if (key == 0x7F || key == 0x08) {
-            if (!g.filterText.empty()) { g.filterText.pop_back(); rebuildFilter(); }
         } else if (key >= 0x20 && key <= 0x7E) {
             g.filterText += (char)key; rebuildFilter();
         }
@@ -912,13 +1007,22 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                     g.imeActive = true; g_ime.setActive(true);
                     g.mode = M_EDIT_NOTE;
                 } else {
+                    // Open multi-line note editor
                     g.editNoteIdx = g.detailNodeIdx;
-                    g.editingTitle = false;
-                    g.editingKeyword = false;
-                    g.editBuf = node["note"].asString();
-                    g.editCur = (int)g.editBuf.length();
+                    std::string note = node["note"].asString();
+                    g.noteLines.clear();
+                    size_t npos = 0;
+                    while (npos < note.length()) {
+                        size_t nl = note.find('\n', npos);
+                        g.noteLines.push_back((nl == std::string::npos) ? note.substr(npos) : note.substr(npos, nl - npos));
+                        if (nl == std::string::npos) break;
+                        npos = nl + 1;
+                    }
+                    if (g.noteLines.empty()) g.noteLines.push_back("");
+                    g.noteRow = 0; g.noteCol = (int)g.noteLines[0].length();
+                    g.noteScroll = 0; g.noteVrowsDirty = true;
                     g.imeActive = true; g_ime.setActive(true);
-                    g.mode = M_EDIT_NOTE;
+                    g.mode = M_EDIT_NOTE_ML;
                 }
             }
         } else if (key == 's' || key == 'S') {
@@ -1039,6 +1143,210 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             g.helpScroll += 5;
         }
         drawHelp();
+        return APP_OUTLINE;
+    }
+
+    // ── M_BOOKMARK_MGR ──────────────────────────────────────────────
+    if (g.mode == M_BOOKMARK_MGR) {
+        auto &bmArr = g.outlineData["bookmarks"];
+        int bmCount = bmArr.isArray() ? (int)bmArr.size() : 0;
+        if (key == 0x1B || key == 'q' || key == 'Q') {
+            g.mode = M_BROWSE;
+        } else if (key == KEY_UP || key == 'j') {
+            if (g.bmMgrSel > 0) g.bmMgrSel--;
+        } else if (key == KEY_DOWN || key == 'k') {
+            if (g.bmMgrSel < bmCount - 1) g.bmMgrSel++;
+        } else if (key == 0x0A || key == 0x0D) {
+            // Jump to bookmarked node
+            if (g.bmMgrSel >= 0 && g.bmMgrSel < bmCount && g.nodes) {
+                std::string bid = bmArr[g.bmMgrSel]["id"].asString();
+                for (size_t i = 0; i < g.nodeCount; i++) {
+                    if ((*g.nodes)[i]["id"].asString() == bid) {
+                        // Unfold ancestors and select
+                        g.foldedNodes.clear();
+                        rebuildFilter();
+                        // Find in filtered
+                        for (int fi = 0; fi < (int)g_filteredIdx.size(); fi++) {
+                            if (g_filteredIdx[fi] == (int)i) { g.sel = fi; break; }
+                        }
+                        g.mode = M_BROWSE;
+                        break;
+                    }
+                }
+            }
+        } else if ((key == 'd' || key == 'D') && g.bmMgrSel >= 0 && g.bmMgrSel < bmCount) {
+            bmArr.elements.erase(bmArr.elements.begin() + g.bmMgrSel);
+            if (g.bmMgrSel >= bmCount - 1) g.bmMgrSel = bmCount - 2;
+            if (g.bmMgrSel < 0) g.bmMgrSel = 0;
+            saveOutline();
+        }
+        drawBookmarkMgr();
+        return APP_OUTLINE;
+    }
+
+    // ── M_EDIT_NOTE_ML: multi-line note editor ───────────────────────
+    if (g.mode == M_EDIT_NOTE_ML) {
+        if (g.imeActive && key != 0) {
+            std::string imeOut;
+            if (g_ime.handleKey(key, imeOut)) {
+                if (!imeOut.empty()) {
+                    g.noteLines[g.noteRow].insert(g.noteCol, imeOut);
+                    g.noteCol += (int)imeOut.length();
+                    g.noteVrowsDirty = true;
+                }
+                goto drawNoteEditor;
+            }
+        }
+        if (key == KEY_IME_TOGGLE) {
+            g.imeActive = !g.imeActive; g_ime.setActive(g.imeActive);
+            goto drawNoteEditor;
+        }
+        if (key == 0x1B) {
+            // Save and close
+            if (g.editNoteIdx >= 0 && g.nodes && (size_t)g.editNoteIdx < g.nodeCount) {
+                std::string noteText;
+                for (int i = 0; i < (int)g.noteLines.size(); i++) {
+                    if (i > 0) noteText += '\n';
+                    noteText += g.noteLines[i];
+                }
+                (*g.nodes)[g.editNoteIdx].set("note", noteText);
+                saveOutline();
+            }
+            g.mode = M_DETAIL; g.imeActive = false; g_ime.setActive(false);
+            drawOutlineDetail(); return APP_OUTLINE;
+        }
+        if (key == 0x0A || key == 0x0D) {
+            // New line
+            std::string rest = g.noteLines[g.noteRow].substr(g.noteCol);
+            g.noteLines[g.noteRow] = g.noteLines[g.noteRow].substr(0, g.noteCol);
+            g.noteRow++;
+            g.noteLines.insert(g.noteLines.begin() + g.noteRow, rest);
+            g.noteCol = 0;
+            g.noteVrowsDirty = true;
+        } else if (key == 0x7F || key == 0x08) {
+            if (g.noteCol > 0) {
+                int prev = g.noteCol - 1;
+                while (prev > 0 && ((unsigned char)g.noteLines[g.noteRow][prev] & 0xC0) == 0x80) prev--;
+                g.noteLines[g.noteRow].erase(prev, g.noteCol - prev);
+                g.noteCol = prev;
+                g.noteVrowsDirty = true;
+            } else if (g.noteRow > 0) {
+                // Join with previous line
+                int prevLen = (int)g.noteLines[g.noteRow - 1].length();
+                g.noteLines[g.noteRow - 1] += g.noteLines[g.noteRow];
+                g.noteLines.erase(g.noteLines.begin() + g.noteRow);
+                g.noteRow--;
+                g.noteCol = prevLen;
+                g.noteVrowsDirty = true;
+            }
+        } else if (key == KEY_UP) {
+            if (g.noteRow > 0) { g.noteRow--; g.noteCol = std::min(g.noteCol, (int)g.noteLines[g.noteRow].length()); }
+        } else if (key == KEY_DOWN) {
+            if (g.noteRow < (int)g.noteLines.size() - 1) { g.noteRow++; g.noteCol = std::min(g.noteCol, (int)g.noteLines[g.noteRow].length()); }
+        } else if (key == KEY_LEFT) {
+            if (g.noteCol > 0) { g.noteCol--; while (g.noteCol > 0 && ((unsigned char)g.noteLines[g.noteRow][g.noteCol] & 0xC0) == 0x80) g.noteCol--; }
+        } else if (key == KEY_RIGHT) {
+            if (g.noteCol < (int)g.noteLines[g.noteRow].length()) { g.noteCol++; while (g.noteCol < (int)g.noteLines[g.noteRow].length() && ((unsigned char)g.noteLines[g.noteRow][g.noteCol] & 0xC0) == 0x80) g.noteCol++; }
+        } else if (key == '\t' || (key == KEY_CTRL_ENTER)) {
+            // Tab or Ctrl+Enter = save
+            if (g.editNoteIdx >= 0 && g.nodes && (size_t)g.editNoteIdx < g.nodeCount) {
+                std::string noteText;
+                for (int i = 0; i < (int)g.noteLines.size(); i++) {
+                    if (i > 0) noteText += '\n';
+                    noteText += g.noteLines[i];
+                }
+                (*g.nodes)[g.editNoteIdx].set("note", noteText);
+                saveOutline();
+            }
+            g.mode = M_DETAIL; g.imeActive = false; g_ime.setActive(false);
+            drawOutlineDetail(); return APP_OUTLINE;
+        } else if (key >= 0x20 && key <= 0x7E) {
+            g.noteLines[g.noteRow].insert(g.noteCol, 1, (char)key);
+            g.noteCol++;
+            g.noteVrowsDirty = true;
+        }
+        drawNoteEditor:
+        {
+            // Draw note editor
+            ui_clear();
+            ui_draw_text(4, g_font.ascent(), "备注编辑", false, true);
+            u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
+            if (g.noteVrowsDirty) {
+                g.noteVrows.clear();
+                for (int li = 0; li < (int)g.noteLines.size(); li++) {
+                    if (g.noteLines[li].empty()) { g.noteVrows.push_back({li, 0, 0}); continue; }
+                    int pos = 0, len = (int)g.noteLines[li].length();
+                    while (pos < len) {
+                        int cw = 0, end = pos, lastBreak = -1;
+                        while (end < len) {
+                            unsigned char c = (unsigned char)g.noteLines[li][end];
+                            int cc = 1;
+                            if (c >= 0x80 && (c & 0xE0) == 0xC0) cc = 2;
+                            else if (c >= 0x80 && (c & 0xF0) == 0xE0) cc = 3;
+                            else if (c >= 0x80 && (c & 0xF8) == 0xF0) cc = 4;
+                            int charW = g_font.textWidth(g.noteLines[li].substr(end, cc).c_str());
+                            if (cw + charW > SCREEN_W - 8) break;
+                            cw += charW;
+                            if (c == ' ') lastBreak = end + 1;
+                            end += cc;
+                        }
+                        if (end >= len) { g.noteVrows.push_back({li, pos, len}); break; }
+                        if (lastBreak > pos) { g.noteVrows.push_back({li, pos, lastBreak}); pos = lastBreak; }
+                        else { g.noteVrows.push_back({li, pos, end}); pos = end; }
+                    }
+                }
+                g.noteVrowsDirty = false;
+            }
+            int contentY = FONT_H + 8 + LINE_SPACING;
+            int maxY = g_ime.composing() ? (STATUS_Y - 2 * LINE_SPACING) : STATUS_Y;
+            int vis = (maxY - contentY) / LINE_SPACING;
+            if (vis < 1) vis = 1;
+            int cursorVrow = 0;
+            for (int i = 0; i < (int)g.noteVrows.size(); i++) {
+                if (g.noteVrows[i].lineIdx == g.noteRow && g.noteCol >= g.noteVrows[i].start && g.noteCol <= g.noteVrows[i].end) { cursorVrow = i; break; }
+            }
+            if (cursorVrow < g.noteScroll) g.noteScroll = cursorVrow;
+            if (cursorVrow >= g.noteScroll + vis) g.noteScroll = cursorVrow - vis + 1;
+            for (int i = 0; i < vis && (g.noteScroll + i) < (int)g.noteVrows.size(); i++) {
+                auto &vr = g.noteVrows[g.noteScroll + i];
+                int ly = contentY + i * LINE_SPACING;
+                std::string text = g.noteLines[vr.lineIdx].substr(vr.start, vr.end - vr.start);
+                ui_draw_text(4, ly, text.c_str(), false);
+            }
+            {
+                auto &vr = g.noteVrows[cursorVrow];
+                std::string before = g.noteLines[vr.lineIdx].substr(vr.start, g.noteCol - vr.start);
+                int cx = 4 + g_font.textWidth(before.c_str());
+                int cy = contentY + (cursorVrow - g.noteScroll) * LINE_SPACING;
+                u8g2_SetDrawColor(g_u8g2, 0);
+                u8g2_DrawBox(g_u8g2, cx, cy + 4, 8, 3);
+                u8g2_SetDrawColor(g_u8g2, 1);
+            }
+            u8g2_SetDrawColor(g_u8g2, 0);
+            // IME at bottom
+            if (g_ime.composing()) {
+                std::string code = g_ime.displayCode();
+                int total = g_ime.totalCandidates();
+                int pageSize = g_ime.pageSize();
+                int curPage = g_ime.currentPage();
+                int totalPages = (total + pageSize - 1) / pageSize;
+                if (totalPages < 1) totalPages = 1;
+                char pageInfo[32];
+                snprintf(pageInfo, sizeof(pageInfo), "%d/%d", curPage, totalPages);
+                int candBaseline = STATUS_Y - 9;
+                int sepY = candBaseline - FONT_H - 4;
+                int codeBaseline = sepY - 7;
+                { int cw = g_font.textWidth(code.c_str()) + 8; u8g2_SetDrawColor(g_u8g2, 1); u8g2_DrawBox(g_u8g2, 4, codeBaseline - g_font.ascent(), cw, FONT_H); u8g2_SetDrawColor(g_u8g2, 0); g_font.drawText(4, codeBaseline, code.c_str(), false); u8g2_SetDrawColor(g_u8g2, 1); }
+                { int tw = g_font.textWidth(pageInfo); int pw = tw + 8; int px = SCREEN_W - pw - 4; u8g2_SetDrawColor(g_u8g2, 1); u8g2_DrawBox(g_u8g2, px, codeBaseline - g_font.ascent(), pw, FONT_H); u8g2_SetDrawColor(g_u8g2, 0); g_font.drawText(px + 4, codeBaseline, pageInfo, false); u8g2_SetDrawColor(g_u8g2, 1); }
+                u8g2_SetDrawColor(g_u8g2, 0); u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W); u8g2_SetDrawColor(g_u8g2, 1);
+                auto &cands = g_ime.candidates();
+                std::string candLine;
+                for (int i = 0; i < (int)cands.size(); i++) { char idx[16]; snprintf(idx, sizeof(idx), "%d.", (i % pageSize) + 1); std::string part = std::string(" ") + idx + cands[i]; int curW = g_font.textWidth(candLine.c_str()); int partW = g_font.textWidth(part.c_str()); if (curW + partW + 8 > SCREEN_W) break; candLine += part; }
+                { int cw = g_font.textWidth(candLine.c_str()) + 8; u8g2_SetDrawColor(g_u8g2, 1); u8g2_DrawBox(g_u8g2, 4, candBaseline - g_font.ascent(), cw, FONT_H); u8g2_SetDrawColor(g_u8g2, 0); g_font.drawText(4, candBaseline, candLine.c_str(), false); u8g2_SetDrawColor(g_u8g2, 1); }
+            }
+            ui_draw_status("Enter换行 Tab保存 Esc返回", "");
+            ui_commit();
+        }
         return APP_OUTLINE;
     }
 
@@ -1213,6 +1521,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             if (!g.nodes) {
                 g.outlineData = JsonValue::object();
                 g.outlineData.set("nodes", JsonValue::array());
+                g.outlineData.set("bookmarks", JsonValue::array());
                 g.nodes = &g.outlineData["nodes"].elements;
                 g.nodeCount = 0;
             }
@@ -1240,6 +1549,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 if (!g.nodes) {
                     g.outlineData = JsonValue::object();
                     g.outlineData.set("nodes", JsonValue::array());
+                    g.outlineData.set("bookmarks", JsonValue::array());
                     g.nodes = &g.outlineData["nodes"].elements;
                     g.nodeCount = 0;
                 }
@@ -1378,6 +1688,63 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             return APP_OUTLINE;
         }
 
+        // z: toggle fold, Z: fold/unfold all
+        if (key == 'z' && g.nodes && g.nodeCount > 0) {
+            int idx = g.filterText.empty() ? g.sel : (g.sel < (int)g_filteredIdx.size() ? g_filteredIdx[g.sel] : -1);
+            if (idx >= 0 && (size_t)idx < g.nodeCount) {
+                if (g.foldedNodes.count(idx)) g.foldedNodes.erase(idx);
+                else g.foldedNodes.insert(idx);
+                rebuildFilter();
+            }
+        }
+        if (key == 'Z') {
+            if (g.foldedNodes.empty()) {
+                // Fold all nodes that have children
+                for (size_t i = 0; i < g.nodeCount; i++) {
+                    int lvl = (*g.nodes)[i]["level"].asInt(0);
+                    if (i + 1 < g.nodeCount && (*g.nodes)[i + 1]["level"].asInt(0) > lvl)
+                        g.foldedNodes.insert((int)i);
+                }
+            } else {
+                g.foldedNodes.clear();
+            }
+            rebuildFilter();
+        }
+
+        // m: toggle bookmark on selected
+        if ((key == 'm' || key == 'M') && g.nodes && g.nodeCount > 0) {
+            int idx = g.filterText.empty() ? g.sel : (g.sel < (int)g_filteredIdx.size() ? g_filteredIdx[g.sel] : -1);
+            if (idx >= 0 && (size_t)idx < g.nodeCount) {
+                auto &bmArr = g.outlineData["bookmarks"];
+                auto &node = (*g.nodes)[idx];
+                std::string nid = node["id"].asString();
+                bool found = false;
+                for (int i = 0; i < (int)bmArr.size(); i++) {
+                    if (bmArr[i]["id"].asString() == nid) {
+                        bmArr.elements.erase(bmArr.elements.begin() + i);
+                        found = true; break;
+                    }
+                }
+                if (!found) {
+                    JsonValue bm;
+                    bm.set("id", nid);
+                    bm.set("title", node["title"].asString());
+                    bm.set("level", node["level"].asInt(0));
+                    bmArr.pushBack(bm);
+                }
+                saveOutline();
+            }
+        }
+
+        // b: bookmark manager
+        if (key == 'b' || key == 'B') {
+            g.bmMgrSel = 0;
+            g.scroll = 0;
+            g.mode = M_BOOKMARK_MGR;
+            drawBookmarkMgr();
+            return APP_OUTLINE;
+        }
+
         drawOutline(); ui_commit();
         return APP_OUTLINE;
     }
@@ -1407,6 +1774,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 if (!g.nodes) {
                     g.outlineData = JsonValue::object();
                     g.outlineData.set("nodes", JsonValue::array());
+                    g.outlineData.set("bookmarks", JsonValue::array());
                     g.nodes = &g.outlineData["nodes"].elements;
                     g.nodeCount = 0;
                 }

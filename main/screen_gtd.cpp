@@ -239,6 +239,12 @@ static struct {
 
     std::string renameTargetProject;
 
+
+
+    // fold state (indices into g_gtdTree that are collapsed)
+
+    std::set<int> foldedNodes;
+
 } g;
 
 
@@ -258,6 +264,7 @@ struct GtdTreeItem {
 };
 
 static std::vector<GtdTreeItem> g_gtdTree;
+static std::vector<int> g_visibleTreeIdx; // indices into g_gtdTree, after fold filtering
 
 
 
@@ -595,9 +602,25 @@ static void rebuildFilter() {
 
         buildGtdTree();
 
-        g.filtered.clear();
+        // Apply fold: build visible tree index list (skipping children of folded nodes)
+        g_visibleTreeIdx.clear();
+        std::set<int> hiddenByFold;
+        for (int fi : g.foldedNodes) {
+            if (fi < 0 || fi >= (int)g_gtdTree.size()) continue;
+            int foldDepth = g_gtdTree[fi].depth;
+            for (int j = fi + 1; j < (int)g_gtdTree.size(); j++) {
+                if (g_gtdTree[j].depth <= foldDepth) break;
+                hiddenByFold.insert(j);
+            }
+        }
+        for (int i = 0; i < (int)g_gtdTree.size(); i++) {
+            if (!hiddenByFold.count(i))
+                g_visibleTreeIdx.push_back(i);
+        }
 
-        for (auto &ti : g_gtdTree) g.filtered.push_back(ti.taskIdx);
+        g.filtered.clear();
+        for (int vi : g_visibleTreeIdx)
+            g.filtered.push_back(g_gtdTree[vi].taskIdx);
 
         if (g.sel >= (int)g.filtered.size()) g.sel = (int)g.filtered.size() - 1;
 
@@ -1137,10 +1160,8 @@ static void drawList() {
 
         }
 
-        char sl[96];
-
-        snprintf(sl, sizeof(sl), "Enter展开 n:新建 d:删除 r:重命名 %d个项目", (int)g.projectList.size());
-
+        char sl[32];
+        snprintf(sl, sizeof(sl), "?:帮助 | %d个项目", (int)g.projectList.size());
         ui_draw_status(sl, "");
 
         drawIMEStatus();
@@ -1185,9 +1206,10 @@ static void drawList() {
 
 
 
-        for (int i = 0; i < vis && (g.scroll + i) < (int)g_gtdTree.size(); i++) {
+        for (int i = 0; i < vis && (g.scroll + i) < (int)g_visibleTreeIdx.size(); i++) {
 
-            auto &ti = g_gtdTree[g.scroll + i];
+            int treeIdx = g_visibleTreeIdx[g.scroll + i];
+            auto &ti = g_gtdTree[treeIdx];
 
             bool sel = (g.scroll + i == g.sel);
 
@@ -1200,6 +1222,11 @@ static void drawList() {
             std::string pri = t["priority"].asString();
 
 
+
+            // Check if this node has children in the tree
+            bool hasChildren = (treeIdx + 1 < (int)g_gtdTree.size() &&
+                                g_gtdTree[treeIdx + 1].depth > ti.depth);
+            bool isFolded = g.foldedNodes.count(treeIdx) > 0;
 
             // Build tree prefix using ├─ └─ │ symbols
 
@@ -1219,6 +1246,10 @@ static void drawList() {
 
             }
 
+            // Add fold indicator
+            if (hasChildren && isFolded) prefix += "▸ ";
+            else if (hasChildren) prefix += "▾ ";
+
 
 
             char line[96];
@@ -1229,7 +1260,7 @@ static void drawList() {
 
 
 
-            // Right-side info: priority badge position
+            // Right-side info: progress + priority badge
 
             int pri_w = 0, pri_x = SCREEN_W;
 
@@ -1243,51 +1274,19 @@ static void drawList() {
 
 
 
-            // Progress + date before priority
-
-            std::string rightInfo;
+            // Progress before priority
 
             int pct = (int)t["progress"].asNumber(0);
-
-            std::string due = t["due"].asString();
 
             if (pct > 0) {
 
                 char buf[16]; snprintf(buf, sizeof(buf), "%d%%", pct);
 
-                rightInfo += buf;
-
-            }
-
-            if (!due.empty()) {
-
-                std::string dd;
-
-                size_t nd = 0;
-
-                for (char c : due) if (c == '-') nd++;
-
-                if (nd >= 2 && due.length() >= 5) dd = due.substr(due.length() - 5);
-
-                else dd = due;
-
-                if (!dd.empty()) {
-
-                    if (!rightInfo.empty()) rightInfo += " ";
-
-                    rightInfo += dd;
-
-                }
-
-            }
-
-            if (!rightInfo.empty()) {
-
-                int info_w = g_font.textWidth(rightInfo.c_str());
+                int info_w = g_font.textWidth(buf);
 
                 int info_x = pri_x - 6 - info_w;
 
-                g_font.drawText(info_x, y + i * LINE_SPACING, rightInfo.c_str(), false);
+                g_font.drawText(info_x, y + i * LINE_SPACING, buf, false);
 
             }
 
@@ -1311,11 +1310,35 @@ static void drawList() {
 
 
 
-        char sl[96];
-
-        snprintf(sl, sizeof(sl), "a:添加 i:子任务 r:重命名 Enter:详情 Space:状态 d:删除 %d项", (int)g_gtdTree.size());
-
-        ui_draw_status(sl, "");
+        // Status bar: left=help hint | selected task info
+        char statusLine[128];
+        statusLine[0] = '\0';
+        if (g.sel >= 0 && g.sel < (int)g_visibleTreeIdx.size()) {
+            auto &st = tasks[g_gtdTree[g_visibleTreeIdx[g.sel]].taskIdx];
+            std::string parts;
+            std::string sCtx = st["context"].asString();
+            if (!sCtx.empty()) parts += "@" + sCtx + " ";
+            auto &stt = st["tags"];
+            if (stt.isArray()) {
+                for (int j = 0; j < (int)stt.size(); j++) {
+                    std::string tn = stt[j].asString();
+                    if (!tn.empty()) parts += "#" + tn + " ";
+                }
+            }
+            std::string sDue = st["due"].asString();
+            if (!sDue.empty()) {
+                size_t nd = 0;
+                for (char c : sDue) if (c == '-') nd++;
+                std::string dd = (nd >= 2 && sDue.length() >= 5) ? sDue.substr(sDue.length() - 5) : sDue;
+                if (!dd.empty()) parts += dd + " ";
+            }
+            while (!parts.empty() && parts.back() == ' ') parts.pop_back();
+            if (!parts.empty())
+                snprintf(statusLine, sizeof(statusLine), "?:帮助 | %s", parts.c_str());
+        }
+        if (statusLine[0] == '\0')
+            snprintf(statusLine, sizeof(statusLine), "?:帮助");
+        ui_draw_status(statusLine, "");
 
         drawIMEStatus();
 
@@ -1357,45 +1380,11 @@ static void drawList() {
 
         std::string parent = t["parent"].asString();
 
-        std::string ctx = t["context"].asString();
-
 
 
         char line[160];
 
         snprintf(line, sizeof(line), "%s %s", statusIcon(status), title.c_str());
-
-        if (g.view != V_INBOX && !ctx.empty()) {
-
-            size_t pos = strlen(line);
-
-            snprintf(line + pos, sizeof(line) - pos, " @%s", ctx.c_str());
-
-        }
-
-        if (g.view != V_INBOX) {
-
-            auto &tt = t["tags"];
-
-            if (tt.isArray()) {
-
-                for (int j = 0; j < (int)tt.size(); j++) {
-
-                    std::string tn = tt[j].asString();
-
-                    if (!tn.empty()) {
-
-                        size_t pos = strlen(line);
-
-                        snprintf(line + pos, sizeof(line) - pos, " #%s", tn.c_str());
-
-                    }
-
-                }
-
-            }
-
-        }
 
 
 
@@ -1410,7 +1399,7 @@ static void drawList() {
 
 
 
-        // Right-side info: priority badge position
+        // Right-side info: progress + priority badge
 
         int pri_w = 0, pri_x = SCREEN_W;
 
@@ -1424,51 +1413,19 @@ static void drawList() {
 
 
 
-        // Progress + date before priority
-
-        std::string rightInfo;
+        // Progress before priority
 
         int pct = (int)t["progress"].asNumber(0);
-
-        std::string due = t["due"].asString();
 
         if (pct > 0) {
 
             char buf[16]; snprintf(buf, sizeof(buf), "%d%%", pct);
 
-            rightInfo += buf;
-
-        }
-
-        if (!due.empty()) {
-
-            std::string dd;
-
-            size_t nd = 0;
-
-            for (char c : due) if (c == '-') nd++;
-
-            if (nd >= 2 && due.length() >= 5) dd = due.substr(due.length() - 5);
-
-            else dd = due;
-
-            if (!dd.empty()) {
-
-                if (!rightInfo.empty()) rightInfo += " ";
-
-                rightInfo += dd;
-
-            }
-
-        }
-
-        if (!rightInfo.empty()) {
-
-            int info_w = g_font.textWidth(rightInfo.c_str());
+            int info_w = g_font.textWidth(buf);
 
             int info_x = pri_x - 6 - info_w;
 
-            g_font.drawText(info_x, y + i * LINE_SPACING, rightInfo.c_str(), false);
+            g_font.drawText(info_x, y + i * LINE_SPACING, buf, false);
 
         }
 
@@ -1530,10 +1487,34 @@ static void drawList() {
 
 
 
+    // Status bar: left=help hint | selected task info
     char statusLine[128];
-
-    snprintf(statusLine, sizeof(statusLine), "a:添加 r:重命名 Enter:详情 Space:状态 d:删除 c:情境 t:标签 /:筛选 %d任务", (int)g.filtered.size());
-
+    statusLine[0] = '\0';
+    if (g.sel >= 0 && g.sel < (int)g.filtered.size()) {
+        auto &st = tasks[g.filtered[g.sel]];
+        std::string parts;
+        std::string sCtx = st["context"].asString();
+        if (!sCtx.empty()) parts += "@" + sCtx + " ";
+        auto &stt = st["tags"];
+        if (stt.isArray()) {
+            for (int j = 0; j < (int)stt.size(); j++) {
+                std::string tn = stt[j].asString();
+                if (!tn.empty()) parts += "#" + tn + " ";
+            }
+        }
+        std::string sDue = st["due"].asString();
+        if (!sDue.empty()) {
+            size_t nd = 0;
+            for (char c : sDue) if (c == '-') nd++;
+            std::string dd = (nd >= 2 && sDue.length() >= 5) ? sDue.substr(sDue.length() - 5) : sDue;
+            if (!dd.empty()) parts += dd + " ";
+        }
+        while (!parts.empty() && parts.back() == ' ') parts.pop_back();
+        if (!parts.empty())
+            snprintf(statusLine, sizeof(statusLine), "?:帮助 | %s", parts.c_str());
+    }
+    if (statusLine[0] == '\0')
+        snprintf(statusLine, sizeof(statusLine), "?:帮助");
     ui_draw_status(statusLine, "");
 
 
@@ -1753,6 +1734,10 @@ static const char *HELP_LINES[] = {
     "h     提高层级",
 
     "l     降低层级",
+
+    "z     折叠/展开",
+
+    "Z     全部折叠/展开",
 
     "a     添加任务",
 
@@ -5006,6 +4991,7 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
                 g.projectDrillIdx = g.sel;
 
                 g.sel = 0; g.scroll = 0;
+                g.foldedNodes.clear();
 
                 rebuildFilter();
 
@@ -5169,6 +5155,33 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         }
 
+    }
+
+
+
+    // z: toggle fold, Z: fold/unfold all (project drill-down only)
+    if (g.view == V_PROJECT && g.projectDrillIdx >= 0 && !g_visibleTreeIdx.empty()) {
+        if (key == 'z' && g.sel >= 0 && g.sel < (int)g_visibleTreeIdx.size()) {
+            int treeIdx = g_visibleTreeIdx[g.sel];
+            // Check if has children
+            if (treeIdx + 1 < (int)g_gtdTree.size() && g_gtdTree[treeIdx + 1].depth > g_gtdTree[treeIdx].depth) {
+                if (g.foldedNodes.count(treeIdx)) g.foldedNodes.erase(treeIdx);
+                else g.foldedNodes.insert(treeIdx);
+                rebuildFilter();
+            }
+        }
+        if (key == 'Z') {
+            if (g.foldedNodes.empty()) {
+                // Fold all nodes that have children
+                for (int i = 0; i < (int)g_gtdTree.size(); i++) {
+                    if (i + 1 < (int)g_gtdTree.size() && g_gtdTree[i + 1].depth > g_gtdTree[i].depth)
+                        g.foldedNodes.insert(i);
+                }
+            } else {
+                g.foldedNodes.clear();
+            }
+            rebuildFilter();
+        }
     }
 
 
