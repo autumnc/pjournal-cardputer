@@ -29,6 +29,10 @@ static const char *TAG = "BtKeybrd";
 #define KEY_RIGHT   0x83
 #define KEY_IME_TOGGLE 0x84
 #define KEY_CTRL_ENTER 0x85
+#define KEY_SHIFT_UP    0x86
+#define KEY_SHIFT_DOWN  0x87
+#define KEY_SHIFT_LEFT  0x88
+#define KEY_SHIFT_RIGHT 0x89
 
 // HID Usage ID → ASCII
 static const uint8_t s_asc_low[] = {
@@ -49,10 +53,10 @@ static const uint8_t s_asc_shift[] = {
 };
 
 static uint8_t hid_to_ascii(uint8_t kc, uint8_t mod) {
-    if (kc == 82) return KEY_UP;
-    if (kc == 81) return KEY_DOWN;
-    if (kc == 80) return KEY_LEFT;
-    if (kc == 79) return KEY_RIGHT;
+    if (kc == 82) return (mod & 0x22) ? KEY_SHIFT_UP : KEY_UP;
+    if (kc == 81) return (mod & 0x22) ? KEY_SHIFT_DOWN : KEY_DOWN;
+    if (kc == 80) return (mod & 0x22) ? KEY_SHIFT_LEFT : KEY_LEFT;
+    if (kc == 79) return (mod & 0x22) ? KEY_SHIFT_RIGHT : KEY_RIGHT;
     if (kc < 4 || kc > 103) return 0;
     uint8_t i = kc - 4;
     if (i >= sizeof(s_asc_low)) return 0;

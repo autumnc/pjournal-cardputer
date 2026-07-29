@@ -27,6 +27,8 @@ extern "C" {
 #define EDITOR_MAX_CELLS (SCREEN_W / g_font.halfAdvance())
 
 // ── Editor state ─────────────────────────────────────────────────────────
+static std::string g_clipboard;  // global clipboard, survives across sessions
+
 static struct {
     std::vector<std::string> lines;
     int cx = 0, cy = 0;
@@ -43,7 +45,83 @@ static struct {
     int64_t autoSaveTime = 0;
     bool modifiedSinceSave = false;
     std::string savedFilename;
+
+    // Selection
+    bool hasSelection = false;
+    int selAnchorCy = 0, selAnchorCx = 0;
 } g_editor;
+
+// ── Selection helpers ────────────────────────────────────────────────────
+// Selection is defined by anchor (selAnchorCy, selAnchorCx) and cursor (cy, cx).
+// The "start" is the earlier position, "end" is the later one.
+
+struct TextPos { int cy, cx; };
+
+static bool posLess(const TextPos &a, const TextPos &b) {
+    if (a.cy != b.cy) return a.cy < b.cy;
+    return a.cx < b.cx;
+}
+
+static void getSelRange(TextPos &start, TextPos &end) {
+    if (!g_editor.hasSelection) {
+        start = {g_editor.cy, g_editor.cx};
+        end = start;
+        return;
+    }
+    TextPos anchor = {g_editor.selAnchorCy, g_editor.selAnchorCx};
+    TextPos cursor = {g_editor.cy, g_editor.cx};
+    if (posLess(anchor, cursor)) { start = anchor; end = cursor; }
+    else { start = cursor; end = anchor; }
+}
+
+static std::string getSelectedText() {
+    TextPos start, end;
+    getSelRange(start, end);
+    if (start.cy == end.cy && start.cx == end.cx) return "";
+    std::string result;
+    if (start.cy == end.cy) {
+        result = g_editor.lines[start.cy].substr(start.cx, end.cx - start.cx);
+    } else {
+        result = g_editor.lines[start.cy].substr(start.cx) + "\n";
+        for (int i = start.cy + 1; i < end.cy; i++)
+            result += g_editor.lines[i] + "\n";
+        result += g_editor.lines[end.cy].substr(0, end.cx);
+    }
+    return result;
+}
+
+static void deleteSelection() {
+    TextPos start, end;
+    getSelRange(start, end);
+    if (start.cy == end.cy && start.cx == end.cx) return;
+    // Keep text before start and after end, join on same line
+    g_editor.lines[start.cy] = g_editor.lines[start.cy].substr(0, start.cx)
+        + g_editor.lines[end.cy].substr(end.cx);
+    // Remove lines between start and end
+    if (end.cy > start.cy)
+        g_editor.lines.erase(g_editor.lines.begin() + start.cy + 1,
+                             g_editor.lines.begin() + end.cy + 1);
+    g_editor.cy = start.cy;
+    g_editor.cx = start.cx;
+    g_editor.hasSelection = false;
+    g_editor.targetCx = -1;
+    g_editor.vrowsDirty = true;
+    g_editor.wordCountDirty = true;
+    g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
+    g_editor.modifiedSinceSave = true;
+}
+
+static void clearSelection() {
+    g_editor.hasSelection = false;
+}
+
+static void extendSelection() {
+    if (!g_editor.hasSelection) {
+        g_editor.selAnchorCy = g_editor.cy;
+        g_editor.selAnchorCx = g_editor.cx;
+        g_editor.hasSelection = true;
+    }
+}
 
 static const std::vector<VRow>& getVrows() {
     if (g_editor.vrowsDirty) {
@@ -122,6 +200,33 @@ static void drawEditor() {
         auto &vr = vrows[g_editor.scroll + i];
         std::string text = g_editor.lines[vr.lineIdx].substr(vr.start, vr.end - vr.start);
         ui_draw_text(4, y + i * LINE_SPACING, text.c_str());
+    }
+
+    // Selection highlight
+    if (g_editor.hasSelection) {
+        TextPos selStart, selEnd;
+        getSelRange(selStart, selEnd);
+        for (int i = 0; i < visibleVrows && (g_editor.scroll + i) < (int)vrows.size(); i++) {
+            int vrIdx = g_editor.scroll + i;
+            auto &vr = vrows[vrIdx];
+            int lineIdx = vr.lineIdx;
+            int rowStart = vr.start, rowEnd = vr.end;
+            if (lineIdx < selStart.cy || lineIdx > selEnd.cy) continue;
+            // Calculate overlap of [rowStart, rowEnd) with selection on this line
+            int hlStart = rowStart, hlEnd = rowEnd;
+            if (lineIdx == selStart.cy) hlStart = std::max(hlStart, selStart.cx);
+            if (lineIdx == selEnd.cy) hlEnd = std::min(hlEnd, selEnd.cx);
+            if (hlStart >= hlEnd) continue;
+            // Highlight range [hlStart, hlEnd) on this vrow
+            std::string before = g_editor.lines[lineIdx].substr(rowStart, hlStart - rowStart);
+            std::string sel = g_editor.lines[lineIdx].substr(hlStart, hlEnd - hlStart);
+            int xOff = 4 + g_font.textWidth(before.c_str());
+            int selW = g_font.textWidth(sel.c_str());
+            int ly = y + i * LINE_SPACING;
+            u8g2_SetDrawColor(g_u8g2, 2);  // XOR mode
+            u8g2_DrawBox(g_u8g2, xOff, ly - g_font.ascent(), selW, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 1);  // restore
+        }
     }
 
     if (cursorVR >= 0 && cursorVR >= g_editor.scroll && cursorVR < g_editor.scroll + visibleVrows) {
@@ -322,6 +427,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         std::string imeOut;
         if (g_ime.handleKey(key, imeOut)) {
             if (!imeOut.empty()) {
+                if (g_editor.hasSelection) deleteSelection();
                 g_editor.lines[g_editor.cy].insert(g_editor.cx, imeOut);
                 g_editor.cx += (int)imeOut.length();
                 g_editor.targetCx = -1;
@@ -398,8 +504,116 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         return APP_SYNC_SEND_FLOMO;
     }
 
+    // ── Clipboard operations (Ctrl+C, Ctrl+X, Ctrl+V) ────────────────
+    if (key == 0x03) { // Ctrl+C — copy
+        if (g_editor.hasSelection) {
+            g_clipboard = getSelectedText();
+            clearSelection();
+        }
+        ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
+    }
+    if (key == 0x18) { // Ctrl+X — cut
+        if (g_editor.hasSelection) {
+            g_clipboard = getSelectedText();
+            deleteSelection();
+        }
+        ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
+    }
+    if (key == 0x16) { // Ctrl+V — paste
+        if (!g_clipboard.empty()) {
+            if (g_editor.hasSelection) {
+                deleteSelection(); // removes selection, then paste at cursor
+            }
+            g_editor.lines[g_editor.cy].insert(g_editor.cx, g_clipboard);
+            g_editor.cx += (int)g_clipboard.length();
+            g_editor.targetCx = -1;
+            g_editor.vrowsDirty = true; g_editor.wordCountDirty = true;
+            g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
+            g_editor.modifiedSinceSave = true;
+        }
+        ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
+    }
+
+    // ── Shift+arrow: extend selection ─────────────────────────────────
+    if (key == KEY_SHIFT_LEFT) {
+        if (g_editor.cx > 0) {
+            extendSelection();
+            g_editor.cx--;
+            while (g_editor.cx > 0 && ((unsigned char)g_editor.lines[g_editor.cy][g_editor.cx] & 0xC0) == 0x80) g_editor.cx--;
+        } else if (g_editor.cy > 0) {
+            extendSelection();
+            g_editor.cy--;
+            g_editor.cx = (int)g_editor.lines[g_editor.cy].length();
+        }
+        g_editor.targetCx = -1;
+        g_editor.vrowsDirty = true;
+        ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
+    }
+    if (key == KEY_SHIFT_RIGHT) {
+        if (g_editor.cx < (int)g_editor.lines[g_editor.cy].length()) {
+            extendSelection();
+            g_editor.cx++;
+            while (g_editor.cx < (int)g_editor.lines[g_editor.cy].length() && ((unsigned char)g_editor.lines[g_editor.cy][g_editor.cx] & 0xC0) == 0x80) g_editor.cx++;
+        } else if (g_editor.cy < (int)g_editor.lines.size() - 1) {
+            extendSelection();
+            g_editor.cy++;
+            g_editor.cx = 0;
+        }
+        g_editor.targetCx = -1;
+        g_editor.vrowsDirty = true;
+        ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
+    }
+    if (key == KEY_SHIFT_UP) {
+        if (g_editor.cy > 0) {
+            extendSelection();
+        }
+        int curVR = -1;
+        for (int vi = 0; vi < (int)vrows.size(); vi++) {
+            if (vrows[vi].lineIdx == g_editor.cy && vrows[vi].start <= g_editor.cx && g_editor.cx <= vrows[vi].end) {
+                curVR = vi; break;
+            }
+        }
+        if (curVR > 0) {
+            auto &prev = vrows[curVR - 1];
+            if (g_editor.targetCx < 0)
+                g_editor.targetCx = byteToCells(g_editor.lines[g_editor.cy], g_editor.cx);
+            int visualCol = g_editor.targetCx % EDITOR_MAX_CELLS;
+            g_editor.cy = prev.lineIdx;
+            int vrowStartCells = byteToCells(g_editor.lines[g_editor.cy], prev.start);
+            int targetCells = vrowStartCells + visualCol;
+            g_editor.cx = cellsToByte(g_editor.lines[g_editor.cy], prev.start, prev.end, targetCells);
+        }
+        g_editor.vrowsDirty = true;
+        ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
+    }
+    if (key == KEY_SHIFT_DOWN) {
+        if (g_editor.cy < (int)g_editor.lines.size() - 1) {
+            extendSelection();
+        }
+        int curVR = -1;
+        for (int vi = 0; vi < (int)vrows.size(); vi++) {
+            if (vrows[vi].lineIdx == g_editor.cy && vrows[vi].start <= g_editor.cx && g_editor.cx <= vrows[vi].end) {
+                curVR = vi; break;
+            }
+        }
+        if (curVR >= 0 && curVR < (int)vrows.size() - 1) {
+            auto &next = vrows[curVR + 1];
+            if (g_editor.targetCx < 0)
+                g_editor.targetCx = byteToCells(g_editor.lines[g_editor.cy], g_editor.cx);
+            int visualCol = g_editor.targetCx % EDITOR_MAX_CELLS;
+            g_editor.cy = next.lineIdx;
+            int vrowStartCells = byteToCells(g_editor.lines[g_editor.cy], next.start);
+            int targetCells = vrowStartCells + visualCol;
+            g_editor.cx = std::min(cellsToByte(g_editor.lines[g_editor.cy], next.start, next.end, targetCells),
+                                   (int)g_editor.lines[g_editor.cy].length());
+        }
+        g_editor.vrowsDirty = true;
+        ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
+    }
+
     // Navigation & editing
     if (key == 0x0A || key == 0x0D) { // Enter
+        if (g_editor.hasSelection) deleteSelection();
         std::string rest = g_editor.lines[g_editor.cy].substr(g_editor.cx);
         g_editor.lines[g_editor.cy] = g_editor.lines[g_editor.cy].substr(0, g_editor.cx);
         g_editor.cx = 0; g_editor.cy++;
@@ -409,13 +623,14 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
         g_editor.modifiedSinceSave = true;
     } else if (key == 0x7F || key == 0x08) { // Backspace
-        if (g_editor.cx > 0) {
+        if (g_editor.hasSelection) {
+            deleteSelection();
+        } else if (g_editor.cx > 0) {
             int prev = g_editor.cx - 1;
             while (prev > 0 && ((unsigned char)g_editor.lines[g_editor.cy][prev] & 0xC0) == 0x80) prev--;
             g_editor.lines[g_editor.cy].erase(prev, g_editor.cx - prev);
             g_editor.cx = prev;
-        }
-        else if (g_editor.cy > 0) {
+        } else if (g_editor.cy > 0) {
             g_editor.cx = (int)g_editor.lines[g_editor.cy-1].length();
             g_editor.lines[g_editor.cy-1] += g_editor.lines[g_editor.cy];
             g_editor.lines.erase(g_editor.lines.begin() + g_editor.cy);
@@ -426,6 +641,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
         g_editor.modifiedSinceSave = true;
     } else if (key >= 0x20 && key <= 0x7E) { // ASCII printable
+        if (g_editor.hasSelection) deleteSelection();
         g_editor.lines[g_editor.cy].insert(g_editor.cx, 1, (char)key);
         g_editor.cx++;
         g_editor.targetCx = -1;
@@ -433,18 +649,27 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
         g_editor.modifiedSinceSave = true;
     } else if (key == KEY_LEFT) {
+        clearSelection();
         if (g_editor.cx > 0) {
             g_editor.cx--;
             while (g_editor.cx > 0 && ((unsigned char)g_editor.lines[g_editor.cy][g_editor.cx] & 0xC0) == 0x80) g_editor.cx--;
+        } else if (g_editor.cy > 0) {
+            g_editor.cy--;
+            g_editor.cx = (int)g_editor.lines[g_editor.cy].length();
         }
         g_editor.targetCx = -1;
     } else if (key == KEY_RIGHT) {
+        clearSelection();
         if (g_editor.cx < (int)g_editor.lines[g_editor.cy].length()) {
             g_editor.cx++;
             while (g_editor.cx < (int)g_editor.lines[g_editor.cy].length() && ((unsigned char)g_editor.lines[g_editor.cy][g_editor.cx] & 0xC0) == 0x80) g_editor.cx++;
+        } else if (g_editor.cy < (int)g_editor.lines.size() - 1) {
+            g_editor.cy++;
+            g_editor.cx = 0;
         }
         g_editor.targetCx = -1;
     } else if (key == KEY_UP) {
+        clearSelection();
         int curVR = -1;
         for (int vi = 0; vi < (int)vrows.size(); vi++) {
             if (vrows[vi].lineIdx == g_editor.cy && vrows[vi].start <= g_editor.cx && g_editor.cx <= vrows[vi].end) {
@@ -462,6 +687,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             g_editor.cx = cellsToByte(g_editor.lines[g_editor.cy], prev.start, prev.end, targetCells);
         }
     } else if (key == KEY_DOWN) {
+        clearSelection();
         int curVR = -1;
         for (int vi = 0; vi < (int)vrows.size(); vi++) {
             if (vrows[vi].lineIdx == g_editor.cy && vrows[vi].start <= g_editor.cx && g_editor.cx <= vrows[vi].end) {
