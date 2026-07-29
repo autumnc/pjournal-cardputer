@@ -2485,7 +2485,7 @@ static void drawPicker() {
 
             u8g2_SetDrawColor(g_u8g2, 1);
 
-            g_font.drawText(boxX + 8, iy, display.c_str(), true);
+            g_font.drawText(boxX + 8, iy, display.c_str(), false);
 
             u8g2_SetDrawColor(g_u8g2, 0);
 

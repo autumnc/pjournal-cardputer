@@ -159,12 +159,16 @@ int FontRenderer::textWidth(const char *text) {
     while (*text) {
         uint32_t cp = utf8Decode(text);
         if (cp == 0) continue;
-        auto *m = findGlyph(cp);
-        if (m) {
-            w += m->advance;
+        auto *sym = getSymbolGlyph(cp, font_size_);
+        if (sym) {
+            w += sym->advance;
         } else {
-            auto *sym = getSymbolGlyph(cp, font_size_);
-            w += sym ? sym->advance : (line_height_ / 2);
+            auto *m = findGlyph(cp);
+            if (m) {
+                w += m->advance;
+            } else {
+                w += line_height_ / 2;
+            }
         }
     }
     return w;
@@ -235,15 +239,15 @@ int FontRenderer::drawText(int x, int y, const char *text, bool invert) {
     while (*text) {
         uint32_t cp = utf8Decode(text);
         if (cp == 0) continue;
-        auto *meta = findGlyph(cp);
-        if (meta) {
-            drawGlyph(x, y, meta, invert);
-            x += meta->advance;
+        auto *sym = getSymbolGlyph(cp, font_size_);
+        if (sym) {
+            drawSymbolGlyph(x, y, sym, invert);
+            x += sym->advance;
         } else {
-            auto *sym = getSymbolGlyph(cp, font_size_);
-            if (sym) {
-                drawSymbolGlyph(x, y, sym, invert);
-                x += sym->advance;
+            auto *meta = findGlyph(cp);
+            if (meta) {
+                drawGlyph(x, y, meta, invert);
+                x += meta->advance;
             } else {
                 x += line_height_ / 2;
             }

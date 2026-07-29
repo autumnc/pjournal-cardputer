@@ -14,6 +14,10 @@ SYMBOLS = [
     (0x25B6, 0x25B8, "TRI_RIGHT", None, None),   # ▶→▸
     (0x25BC, 0x25BE, "TRI_DOWN",  None, None),   # ▼→▾
     (0x2605, 0x2605, "STAR",      None, None),   # ★
+    (0x25EF, 0x25CB, "CIRCLE_EMPTY", None, None),# ◯→○ (large variant)
+    (0x25D0, 0x25D0, "CIRCLE_HALF",  None, None),# ◐ (custom 14x14)
+    (0x2B24, 0x25CF, "CIRCLE_FULL",  None, None),# ⬤→● (large variant)
+    (0xF040, 0x270E, "PENCIL",       None, None),# fa-pen→✎ (Nerd Font icon)
 ]
 
 # Font metrics for each size
@@ -70,8 +74,26 @@ def main():
             glyphs = []
             for render_cp, target_cp, name, adv28, adv22 in SYMBOLS:
                 adv_override = adv28 if size == 28 else adv22
-                w, h, xo, yo, adv_orig, bits = render_glyph(face, render_cp, size)
-                adv = adv_override if adv_override else adv_orig
+                if name == "CIRCLE_HALF":
+                    # Custom: left half filled + right half outline only
+                    w, h, xo, yo, adv_orig, outline_bits = render_glyph(face, 0x25EF, size)
+                    w_full, h_full, _, _, _, full_bits = render_glyph(face, 0x2B24, size)
+                    adv = adv_override if adv_override else adv_orig
+                    row_bytes = (w + 7) // 8
+                    half_bits = bytearray(full_bits)
+                    mid_col = w // 2
+                    # Clear right-half interior pixels (keep only outline)
+                    for r in range(h):
+                        for c in range(mid_col, w):
+                            byte_idx = r * row_bytes + c // 8
+                            bit = 7 - (c % 8)
+                            is_outline = (outline_bits[byte_idx] >> bit) & 1
+                            if not is_outline:
+                                half_bits[byte_idx] &= ~(1 << bit)
+                    bits = bytes(half_bits)
+                else:
+                    w, h, xo, yo, adv_orig, bits = render_glyph(face, render_cp, size)
+                    adv = adv_override if adv_override else adv_orig
                 var_name = f"SYM_{name}_{size}_BITS"
                 f.write(f"static const uint8_t {var_name}[] = {{\n    ")
                 for i, b in enumerate(bits):

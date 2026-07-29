@@ -48,7 +48,12 @@ static void drawFileIcon(int x, int baseline) {
 
 #define OUTLINE_DIR "/sdcard/outline"
 
-enum Mode { M_PROJECTS, M_BROWSE, M_DETAIL, M_ADD_PROJECT, M_ADD_HEADING, M_ADD_SUB, M_FILTER, M_EDIT_NOTE, M_EDIT_NOTE_ML, M_SUMMARY, M_HELP, M_BOOKMARK_MGR, M_CONFIRM };
+// Outline node status values
+static const char *OUTLINE_STATUS[] = {"draft", "active", "done", "revise"};
+static const char *OUTLINE_STATUS_DISPLAY[] = {"草稿", "进行中", "已完成", "待修改"};
+static const int OUTLINE_STATUS_COUNT = 4;
+
+enum Mode { M_PROJECTS, M_BROWSE, M_DETAIL, M_ADD_PROJECT, M_ADD_HEADING, M_ADD_SUB, M_FILTER, M_EDIT_NOTE, M_EDIT_NOTE_ML, M_SUMMARY, M_HELP, M_BOOKMARK_MGR, M_CONFIRM, M_TAG_MGR, M_ADD_TAG, M_RENAME_TAG, M_PICKER };
 
 // ── State ────────────────────────────────────────────────────────────────
 static struct {
@@ -74,6 +79,7 @@ static struct {
 
     // filter
     std::string filterText;
+    std::vector<std::string> filterTags;
 
     // heading whose note is being edited (index into nodes)
     int editNoteIdx = -1;
@@ -114,6 +120,18 @@ static struct {
     std::string confirmMsg;
     int confirmAction = 0;  // 1=delete heading, 2=delete project, 3=clear file
     int confirmIdx = -1;    // subject index
+
+    // tag management
+    std::vector<std::string> tagList;
+    int tagMgrSel = 0;
+    std::string renameTargetTag;
+
+    // picker (for status/tags)
+    struct PickerOpt { std::string value; std::string display; };
+    std::vector<PickerOpt> pickerOpts;
+    int pickerSel = 0;
+    int pickerField = -1;
+    std::set<int> pickerToggled;
 } g;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -168,6 +186,73 @@ static void loadOutline() {
 
     g.nodes = &g.outlineData["nodes"].elements;
     g.nodeCount = g.outlineData["nodes"].size();
+}
+
+static void buildTagList() {
+    g.tagList.clear();
+    // Collect from outlineData["tags"] — use has() to avoid mutating memberValues
+    if (g.outlineData.has("tags")) {
+        auto &tags = g.outlineData["tags"];
+        if (tags.isArray()) {
+            for (int i = 0; i < (int)tags.size(); i++) {
+                std::string name = tags[i].asString();
+                if (name.empty()) continue;
+                bool dup = false;
+                for (auto &t : g.tagList) if (t == name) { dup = true; break; }
+                if (!dup) g.tagList.push_back(name);
+            }
+        }
+    }
+    // Collect from node tags
+    if (g.nodes) {
+        for (size_t i = 0; i < g.nodeCount; i++) {
+            auto &node = (*g.nodes)[i];
+            if (!node.has("tags")) continue;
+            auto &tt = node["tags"];
+            if (tt.isArray()) {
+                for (int j = 0; j < (int)tt.size(); j++) {
+                    std::string name = tt[j].asString();
+                    if (name.empty()) continue;
+                    bool dup = false;
+                    for (auto &t : g.tagList) if (t == name) { dup = true; break; }
+                    if (!dup) g.tagList.push_back(name);
+                }
+            }
+        }
+    }
+    std::sort(g.tagList.begin(), g.tagList.end());
+}
+
+static void openOutlinePicker(int fieldIdx) {
+    g.pickerOpts.clear();
+    g.pickerField = fieldIdx;
+    auto &node = (*g.nodes)[g.detailNodeIdx];
+
+    if (fieldIdx == 1) {  // status
+        for (int i = 0; i < OUTLINE_STATUS_COUNT; i++)
+            g.pickerOpts.push_back({OUTLINE_STATUS[i], OUTLINE_STATUS_DISPLAY[i]});
+        std::string cur = node["status"].asString("draft");
+        g.pickerSel = 0;
+        for (int i = 0; i < OUTLINE_STATUS_COUNT; i++)
+            if (OUTLINE_STATUS[i] == cur) { g.pickerSel = i; break; }
+    } else if (fieldIdx == 4) {  // tags
+        buildTagList();
+        for (auto &t : g.tagList)
+            g.pickerOpts.push_back({t, "#" + t});
+        g.pickerSel = 0;
+        g.pickerToggled.clear();
+        auto &tt = node["tags"];
+        if (tt.isArray()) {
+            for (int i = 0; i < (int)tt.size(); i++) {
+                for (int j = 0; j < (int)g.pickerOpts.size(); j++) {
+                    if (g.pickerOpts[j].value == tt[i].asString()) {
+                        g.pickerToggled.insert(j); break;
+                    }
+                }
+            }
+        }
+    }
+    g.mode = M_PICKER;
 }
 
 static void saveOutline() {
@@ -253,6 +338,17 @@ static void rebuildFilter() {
     }
     for (size_t i = 0; i < g.nodeCount; i++) {
         if (hiddenByFold.count((int)i)) continue;
+        // Tag filter
+        if (!g.filterTags.empty()) {
+            auto &tt = (*g.nodes)[i]["tags"];
+            bool tagMatch = false;
+            if (tt.isArray()) {
+                for (int j = 0; j < (int)tt.size() && !tagMatch; j++)
+                    for (auto &ft : g.filterTags)
+                        if (tt[j].asString() == ft) { tagMatch = true; break; }
+            }
+            if (!tagMatch) continue;
+        }
         if (g.filterText.empty()) {
             g_filteredIdx.push_back((int)i);
         } else {
@@ -485,6 +581,7 @@ static const char *HELP_LINES[] = {
     "d     删除标题",
     "Tab   切换项目",
     "/     筛选",
+    "t     标签管理",
     "j/k   上/下移任务",
     "h/l   提/降层级",
     "q/Esc 返回项目",
@@ -539,7 +636,7 @@ static void drawHelp() {
     ui_commit();
 }
 
-static void drawOutlineDetail() {
+static void drawOutlineDetailInner() {
     ui_clear();
     if (!g.nodes || g.detailNodeIdx < 0 || g.detailNodeIdx >= (int)g.nodeCount) return;
     auto &node = (*g.nodes)[g.detailNodeIdx];
@@ -552,10 +649,12 @@ static void drawOutlineDetail() {
     struct Field { const char *label; const char *key; char type; };
     static const Field fields[] = {
         {"标题",   "title",    's'},
+        {"状态",   "status",   't'},
         {"关键词", "keywords", 's'},
         {"备注",   "note",     'm'},
+        {"标签",   "tags",     'g'},
     };
-    static const int NF = 3;
+    static const int NF = 5;
 
     for (int i = 0; i < NF; i++) {
         bool sel = (i == g.detailField);
@@ -568,6 +667,17 @@ static void drawOutlineDetail() {
                 size_t nl = val.find('\n');
                 if (nl != std::string::npos) val = val.substr(0, nl) + "…";
             }
+        } else if (f.type == 't') {
+            std::string sv = node["status"].asString("draft");
+            val = "(未设)";
+            for (int k = 0; k < OUTLINE_STATUS_COUNT; k++)
+                if (OUTLINE_STATUS[k] == sv) { val = OUTLINE_STATUS_DISPLAY[k]; break; }
+        } else if (f.type == 'g') {
+            auto &tt = node["tags"];
+            if (tt.isArray() && tt.size() > 0) {
+                val = "#" + tt[0].asString();
+                for (int j = 1; j < (int)tt.size(); j++) val += " #" + tt[j].asString();
+            } else val = "(无)";
         } else {
             val = node[f.key].asString();
             if (val.empty()) val = "(空)";
@@ -586,7 +696,12 @@ static void drawOutlineDetail() {
     }
 
     ui_draw_status("Enter编辑 ↑↓选择 f:关联 Esc返回", "");
-    drawIMEStatus(); ui_commit();
+    drawIMEStatus();
+}
+
+static void drawOutlineDetail() {
+    drawOutlineDetailInner();
+    ui_commit();
 }
 
 static void drawSummary() {
@@ -609,10 +724,32 @@ static void drawSummary() {
     u8g2_DrawHLine(g_u8g2, boxX + 4, y, boxW - 8);
     y += 8 + 15;
 
+    // Status
+    std::string st = node["status"].asString("draft");
+    const char *stDisp = "草稿";
+    for (int s = 0; s < OUTLINE_STATUS_COUNT; s++)
+        if (OUTLINE_STATUS[s] == st) { stDisp = OUTLINE_STATUS_DISPLAY[s]; break; }
+    char line[128];
+    snprintf(line, sizeof(line), "状态: %s", stDisp);
+    ui_draw_text(textX, y, line, false);
+    y += LINE_SPACING;
+
     // Keywords
     std::string kw = node["keywords"].asString();
-    char line[128];
     snprintf(line, sizeof(line), "关键词: %s", kw.empty() ? "(无)" : kw.c_str());
+    ui_draw_text(textX, y, line, false);
+    y += LINE_SPACING;
+
+    // Tags
+    auto &tt = node["tags"];
+    std::string tagStr;
+    if (tt.isArray() && tt.size() > 0) {
+        for (int j = 0; j < (int)tt.size(); j++) {
+            if (j > 0) tagStr += " ";
+            tagStr += "#" + tt[j].asString();
+        }
+    }
+    snprintf(line, sizeof(line), "标签: %s", tagStr.empty() ? "(无)" : tagStr.c_str());
     ui_draw_text(textX, y, line, false);
     y += LINE_SPACING;
 
@@ -625,8 +762,6 @@ static void drawSummary() {
         std::string flatNote;
         for (char c : note) { flatNote += (c == '\n') ? ' ' : c; }
         std::string prefix = "备注: ";
-        int prefixW = g_font.textWidth(prefix.c_str());
-        int noteX = textX;
         // First line starts after "备注:" prefix
         std::string firstLine = prefix + flatNote;
         // Word-wrap the combined text within contentW
@@ -776,30 +911,38 @@ static void drawOutline() {
                 if (bmArr[bi]["id"].asString() == nodeId) { isBookmarked = true; break; }
         }
 
-        // show indicators: ★ [K] [M] before file icon
+        // show indicators: ★ status [M] before file icon
         int rightX = SCREEN_W - 4;
         std::string file = node["file"].asString();
         if (!file.empty()) rightX -= FILE_ICON_W;
         if (isBookmarked) {
             int bw = g_font.textWidth("★") + 2;
             rightX -= bw;
-            g_font.drawText(rightX, y + i * LINE_SPACING, "★", sel);
+            g_font.drawText(rightX, y + i * LINE_SPACING, "★", false);
         }
-        std::string keywords = node["keywords"].asString();
+        // Status symbol (replaces [K])
+        std::string status = node["status"].asString("draft");
+        const char *statusSym = "○";  // draft default
+        for (int s = 0; s < OUTLINE_STATUS_COUNT; s++) {
+            if (OUTLINE_STATUS[s] == status) {
+                statusSym = (const char *[]){"○", "◐", "●", "✎"}[s];
+                break;
+            }
+        }
+        {
+            int sw = g_font.textWidth(statusSym) + 2;
+            rightX -= sw;
+            g_font.drawText(rightX, y + i * LINE_SPACING, statusSym, false);
+        }
         std::string note = node["note"].asString();
         if (!note.empty()) {
             int mw = g_font.textWidth("[M]") + 2;
             rightX -= mw;
-            g_font.drawText(rightX, y + i * LINE_SPACING, "[M]", sel);
-        }
-        if (!keywords.empty()) {
-            int kw = g_font.textWidth("[K]") + 2;
-            rightX -= kw;
-            g_font.drawText(rightX, y + i * LINE_SPACING, "[K]", sel);
+            g_font.drawText(rightX, y + i * LINE_SPACING, "[M]", false);
         }
         // show file indicator
         if (!file.empty()) {
-            drawFileIcon(SCREEN_W - FILE_ICON_W - 4, y + i * LINE_SPACING + 2);
+            drawFileIcon(SCREEN_W - FILE_ICON_W - 4, y + i * LINE_SPACING);
         }
     }
 
@@ -808,8 +951,34 @@ static void drawOutline() {
         snprintf(fb, sizeof(fb), "筛选: %s", g.filterText.c_str());
         ui_draw_text(4, STATUS_Y - LINE_SPACING + 2, fb, true);
     }
+    if (!g.filterTags.empty() && g.filterText.empty()) {
+        char fb[64];
+        int fn = snprintf(fb, sizeof(fb), "标签:");
+        for (auto &ft : g.filterTags)
+            fn += snprintf(fb + fn, sizeof(fb) - fn, " #%s", ft.c_str());
+        ui_draw_text(4, STATUS_Y - LINE_SPACING + 2, fb, true);
+    }
 
-    ui_draw_status("a:标题 i:子标题 r:重命名 d:删除 s:摘要 f:文件 m:书签 b:书签管理 /:筛选", "");
+    // Status bar: ?:帮助 | keywords #tags
+    {
+        char sl[128];
+        int n = snprintf(sl, sizeof(sl), "?:帮助");
+        if (g.nodes && g.nodeCount > 0) {
+            int idx = g.filterText.empty() ? g.sel : (g.sel < (int)g_filteredIdx.size() ? g_filteredIdx[g.sel] : -1);
+            if (idx >= 0 && (size_t)idx < g.nodeCount) {
+                auto &node = (*g.nodes)[idx];
+                std::string kw = node["keywords"].asString();
+                if (!kw.empty()) n += snprintf(sl + n, sizeof(sl) - n, " | %s", kw.c_str());
+                auto &tt = node["tags"];
+                if (tt.isArray() && tt.size() > 0) {
+                    if (kw.empty()) n += snprintf(sl + n, sizeof(sl) - n, " |");
+                    for (int j = 0; j < (int)tt.size(); j++)
+                        n += snprintf(sl + n, sizeof(sl) - n, " #%s", tt[j].asString().c_str());
+                }
+            }
+        }
+        ui_draw_status(sl, "");
+    }
 
     if (composingFilter) drawIMEStatus();
 }
@@ -986,7 +1155,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
         } else if (key == KEY_UP) {
             if (g.detailField > 0) g.detailField--;
         } else if (key == KEY_DOWN) {
-            if (g.detailField < 2) g.detailField++;
+            if (g.detailField < 4) g.detailField++;
         } else if (key == 0x0A || key == 0x0D) {
             if (!g.nodes || g.detailNodeIdx < 0 || g.detailNodeIdx >= (int)g.nodeCount) { g.mode = M_BROWSE; }
             else {
@@ -1000,13 +1169,16 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                     g.imeActive = true; g_ime.setActive(true);
                     g.mode = M_EDIT_NOTE;
                 } else if (g.detailField == 1) {
+                    // status picker
+                    openOutlinePicker(1);
+                } else if (g.detailField == 2) {
                     g.editNoteIdx = g.detailNodeIdx;
                     g.editingKeyword = true;
                     g.editBuf = node["keywords"].asString();
                     g.editCur = (int)g.editBuf.length();
                     g.imeActive = true; g_ime.setActive(true);
                     g.mode = M_EDIT_NOTE;
-                } else {
+                } else if (g.detailField == 3) {
                     // Open multi-line note editor
                     g.editNoteIdx = g.detailNodeIdx;
                     std::string note = node["note"].asString();
@@ -1023,6 +1195,9 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                     g.noteScroll = 0; g.noteVrowsDirty = true;
                     g.imeActive = true; g_ime.setActive(true);
                     g.mode = M_EDIT_NOTE_ML;
+                } else if (g.detailField == 4) {
+                    // tags picker
+                    openOutlinePicker(4);
                 }
             }
         } else if (key == 's' || key == 'S') {
@@ -1108,6 +1283,216 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++;
         }
         drawInputOverlay(g.editingTitle ? "编辑标题" : (g.editingKeyword ? "编辑关键词" : "编辑备注"));
+        return APP_OUTLINE;
+    }
+
+    // ── M_PICKER ─────────────────────────────────────────────────────
+    if (g.mode == M_PICKER) {
+        if (key == 0x1B || key == 'q' || key == 'Q') {
+            g.mode = M_DETAIL;
+        } else if (key == KEY_UP) {
+            if (g.pickerSel > 0) g.pickerSel--;
+        } else if (key == KEY_DOWN) {
+            if (g.pickerSel < (int)g.pickerOpts.size() - 1) g.pickerSel++;
+        } else if (key == 0x0A || key == 0x0D || key == ' ') {
+            auto &node = (*g.nodes)[g.detailNodeIdx];
+            if (g.pickerField == 1) {  // status
+                node.set("status", g.pickerOpts[g.pickerSel].value);
+                saveOutline();
+                g.mode = M_DETAIL;
+            } else if (g.pickerField == 4) {  // tags - toggle
+                if (g.pickerToggled.count(g.pickerSel))
+                    g.pickerToggled.erase(g.pickerSel);
+                else
+                    g.pickerToggled.insert(g.pickerSel);
+            }
+        } else if (key == 'y' || key == 'Y') {
+            // confirm tags selection
+            if (g.pickerField == 4) {
+                auto &node = (*g.nodes)[g.detailNodeIdx];
+                JsonValue newTags = JsonValue::array();
+                for (int idx : g.pickerToggled)
+                    newTags.pushBack(g.pickerOpts[idx].value);
+                node.set("tags", newTags);
+                saveOutline();
+                g.mode = M_DETAIL;
+            }
+        }
+        // Draw picker overlay (GTD-style: no title, popup on detail view)
+        {
+            drawOutlineDetailInner();
+            int n = (int)g.pickerOpts.size();
+            if (n == 0) { ui_commit(); return APP_OUTLINE; }
+            int maxVis = 6;
+            int boxW = 250;
+            int boxH = maxVis * LINE_SPACING + 24 + 15;
+            int boxX = (SCREEN_W - boxW) / 2;
+            int boxY = (SCREEN_H - boxH) / 2;
+            // Scroll to keep selection visible
+            int scroll = 0;
+            if (n > maxVis) {
+                scroll = g.pickerSel - maxVis / 2;
+                if (scroll < 0) scroll = 0;
+                if (scroll + maxVis > n) scroll = n - maxVis;
+            }
+            // Opaque white background
+            u8g2_SetDrawColor(g_u8g2, 1);
+            u8g2_DrawBox(g_u8g2, boxX, boxY, boxW, boxH);
+            // Black border frame
+            u8g2_SetDrawColor(g_u8g2, 0);
+            u8g2_DrawFrame(g_u8g2, boxX, boxY, boxW, boxH);
+            // Draw options
+            int vis = n > maxVis ? maxVis : n;
+            bool isTagPicker = (g.pickerField == 4);
+            for (int i = 0; i < vis; i++) {
+                int oi = scroll + i;
+                int iy = boxY + 27 + i * LINE_SPACING;
+                bool s = (oi == g.pickerSel);
+                bool toggled = isTagPicker && g.pickerToggled.count(oi);
+                std::string display;
+                if (isTagPicker) display = toggled ? "[x]" : "[ ]";
+                display += g.pickerOpts[oi].display;
+                if (s) {
+                    u8g2_SetDrawColor(g_u8g2, 0);
+                    u8g2_DrawBox(g_u8g2, boxX + 4, iy - g_font.ascent(), boxW - 8, FONT_H);
+                    u8g2_SetDrawColor(g_u8g2, 1);
+                    g_font.drawText(boxX + 8, iy, display.c_str(), false);
+                    u8g2_SetDrawColor(g_u8g2, 0);
+                } else {
+                    g_font.drawText(boxX + 8, iy, display.c_str(), false);
+                }
+            }
+            ui_commit();
+        }
+        return APP_OUTLINE;
+    }
+
+    // ── M_TAG_MGR ────────────────────────────────────────────────────
+    if (g.mode == M_TAG_MGR) {
+        if (key == 0x1B || key == 'q' || key == 'Q') {
+            g.mode = M_BROWSE;
+        } else if (key == KEY_UP || key == 'k') {
+            if (g.tagMgrSel > 0) g.tagMgrSel--;
+        } else if (key == KEY_DOWN || key == 'j') {
+            if (g.tagMgrSel < (int)g.tagList.size() - 1) g.tagMgrSel++;
+        } else if (key == 'a' || key == 'A') {
+            g.mode = M_ADD_TAG;
+            g.editBuf.clear(); g.editCur = 0;
+            g.imeActive = true; g_ime.setActive(true);
+        } else if ((key == 'd' || key == 'D') && g.tagMgrSel < (int)g.tagList.size()) {
+            std::string name = g.tagList[g.tagMgrSel];
+            // Remove from stored list
+            auto &arr = g.outlineData["tags"];
+            for (int i = (int)arr.size() - 1; i >= 0; i--)
+                if (arr[i].asString() == name) arr.elements.erase(arr.elements.begin() + i);
+            // Remove from nodes
+            if (g.nodes) {
+                for (size_t i = 0; i < g.nodeCount; i++) {
+                    auto &tt = (*g.nodes)[i]["tags"];
+                    if (tt.isArray()) {
+                        for (int j = (int)tt.size() - 1; j >= 0; j--)
+                            if (tt[j].asString() == name) tt.elements.erase(tt.elements.begin() + j);
+                    }
+                }
+            }
+            saveOutline();
+            buildTagList();
+            if (g.tagMgrSel >= (int)g.tagList.size()) g.tagMgrSel = (int)g.tagList.size() - 1;
+            if (g.tagMgrSel < 0) g.tagMgrSel = 0;
+        } else if ((key == 'r' || key == 'R') && g.tagMgrSel < (int)g.tagList.size()) {
+            g.mode = M_RENAME_TAG;
+            g.renameTargetTag = g.tagList[g.tagMgrSel];
+            g.editBuf = g.tagList[g.tagMgrSel];
+            g.editCur = (int)g.editBuf.length();
+            g.imeActive = true; g_ime.setActive(true);
+        } else if ((key == 0x0A || key == 0x0D) && g.tagMgrSel < (int)g.tagList.size()) {
+            // Toggle tag filter
+            std::string name = g.tagList[g.tagMgrSel];
+            bool found = false;
+            for (int i = 0; i < (int)g.filterTags.size(); i++) {
+                if (g.filterTags[i] == name) { g.filterTags.erase(g.filterTags.begin() + i); found = true; break; }
+            }
+            if (!found) g.filterTags.push_back(name);
+            rebuildFilter();
+        }
+        // Draw tag manager
+        {
+            ui_clear(); int y = FONT_H + 6 + LINE_SPACING;
+            ui_draw_text(4, FONT_H, "标签管理", false, true);
+            u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
+            int maxY = STATUS_Y;
+            int vis = (maxY - y + LINE_SPACING - 1) / LINE_SPACING;
+            if (vis < 1) vis = 1;
+            if (g.tagMgrSel < g.scroll) g.scroll = g.tagMgrSel;
+            if (g.tagMgrSel >= g.scroll + vis) g.scroll = g.tagMgrSel - vis + 1;
+            for (int i = 0; i < vis && (g.scroll + i) < (int)g.tagList.size(); i++) {
+                int idx = g.scroll + i;
+                bool s = (idx == g.tagMgrSel);
+                char buf[64];
+                snprintf(buf, sizeof(buf), "#%s", g.tagList[idx].c_str());
+                ui_draw_text(8, y + i * LINE_SPACING, buf, s);
+                // Show filter indicator
+                bool active = false;
+                for (auto &ft : g.filterTags) if (ft == g.tagList[idx]) { active = true; break; }
+                if (active) g_font.drawText(SCREEN_W - g_font.textWidth("\xe2\x97\x8f") - 4, y + i * LINE_SPACING, "\xe2\x97\x8f", false);
+            }
+            if (g.tagList.empty()) ui_draw_text(8, y, "暂无 — 按a添加");
+            ui_draw_status("a:添加 d:删除 r:重命名 Enter:筛选 Esc:返回", "");
+            ui_commit();
+        }
+        return APP_OUTLINE;
+    }
+
+    // ── M_ADD_TAG / M_RENAME_TAG ─────────────────────────────────────
+    if (g.mode == M_ADD_TAG || g.mode == M_RENAME_TAG) {
+        if (g.imeActive && key != 0) {
+            std::string imeOut;
+            if (g_ime.handleKey(key, imeOut)) {
+                if (!imeOut.empty()) { g.editBuf.insert(g.editCur, imeOut); g.editCur += (int)imeOut.length(); }
+                drawInputOverlay(g.mode == M_ADD_TAG ? "添加标签" : "重命名标签"); return APP_OUTLINE;
+            }
+        }
+        if (key == KEY_IME_TOGGLE) {
+            g.imeActive = !g.imeActive; g_ime.setActive(g.imeActive);
+            drawInputOverlay(g.mode == M_ADD_TAG ? "添加标签" : "重命名标签"); return APP_OUTLINE;
+        }
+        if (key == 0x1B) {
+            g.mode = M_TAG_MGR; g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x0A || key == 0x0D) {
+            if (!g.editBuf.empty()) {
+                std::string name = g.editBuf;
+                if (!name.empty() && name[0] == '#') name = name.substr(1);
+                if (!name.empty()) {
+                    if (g.mode == M_ADD_TAG) {
+                        if (!g.outlineData.has("tags") || !g.outlineData["tags"].isArray())
+                            g.outlineData.set("tags", JsonValue::array());
+                        auto &arr = g.outlineData["tags"];
+                        arr.pushBack(name);
+                    } else {
+                        // Rename: update stored list and all nodes
+                        std::string oldName = g.renameTargetTag;
+                        auto &arr = g.outlineData["tags"];
+                        for (int i = 0; i < (int)arr.size(); i++)
+                            if (arr[i].asString() == oldName) arr.elements[i] = JsonValue(name);
+                        if (g.nodes) {
+                            for (size_t i = 0; i < g.nodeCount; i++) {
+                                auto &tt = (*g.nodes)[i]["tags"];
+                                if (tt.isArray()) {
+                                    for (int j = 0; j < (int)tt.size(); j++)
+                                        if (tt[j].asString() == oldName) tt.elements[j] = JsonValue(name);
+                                }
+                            }
+                        }
+                    }
+                    saveOutline();
+                    buildTagList();
+                }
+            }
+            g.mode = M_TAG_MGR; g.imeActive = false; g_ime.setActive(false);
+        } else if (key == 0x7F || key == 0x08) {
+            if (g.editCur > 0) { int prev = g.editCur - 1; while (prev > 0 && ((unsigned char)g.editBuf[prev] & 0xC0) == 0x80) prev--; g.editBuf.erase(prev, g.editCur - prev); g.editCur = prev; }
+        } else if (key >= 0x20 && key <= 0x7E) { g.editBuf.insert(g.editCur, 1, (char)key); g.editCur++; }
+        drawInputOverlay(g.mode == M_ADD_TAG ? "添加标签" : "重命名标签");
         return APP_OUTLINE;
     }
 
@@ -1462,13 +1847,18 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
     // ── M_BROWSE: outline tree ───────────────────────────────────────
     if (g.mode == M_BROWSE) {
         if (key == 'q' || key == 'Q' || key == 0x1B) {
-            g.mode = M_PROJECTS;
-            g.sel = g.curProject >= 0 ? g.curProject : 0;
-            g.scroll = 0;
-            g.nodes = nullptr; g.nodeCount = 0;
-            g_filteredIdx.clear();
-            drawProjectList(); ui_commit();
-            return APP_OUTLINE;
+            if (!g.filterTags.empty()) {
+                g.filterTags.clear();
+                rebuildFilter();
+            } else {
+                g.mode = M_PROJECTS;
+                g.sel = g.curProject >= 0 ? g.curProject : 0;
+                g.scroll = 0;
+                g.nodes = nullptr; g.nodeCount = 0;
+                g_filteredIdx.clear();
+                drawProjectList(); ui_commit();
+                return APP_OUTLINE;
+            }
         }
 
         if (key == '\t') {
@@ -1736,6 +2126,16 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             }
         }
 
+        // t: tag manager
+        if ((key == 't' || key == 'T') && g.curProject >= 0) {
+            buildTagList();
+            g.tagMgrSel = 0;
+            g.scroll = 0;
+            g.mode = M_TAG_MGR;
+            ui_clear(); ui_commit();
+            return APP_OUTLINE;
+        }
+
         // b: bookmark manager
         if (key == 'b' || key == 'B') {
             g.bmMgrSel = 0;
@@ -1791,6 +2191,8 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
                 node.set("file", "");
                 node.set("note", "");
                 node.set("keywords", "");
+                node.set("status", "draft");
+                node.set("tags", JsonValue::array());
                 if (g.insertAfter >= 0 && g.insertAfter < (int)g.nodes->size())
                     g.nodes->insert(g.nodes->begin() + g.insertAfter + 1, node);
                 else
