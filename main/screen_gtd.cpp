@@ -20,7 +20,11 @@
 
 #include <set>
 
+#include <map>
+
 #include <sys/stat.h>
+
+#include <dirent.h>
 
 
 
@@ -70,7 +74,7 @@ static const char *PRIORITY_DISPLAY[] = {"A 高", "B 中", "C 低"};
 
 
 
-enum Mode { M_BROWSE, M_ADD, M_DETAIL, M_EDIT_FIELD, M_FILTER, M_RENAME, M_CONFIRM, M_ADD_PROJECT, M_RENAME_PROJECT, M_PICKER, M_CALENDAR, M_HELP, M_EDIT_NOTE, M_CONTEXT_MGR, M_TAG_MGR, M_ADD_CONTEXT, M_ADD_TAG, M_RENAME_CONTEXT, M_RENAME_TAG, M_SUMMARY };
+enum Mode { M_BROWSE, M_ADD, M_DETAIL, M_EDIT_FIELD, M_FILTER, M_RENAME, M_CONFIRM, M_ADD_PROJECT, M_RENAME_PROJECT, M_PICKER, M_CALENDAR, M_HELP, M_EDIT_NOTE, M_CONTEXT_MGR, M_TAG_MGR, M_ADD_CONTEXT, M_ADD_TAG, M_RENAME_CONTEXT, M_RENAME_TAG, M_SUMMARY, M_ARCHIVE };
 
 
 
@@ -244,6 +248,28 @@ static struct {
     // fold state (indices into g_gtdTree that are collapsed)
 
     std::set<int> foldedNodes;
+
+
+
+    // archive manager
+
+    std::vector<std::string> archiveMonths;  // "YYYY-MM" list
+
+    std::vector<int> archiveCounts;          // task count per month
+
+    std::vector<JsonValue> archiveTasks;     // tasks of selected month (read-only browse)
+
+    int archiveSel = 0;
+
+    int archiveScroll = 0;
+
+    int archiveViewSel = 0;   // index in archiveTasks when browsing
+
+    int archiveViewScroll = 0;
+
+    bool archiveBrowsing = false;  // false = month list, true = task list
+
+    std::string archiveViewMonth;  // currently viewed month
 
 } g;
 
@@ -866,6 +892,80 @@ static void saveData() {
 
 
 
+// ── Auto-archive ─────────────────────────────────────────────────────────
+
+static std::string currentMonthStr() {
+    time_t now; time(&now); struct tm *tm = localtime(&now);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d", tm->tm_year + 1900, tm->tm_mon + 1);
+    return buf;
+}
+
+static void autoArchive() {
+    std::string curMonth = currentMonthStr();
+    std::string lastArchive = g.data["lastArchive"].asString();
+
+    // Already archived this month
+    if (lastArchive == curMonth) return;
+
+    mkdir(ARCHIVE_DIR, 0755);
+
+    auto &tasks = g.data["tasks"];
+    if (!tasks.isArray()) return;
+
+    // Group completed tasks by their completed-month
+    // key = "YYYY-MM", value = array of task indices (in reverse for safe erase)
+    std::map<std::string, std::vector<int>> byMonth;
+    for (int i = 0; i < (int)tasks.size(); i++) {
+        if (tasks[i]["status"].asString("todo") != "done") continue;
+        std::string completed = tasks[i]["completed"].asString();
+        if (completed.empty()) continue;
+        // completed format: "YYYY-MM-DD"
+        if (completed.length() < 7) continue;
+        std::string month = completed.substr(0, 7);
+        // Only archive tasks from previous months or earlier
+        if (month >= curMonth) continue;
+        byMonth[month].push_back(i);
+    }
+
+    bool anyArchived = false;
+    for (auto &kv : byMonth) {
+        std::string month = kv.first;
+        std::vector<int> &indices = kv.second;
+
+        // Load existing archive file (if any) and merge
+        std::string arcPath = std::string(ARCHIVE_DIR) + "/" + month + ".json";
+        JsonValue arcData = JsonValue::loadFromFile(arcPath);
+        if (arcData.isNull() || !arcData.has("tasks") || !arcData["tasks"].isArray()) {
+            arcData = JsonValue::object();
+            arcData.set("tasks", JsonValue::array());
+            arcData.set("archiveDate", month);
+        }
+        auto &arcTasks = arcData["tasks"];
+
+        // Append archived tasks
+        for (int idx : indices)
+            arcTasks.pushBack(tasks[idx]);
+
+        JsonValue::saveToFile(arcPath, arcData);
+        anyArchived = true;
+    }
+
+    // Remove archived tasks from main data (erase from back to front)
+    std::vector<int> allToRemove;
+    for (auto &kv : byMonth)
+        for (int idx : kv.second)
+            allToRemove.push_back(idx);
+    std::sort(allToRemove.rbegin(), allToRemove.rend());
+    for (int idx : allToRemove)
+        tasks.elements.erase(tasks.elements.begin() + idx);
+
+    g.data.set("lastArchive", curMonth);
+    if (anyArchived) saveData();
+}
+
+
+
 // ── ID generator ─────────────────────────────────────────────────────────
 
 static std::string makeId() {
@@ -1113,6 +1213,118 @@ static void drawDetail();  // forward declaration
 static void drawList();    // forward declaration
 
 static void drawHelp();    // forward declaration
+
+
+
+// ── Archive manager ──────────────────────────────────────────────────────
+
+static void loadArchiveMonths() {
+    g.archiveMonths.clear();
+    g.archiveCounts.clear();
+    DIR *dir = opendir(ARCHIVE_DIR);
+    if (!dir) return;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name.size() > 5 && name.substr(name.size() - 5) == ".json") {
+            std::string month = name.substr(0, name.size() - 5);
+            // Count tasks
+            std::string path = std::string(ARCHIVE_DIR) + "/" + name;
+            JsonValue data = JsonValue::loadFromFile(path);
+            int count = 0;
+            if (data.has("tasks") && data["tasks"].isArray()) count = (int)data["tasks"].size();
+            g.archiveMonths.push_back(month);
+            g.archiveCounts.push_back(count);
+        }
+    }
+    closedir(dir);
+    // Sort both vectors together (newest first)
+    std::vector<int> order(g.archiveMonths.size());
+    for (size_t i = 0; i < order.size(); i++) order[i] = i;
+    std::sort(order.begin(), order.end(), [](int a, int b) {
+        return g.archiveMonths[a] > g.archiveMonths[b];
+    });
+    std::vector<std::string> sm = g.archiveMonths;
+    std::vector<int> sc = g.archiveCounts;
+    for (size_t i = 0; i < order.size(); i++) {
+        g.archiveMonths[i] = sm[order[i]];
+        g.archiveCounts[i] = sc[order[i]];
+    }
+}
+
+static void loadArchiveMonthTasks(const std::string &month) {
+    g.archiveTasks.clear();
+    std::string path = std::string(ARCHIVE_DIR) + "/" + month + ".json";
+    JsonValue data = JsonValue::loadFromFile(path);
+    if (!data.isNull() && data.has("tasks") && data["tasks"].isArray()) {
+        auto &tasks = data["tasks"];
+        for (int i = 0; i < (int)tasks.size(); i++)
+            g.archiveTasks.push_back(tasks[i]);
+    }
+}
+
+static void drawArchiveMgr() {
+    ui_clear();
+
+    if (!g.archiveBrowsing) {
+        // Month list
+        ui_draw_text(4, g_font.ascent(), "归档管理", false, true);
+        u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
+
+        int y = FONT_H + 8 + LINE_SPACING;
+        int vis = (STATUS_Y - y + LINE_SPACING - 1) / LINE_SPACING;
+        if (vis < 1) vis = 1;
+        if (g.archiveSel < g.archiveScroll) g.archiveScroll = g.archiveSel;
+        if (g.archiveSel >= g.archiveScroll + vis) g.archiveScroll = g.archiveSel - vis + 1;
+
+        if (g.archiveMonths.empty()) {
+            ui_draw_text(8, y, "暂无归档");
+        }
+        for (int i = 0; i < vis && (g.archiveScroll + i) < (int)g.archiveMonths.size(); i++) {
+            int mi = g.archiveScroll + i;
+            bool sel = (mi == g.archiveSel);
+            std::string month = g.archiveMonths[mi];
+            int count = g.archiveCounts[mi];
+
+            char buf[64];
+            snprintf(buf, sizeof(buf), "%s  (%d项)", month.c_str(), count);
+            ui_draw_text(8, y + i * LINE_SPACING, buf, sel);
+        }
+
+        ui_draw_status("?:帮助 | Enter展开 d:删除 Esc返回", "");
+    } else {
+        // Task list for selected month
+        char title[48];
+        snprintf(title, sizeof(title), "归档: %s", g.archiveViewMonth.c_str());
+        ui_draw_text(4, g_font.ascent(), title, false, true);
+        u8g2_DrawHLine(g_u8g2, 0, FONT_H + 4, SCREEN_W);
+
+        int y = FONT_H + 8 + LINE_SPACING;
+        int vis = (STATUS_Y - y + LINE_SPACING - 1) / LINE_SPACING;
+        if (vis < 1) vis = 1;
+        if (g.archiveViewSel < g.archiveViewScroll) g.archiveViewScroll = g.archiveViewSel;
+        if (g.archiveViewSel >= g.archiveViewScroll + vis) g.archiveViewScroll = g.archiveViewSel - vis + 1;
+
+        for (int i = 0; i < vis && (g.archiveViewScroll + i) < (int)g.archiveTasks.size(); i++) {
+            int ti = g.archiveViewScroll + i;
+            bool sel = (ti == g.archiveViewSel);
+            auto &t = g.archiveTasks[ti];
+            std::string status = t["status"].asString("todo");
+            std::string ttl = t["title"].asString();
+            char buf[96];
+            snprintf(buf, sizeof(buf), "%s %s", statusIcon(status), ttl.c_str());
+            ui_draw_text(8, y + i * LINE_SPACING, buf, sel);
+        }
+
+        if (g.archiveTasks.empty()) ui_draw_text(8, y, "(空)");
+
+        char sl[48];
+        snprintf(sl, sizeof(sl), "?:帮助 | %d项 Esc返回", (int)g.archiveTasks.size());
+        ui_draw_status(sl, "");
+    }
+
+    drawIMEStatus(); ui_commit();
+}
 
 
 
@@ -1738,6 +1950,8 @@ static const char *HELP_LINES[] = {
     "z     折叠/展开",
 
     "Z     全部折叠/展开",
+
+    "A     归档管理",
 
     "a     添加任务",
 
@@ -3173,6 +3387,8 @@ void screen_gtd_init() {
 
     loadData();
 
+    autoArchive();
+
 }
 
 
@@ -4448,6 +4664,60 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
 
 
+    // ── M_ARCHIVE: archive manager ────────────────────────────────────
+
+    if (g.mode == M_ARCHIVE) {
+
+        if (key == 0x1B || key == 'q' || key == 'Q') {
+            if (g.archiveBrowsing) {
+                g.archiveBrowsing = false;
+            } else {
+                g.mode = M_BROWSE;
+            }
+        } else if (key == KEY_UP) {
+            if (g.archiveBrowsing) {
+                if (g.archiveViewSel > 0) g.archiveViewSel--;
+            } else {
+                if (g.archiveSel > 0) g.archiveSel--;
+            }
+        } else if (key == KEY_DOWN) {
+            if (g.archiveBrowsing) {
+                if (g.archiveViewSel < (int)g.archiveTasks.size() - 1) g.archiveViewSel++;
+            } else {
+                if (g.archiveSel < (int)g.archiveMonths.size() - 1) g.archiveSel++;
+            }
+        } else if ((key == 'd' || key == 'D') && !g.archiveBrowsing) {
+            if (g.archiveSel >= 0 && g.archiveSel < (int)g.archiveMonths.size()) {
+                std::string path = std::string(ARCHIVE_DIR) + "/" + g.archiveMonths[g.archiveSel] + ".json";
+                remove(path.c_str());
+                g.archiveMonths.erase(g.archiveMonths.begin() + g.archiveSel);
+                g.archiveCounts.erase(g.archiveCounts.begin() + g.archiveSel);
+                if (g.archiveSel >= (int)g.archiveMonths.size()) g.archiveSel = (int)g.archiveMonths.size() - 1;
+                if (g.archiveSel < 0) g.archiveSel = 0;
+            }
+        } else if ((key == 0x0A || key == 0x0D) && !g.archiveBrowsing) {
+            if (g.archiveSel >= 0 && g.archiveSel < (int)g.archiveMonths.size()) {
+                g.archiveViewMonth = g.archiveMonths[g.archiveSel];
+                loadArchiveMonthTasks(g.archiveViewMonth);
+                g.archiveBrowsing = true;
+                g.archiveViewSel = 0;
+                g.archiveViewScroll = 0;
+            }
+        } else if (key == '?' || key == 'h') {
+            g.helpScroll = 0;
+            g.helpPrevMode = M_ARCHIVE;
+            g.mode = M_HELP;
+            drawHelp();
+            ui_commit();
+            return APP_GTD;
+        }
+
+        if (g.mode != M_HELP) drawArchiveMgr();
+        return APP_GTD;
+    }
+
+
+
     // ── M_HELP: shortcut help dialog ─────────────────────────────────
 
     if (g.mode == M_HELP) {
@@ -5060,6 +5330,24 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
         g.imeActive = true;
 
         g_ime.setActive(true);
+
+    }
+
+
+
+    if (key == 'A') {
+
+        mkdir(ARCHIVE_DIR, 0755);
+
+        loadArchiveMonths();
+
+        g.archiveSel = 0;
+
+        g.archiveScroll = 0;
+
+        g.archiveBrowsing = false;
+
+        g.mode = M_ARCHIVE;
 
     }
 
