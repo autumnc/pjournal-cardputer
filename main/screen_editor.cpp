@@ -22,12 +22,13 @@ extern "C" {
     extern void u8g2_DrawFrame(void *u8g2, int x, int y, int w, int h);
 }
 
+#include "clipboard.h"
+
 #define IME_CODE_Y (STATUS_Y - 2*FONT_H + g_font.ascent())
 #define IME_CAND_Y (STATUS_Y - FONT_H + g_font.ascent() - 3)
 #define EDITOR_MAX_CELLS (SCREEN_W / g_font.halfAdvance())
 
 // ── Editor state ─────────────────────────────────────────────────────────
-static std::string g_clipboard;  // global clipboard, survives across sessions
 
 static struct {
     std::vector<std::string> lines;

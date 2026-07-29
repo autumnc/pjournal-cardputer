@@ -33,6 +33,7 @@ static const char *TAG = "BtKeybrd";
 #define KEY_SHIFT_DOWN  0x87
 #define KEY_SHIFT_LEFT  0x88
 #define KEY_SHIFT_RIGHT 0x89
+#define KEY_CTRL_I      0x8A
 
 // HID Usage ID → ASCII
 static const uint8_t s_asc_low[] = {
@@ -230,10 +231,10 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
 
                 // Ctrl modifier handling
                 bool ctrl = (mod & 0x11) != 0;
-                if (ctrl && kc >= 4 && kc <= 29) {
-                    // Ctrl+letter → control character (0x01-0x1A)
-                    uint8_t cc = kc - 3;
-                    xQueueSendToBack(s_queue, &cc, 0);
+                if (ctrl && kc == 12) {
+                    // Ctrl+I → inspiration panel (must check before generic Ctrl+letter)
+                    uint8_t ci = KEY_CTRL_I;
+                    xQueueSendToBack(s_queue, &ci, 0);
                     continue;
                 }
                 if (ctrl && kc == 44) {
@@ -246,6 +247,12 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                     // Ctrl+Enter → special key
                     uint8_t ce = KEY_CTRL_ENTER;
                     xQueueSendToBack(s_queue, &ce, 0);
+                    continue;
+                }
+                if (ctrl && kc >= 4 && kc <= 29) {
+                    // Ctrl+letter → control character (0x01-0x1A)
+                    uint8_t cc = kc - 3;
+                    xQueueSendToBack(s_queue, &cc, 0);
                     continue;
                 }
 
@@ -610,15 +617,18 @@ void BtKeyboard::checkKeyRepeat() {
             if (now >= s_last_repeat_time[i] + interval_us) {
                 // Ctrl modifier handling for repeat
                 bool ctrl = (s_last_mod & 0x11) != 0;
-                if (ctrl && kc >= 4 && kc <= 29) {
-                    uint8_t cc = kc - 3;
-                    xQueueSendToBack(s_queue, &cc, 0);
+                if (ctrl && kc == 12) {
+                    uint8_t ci = KEY_CTRL_I;
+                    xQueueSendToBack(s_queue, &ci, 0);
                 } else if (ctrl && kc == 44) {
                     uint8_t toggle = KEY_IME_TOGGLE;
                     xQueueSendToBack(s_queue, &toggle, 0);
                 } else if (ctrl && kc == 40) {
                     uint8_t ce = KEY_CTRL_ENTER;
                     xQueueSendToBack(s_queue, &ce, 0);
+                } else if (ctrl && kc >= 4 && kc <= 29) {
+                    uint8_t cc = kc - 3;
+                    xQueueSendToBack(s_queue, &cc, 0);
                 } else {
                     uint8_t ascii = hid_to_ascii(kc, s_last_mod);
                     if (ascii) xQueueSendToBack(s_queue, &ascii, 0);

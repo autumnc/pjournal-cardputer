@@ -1,4 +1,5 @@
 #include "pjournal_app.h"
+#include "clipboard.h"
 #include "font_renderer.h"
 #include "journal_storage.h"
 #include "flomo_client.h"
@@ -13,6 +14,8 @@
 #include <freertos/task.h>
 
 extern void *g_u8g2;
+
+std::string g_clipboard;  // global clipboard definition
 
 extern "C" {
     extern void u8g2_SetDrawColor(void *g_u8g2, int color);

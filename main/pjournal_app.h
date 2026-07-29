@@ -17,6 +17,7 @@ enum AppState {
     APP_FILE_MANAGER,
     APP_GTD,
     APP_OUTLINE,
+    APP_INSPIRATION,
     APP_QUIT,
 };
 
@@ -44,6 +45,7 @@ struct ScreenContext {
 #define KEY_SHIFT_DOWN  0x87
 #define KEY_SHIFT_LEFT  0x88
 #define KEY_SHIFT_RIGHT 0x89
+#define KEY_CTRL_I      0x8A
 
 // Screen entry points (screens that remain in pjournal_app.cpp)
 void screen_main_init();
@@ -61,3 +63,7 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx);
 
 void screen_outline_init();
 AppState screen_outline_handle(int key, ScreenContext &ctx);
+
+// Inspiration screen
+void screen_inspiration_init(AppState returnTo);
+AppState screen_inspiration_handle(int key, ScreenContext &ctx);

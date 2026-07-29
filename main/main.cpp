@@ -219,6 +219,7 @@ extern "C" void app_main() {
     // Always start at main screen; BT connects in background
     AppState currentState = APP_MAIN;
     ScreenContext ctx;
+    static AppState inspReturnTo = APP_MAIN;
 
     // Button debounce counters
     struct { int count; bool fired_long; } btn_user = {}, btn_boot = {};
@@ -346,6 +347,14 @@ extern "C" void app_main() {
                 btn_boot.fired_long = false;
             }
         }
+
+        // Global Ctrl+I → inspiration panel (works from any screen including editor)
+        if (key == KEY_CTRL_I && currentState != APP_INSPIRATION) {
+            inspReturnTo = currentState;
+            currentState = APP_INSPIRATION;
+            key = 0;
+        }
+
         switch (currentState) {
         case APP_MAIN:
             g_font.setSize(22);
@@ -363,8 +372,8 @@ extern "C" void app_main() {
             if (!editorInited) { screen_editor_init(ctx); editorInited = true; }
             if (key > 0) currentState = screen_editor_handle(key, ctx);
             else { screen_editor_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
-            // Don't reset editorInited when returning from Flomo send
-            if (currentState != APP_EDITOR && currentState != APP_SYNC_SEND_FLOMO) editorInited = false;
+            // Don't reset editorInited when returning from Flomo send or inspiration panel
+            if (currentState != APP_EDITOR && currentState != APP_SYNC_SEND_FLOMO && currentState != APP_INSPIRATION) editorInited = false;
             break;
         }
 
@@ -438,6 +447,20 @@ extern "C" void app_main() {
             if (key > 0) currentState = screen_outline_handle(key, ctx);
             else { screen_outline_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
             if (currentState != APP_OUTLINE) outlineInited = false;
+            break;
+        }
+
+        case APP_INSPIRATION: {
+            g_font.setSize(22);
+            IME::getInstance().setPageSize(7);
+            static bool inspInited = false;
+            if (!inspInited) {
+                screen_inspiration_init(inspReturnTo);
+                inspInited = true;
+            }
+            if (key > 0) currentState = screen_inspiration_handle(key, ctx);
+            else { screen_inspiration_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
+            if (currentState != APP_INSPIRATION) inspInited = false;
             break;
         }
 

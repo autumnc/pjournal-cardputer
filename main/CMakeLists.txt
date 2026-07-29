@@ -21,6 +21,7 @@ idf_component_register(SRCS
     "ime/IME.cpp"
     "screen_gtd.cpp"
     "screen_outline.cpp"
+    "screen_inspiration.cpp"
     INCLUDE_DIRS "."
     EMBED_FILES
         "ime/ime_table_pinyin.bin"
