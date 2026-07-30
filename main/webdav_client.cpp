@@ -147,22 +147,17 @@ static std::string httpRequest(const std::string &url, const std::string &method
     if (!contentType.empty()) esp_http_client_set_header(client, "Content-Type", contentType.c_str());
     if (!extraHeader.empty()) esp_http_client_set_header(client, "Depth", extraHeader.c_str());
 
-    if (!body.empty() && method != "GET" && method != "HEAD") {
-        esp_http_client_set_post_field(client, body.c_str(), (int)body.size());
-    }
-
     std::string response;
     int status = 0;
-    esp_err_t err = esp_http_client_open(client, 0);  // 先打开连接
+    int bodyLen = (!body.empty() && method != "GET" && method != "HEAD") ? (int)body.size() : 0;
+    esp_err_t err = esp_http_client_open(client, bodyLen);
     if (err == ESP_OK) {
-        // 对于有请求体的方法，发送请求体
-        if (!body.empty() && method != "GET" && method != "HEAD") {
-            int written = esp_http_client_write(client, body.c_str(), (int)body.size());
-            ESP_LOGI(TAG, "Written %d bytes to request body", written);
+        // Write request body for PUT/POST/etc
+        if (bodyLen > 0) {
+            int written = esp_http_client_write(client, body.c_str(), bodyLen);
+            ESP_LOGI(TAG, "Written %d/%d bytes to request body", written, bodyLen);
         }
 
-        // 获取响应状态码
-        // 注意：fetch_headers 返回的是 content_length，不是 status_code
         int content_length = esp_http_client_fetch_headers(client);
         status = esp_http_client_get_status_code(client);
         ESP_LOGI(TAG, "HTTP %s %s status=%d content_length=%d",
@@ -293,8 +288,6 @@ std::string WebDavClient::headFile(const std::string &remotePath) {
     int status = 0;
     httpRequest(url, "HEAD", auth, "", "", "", &status);
     if (status == 200 || status == 203) {
-        // We could get Last-Modified from the headers,
-        // but for simplicity return "exists" for now
         return "exists";
     }
     return "";
@@ -420,6 +413,14 @@ SyncResult WebDavClient::sync(const std::string &localDir) {
         }
     }
 
+    // Safety check: if remote list is empty but local has files and previous sync state exists,
+    // the network is likely down — abort sync to avoid deleting all local files
+    if (remoteFiles.empty() && !localFiles.empty() && !prevState.empty()) {
+        ESP_LOGE(TAG, "Remote file list is empty but local has %d files and sync state has %d entries — network likely down, aborting sync",
+                 (int)localFiles.size(), (int)prevState.size());
+        return {false, "网络异常，无法获取远程文件列表"};
+    }
+
     int uploaded = 0, downloaded = 0, skipped = 0;
     int deletedLocal = 0, deletedRemote = 0, failed = 0;
 
@@ -442,111 +443,68 @@ SyncResult WebDavClient::sync(const std::string &localDir) {
         time_t localMtime = localExists ? localFiles[fname] : 0;
         time_t remoteMtime = remoteExists ? remoteFiles[fname] : 0;
 
-        // If PROPFIND didn't return mtime, try HEAD
-        if (remoteExists && remoteMtime == 0) {
-            std::string headResult = headFile(remoteDir + fname);
-            if (!headResult.empty() && headResult != "exists") {
-                remoteMtime = parseWebdavDate(headResult);
-            }
-        }
-
         if (!localExists && !remoteExists) {
             continue;
         } else if (!localExists && remoteExists) {
             if (inPrev) {
-                // Local deleted -> delete remote
-                if (remove(remoteDir + fname)) {
-                    deletedRemote++;
-                } else {
-                    failed++;
-                }
+                // Local was deleted → delete remote
+                if (remove(remoteDir + fname)) deletedRemote++;
+                else failed++;
             } else {
-                // Remote new -> download
+                // Remote new → download
                 ESP_LOGI(TAG, "Downloading remote file: %s", fname.c_str());
                 std::string content = download(remoteDir + fname);
-                if (!content.empty()) {
-                    ESP_LOGI(TAG, "Downloaded %d bytes for %s", (int)content.size(), fname.c_str());
-                    if (g_journal.saveEntryRaw(fname, content)) {
-                        downloaded++;
-                        newState[fname] = remoteMtime;
-                        // Set local file mtime to match remote
-                        std::string localPath = "/sdcard/pjournal/" + fname;
-                        struct utimbuf ut;
-                        ut.actime = remoteMtime;
-                        ut.modtime = remoteMtime;
-                        utime(localPath.c_str(), &ut);
-                        ESP_LOGI(TAG, "Successfully saved: %s", fname.c_str());
-                    } else {
-                        ESP_LOGE(TAG, "Failed to save: %s", fname.c_str());
-                        failed++;
-                    }
+                if (!content.empty() && g_journal.saveEntryRaw(fname, content)) {
+                    downloaded++;
+                    newState[fname] = remoteMtime;
+                    std::string localPath = "/sdcard/pjournal/" + fname;
+                    struct utimbuf ut = {remoteMtime, remoteMtime};
+                    utime(localPath.c_str(), &ut);
                 } else {
-                    ESP_LOGE(TAG, "Download failed or empty content: %s", fname.c_str());
                     failed++;
                 }
             }
         } else if (localExists && !remoteExists) {
             if (inPrev) {
-                // Remote deleted -> delete local
-                if (g_journal.deleteEntry(fname)) {
-                    deletedLocal++;
-                } else {
-                    failed++;
-                }
+                // Remote was deleted → delete local
+                if (g_journal.deleteEntry(fname)) deletedLocal++;
+                else failed++;
             } else {
-                // Local new -> upload
+                // Local new → upload
                 std::string content = g_journal.readEntry(fname);
-                if (!content.empty()) {
-                    if (upload(remoteDir + fname, content)) {
-                        uploaded++;
-                        newState[fname] = localMtime;
-                    } else {
-                        failed++;
-                    }
+                if (upload(remoteDir + fname, content)) {
+                    uploaded++;
+                    newState[fname] = localMtime;
                 } else {
                     failed++;
                 }
             }
         } else {
-            // Both exist -> compare mtimes
+            // Both exist → compare mtimes
             time_t lm = localMtime ? localMtime : 0;
             time_t rm = remoteMtime ? remoteMtime : 0;
             long diff = (long)(lm - rm);
             if (diff < 0) diff = -diff;
-            // 使用60秒阈值避免同一文件被双向同步
             if (diff <= 60) {
                 skipped++;
                 newState[fname] = lm ? lm : rm;
             } else if (lm > rm) {
-                // Local newer -> upload
                 std::string content = g_journal.readEntry(fname);
-                if (!content.empty()) {
-                    if (upload(remoteDir + fname, content)) {
-                        uploaded++;
-                        newState[fname] = lm;
-                    } else {
-                        failed++;
-                        newState[fname] = prevState.count(fname) ? prevState[fname] : lm;
-                    }
+                if (upload(remoteDir + fname, content)) {
+                    uploaded++;
+                    newState[fname] = lm;
                 } else {
                     failed++;
+                    newState[fname] = prevState.count(fname) ? prevState[fname] : lm;
                 }
             } else {
-                // Remote newer -> download
                 std::string content = download(remoteDir + fname);
-                if (!content.empty()) {
-                    if (g_journal.saveEntryRaw(fname, content)) {
-                        downloaded++;
-                        newState[fname] = rm;
-                        // Set local mtime to match remote
-                        std::string localPath = "/sdcard/pjournal/" + fname;
-                        struct utimbuf ut;
-                        ut.actime = rm;
-                        ut.modtime = rm;
-                        utime(localPath.c_str(), &ut);
-                    } else {
-                        failed++;
-                    }
+                if (!content.empty() && g_journal.saveEntryRaw(fname, content)) {
+                    downloaded++;
+                    newState[fname] = rm;
+                    std::string localPath = "/sdcard/pjournal/" + fname;
+                    struct utimbuf ut = {rm, rm};
+                    utime(localPath.c_str(), &ut);
                 } else {
                     failed++;
                 }

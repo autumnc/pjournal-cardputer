@@ -465,6 +465,15 @@ extern "C" void app_main() {
         }
 
         case APP_SYNC_WEBDAV: {
+            g_font.setSize(22);
+            IME::getInstance().setPageSize(7);
+
+            // Show sync panel immediately
+            ui_clear();
+            ui_draw_text_centered(100, "WebDAV 同步", false, true);
+            ui_draw_text_centered(135, "正在连接WiFi...");
+            ui_commit();
+
             // Auto-connect WiFi if needed
             bool wifiWasConnected = g_wifi.isConnected();
             if (!wifiWasConnected) {
@@ -473,7 +482,6 @@ extern "C" void app_main() {
                 if (!ssid.empty()) {
                     g_wifi.begin();
                     g_wifi.connect(ssid.c_str(), pass.c_str());
-                    // Wait up to 10s for WiFi connection
                     for (int i = 0; i < 100; i++) {
                         if (g_wifi.isConnected()) break;
                         vTaskDelay(pdMS_TO_TICKS(100));
@@ -481,20 +489,37 @@ extern "C" void app_main() {
                 }
             }
 
+            if (!g_wifi.isConnected()) {
+                ui_clear();
+                ui_draw_text_centered(100, "WebDAV 同步", false, true);
+                ui_draw_text_centered(135, "WiFi连接失败");
+                ui_commit();
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                currentState = APP_MAIN;
+                break;
+            }
+
             ui_clear();
-            ui_show_message_centered("正在同步...");
+            ui_draw_text_centered(100, "WebDAV 同步", false, true);
+            ui_draw_text_centered(135, "正在同步...");
+            ui_commit();
+
             std::string url = g_settings.webdavUrl();
             std::string user = g_settings.webdavUsername();
             std::string pass = g_settings.webdavPassword();
             if (url.empty() || user.empty()) {
                 ui_clear();
-                ui_show_message_centered("请先配置WebDAV");
+                ui_draw_text_centered(100, "WebDAV 同步", false, true);
+                ui_draw_text_centered(135, "请先配置WebDAV");
+                ui_commit();
                 vTaskDelay(pdMS_TO_TICKS(2000));
             } else {
                 g_webdav.configure(url, user, pass);
                 auto result = g_webdav.sync("/sdcard/pjournal");
                 ui_clear();
-                ui_show_message_centered(result.message.c_str());
+                ui_draw_text_centered(100, "WebDAV 同步", false, true);
+                ui_draw_text_centered(135, result.message.c_str());
+                ui_commit();
                 vTaskDelay(pdMS_TO_TICKS(2000));
             }
 

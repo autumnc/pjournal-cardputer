@@ -204,6 +204,7 @@ std::vector<std::pair<std::string, time_t>> JournalStorage::listFileMtimes() {
         if (de->d_type != DT_REG) continue;
         std::string fn = de->d_name;
         if (fn[0] == '.') continue;
+        if (fn.size() >= 2 && fn[0] == '_' && fn[1] == '_') continue;  // skip temp files
         if (!isJournalExt(fn)) continue;
 
         struct stat st;
