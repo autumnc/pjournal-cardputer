@@ -287,8 +287,9 @@ void screen_inspiration_init(AppState returnTo) {
                     }
                 }
             }
-            remove(tempPath.c_str());
         }
+        // Always clean up temp file (even if editor was cancelled)
+        remove(tempPath.c_str());
         g.pendingInspirationId.clear();
         return; // preserve sel/scroll
     }

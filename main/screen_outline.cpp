@@ -1009,10 +1009,9 @@ void screen_outline_init() {
                 fwrite(body.data(), 1, body.size(), f);
                 fclose(f);
             }
-
-            // Clean up temp file
-            remove(tempPath.c_str());
         }
+        // Always clean up temp file (even if editor was cancelled)
+        remove(tempPath.c_str());
         g.pendingOutlineTarget.clear();
         g.pendingJournalFile.clear();
         // Reload outline data after returning from editor

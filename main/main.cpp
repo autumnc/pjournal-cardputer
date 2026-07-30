@@ -372,8 +372,19 @@ extern "C" void app_main() {
             if (!editorInited) { screen_editor_init(ctx); editorInited = true; }
             if (key > 0) currentState = screen_editor_handle(key, ctx);
             else { screen_editor_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
-            // Don't reset editorInited when returning from Flomo send or inspiration panel
-            if (currentState != APP_EDITOR && currentState != APP_SYNC_SEND_FLOMO && currentState != APP_INSPIRATION) editorInited = false;
+            // Preserve editorInited when going to inspiration via Ctrl+I (editor should resume)
+            // Reset editorInited when editor is opened FROM another screen (new content)
+            if (currentState != APP_EDITOR && currentState != APP_SYNC_SEND_FLOMO) {
+                if (currentState == APP_INSPIRATION) {
+                    // Ctrl+I from editor → preserve editor state
+                } else {
+                    editorInited = false;
+                }
+            }
+            // If another screen opened the editor, must re-init with new content
+            if (currentState == APP_EDITOR && ctx.prevState != APP_MAIN && ctx.prevState != APP_EDITOR) {
+                editorInited = false;
+            }
             break;
         }
 

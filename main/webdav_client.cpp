@@ -472,7 +472,7 @@ SyncResult WebDavClient::sync(const std::string &localDir) {
             } else {
                 // Local new → upload
                 std::string content = g_journal.readEntry(fname);
-                if (upload(remoteDir + fname, content)) {
+                if (!content.empty() && upload(remoteDir + fname, content)) {
                     uploaded++;
                     newState[fname] = localMtime;
                 } else {
@@ -490,7 +490,7 @@ SyncResult WebDavClient::sync(const std::string &localDir) {
                 newState[fname] = lm ? lm : rm;
             } else if (lm > rm) {
                 std::string content = g_journal.readEntry(fname);
-                if (upload(remoteDir + fname, content)) {
+                if (!content.empty() && upload(remoteDir + fname, content)) {
                     uploaded++;
                     newState[fname] = lm;
                 } else {
