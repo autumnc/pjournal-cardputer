@@ -1,6 +1,6 @@
 # pjournal-esp32
 
-ESP32-S3 上的个人日记工具，配备 4.2 寸RLCD黑白全反射屏，支持蓝牙键盘输入、拼音输入法、多端同步等功能。
+ESP32-S3 上的个人日记工具，配备 4.2 寸 RLCD 黑白全反射屏，支持蓝牙键盘输入、拼音输入法、GTD 任务管理、大纲写作、多端同步等功能。
 
 ## 硬件需求
 
@@ -19,39 +19,107 @@ ESP32-S3 上的个人日记工具，配备 4.2 寸RLCD黑白全反射屏，支�
 ## 功能特性
 
 - **自由写作** / **提示写作**：新建日记条目
-- **拼音输入法**：支持中文输入、词库联想
+- **拼音输入法**：支持中文输入、词库联想，`Ctrl+Space` 切换中/英，`Shift+Space` 切换全角/半角
+- **GTD 任务管理** (`t`)：分层任务、项目、标签/情境、筛选、归档、任务摘要
+- **大纲写作** (`o`)：大纲式写作，支持项目、标签、标题层级、详情面板、摘要
+- **灵感面板** (`Ctrl+I`)：快速记录灵感，支持关键词、内容检索、复制到剪贴板
 - **蓝牙键盘**：一键配对 / 自动重连（10 秒间隔）
-- **过往日记浏览**：按日期排序、查看详情
-- **编辑已有日记**：从浏览/详情界面按 `e` 进入编辑
-- **自动保存**：3 秒无操作自动保存，或手动 `Ctrl+S`
-- **发送至 Flomo**：`Ctrl+F` 发送当前正文到 Flomo
-- **WebDAV 同步**：上传/下载日记到远程存储
+- **过往日记浏览**：按日期排序、查看详情、编辑
+- **编辑器**：自动保存、选择/复制/粘贴、发送至 Flomo
+- **发送至 Flomo**：`Ctrl+F` 即时反馈面板，防止重复发送
+- **WebDAV 同步**：上传/下载日记到远程存储，同步状态即时显示
 - **AI 提示生成**：`Ctrl+P` 根据个人设置生成写作提示
 - **NTP 时间同步**：支持自定义 NTP 服务器
-- **固件 OTA 待烧录**：通过串口 `/dev/ttyUSB0` 烧写
+- **Web 文件管理**：通过浏览器管理 SD 卡文件
 
 ## 快捷键
 
+### 主界面
+
 | 快捷键 | 功能 |
 |--------|------|
-| `p` | 提示写作（主界面） |
-| `f` | 自由写作（主界面） |
-| `v` | 查看过往日记（主界面） |
-| `w` | WebDAV 同步（主界面） |
-| `s` | 设置（主界面） |
+| `p` | 提示写作 |
+| `f` | 自由写作 |
+| `v` | 查看过往日记 |
+| `t` | GTD 任务管理 |
+| `o` | 大纲写作 |
+| `w` | WebDAV 同步 |
+| `s` | 设置 |
+| `Ctrl+I` | 灵感面板（全局） |
+
+### 编辑器
+
+| 快捷键 | 功能 |
+|--------|------|
 | `Ctrl+Space` | 中/英输入法切换 |
+| `Shift+Space` | 全角/半角切换 |
 | `Ctrl+S` | 保存 |
 | `Ctrl+Q` | 退出编辑 |
 | `Ctrl+P` | AI 生成写作提示 |
 | `Ctrl+F` | 发送正文到 Flomo |
+| `Ctrl+C/X/V` | 复制 / 剪切 / 粘贴 |
+| `Shift+方向键` | 选择文本 |
+
+### 通用
+
+| 快捷键 | 功能 |
+|--------|------|
 | `ESC` | 返回上一级面板 |
-| `j` / `↓` | 向下移动 |
-| `k` / `↑` | 向上移动 |
-| `h` / `←` | 向左移动 |
-| `l` / `→` | 向右移动 |
+| `j` / `k` | 上移 / 下移 |
+| `h` / `l` | 左移 / 右移 |
 | `Enter` | 确认 / 进入详情 |
-| `d` | 删除条目（过往日记列表） |
+| `d` | 删除条目 |
 | `e` | 编辑当前条目 |
+| `?` | 帮助 |
+
+### GTD 任务管理
+
+| 快捷键 | 功能 |
+|--------|------|
+| `j` / `k` | 上移 / 下移任务 |
+| `h` / `l` | 提高 / 降低层级 |
+| `z` / `Z` | 折叠 / 全部折叠展开 |
+| `a` | 添加任务 |
+| `i` | 添加子任务 |
+| `r` | 重命名 |
+| `Enter` | 任务详情（编辑字段、优先级、截止日期） |
+| `Space` | 切换完成状态 |
+| `d` | 删除任务 |
+| `Tab` | 切换标签 |
+| `/` | 筛选 |
+| `A` | 归档管理 |
+| `s` | 任务摘要 |
+| `c` | 情境管理 |
+| `t` | 标签管理 |
+| `n` | 新建项目 |
+
+### 大纲写作
+
+| 快捷键 | 功能 |
+|--------|------|
+| `a` / `i` | 添加标题 / 子标题 |
+| `r` | 重命名 |
+| `Enter` | 详情面板 |
+| `f` | 关联文件 |
+| `s` | 摘要 |
+| `d` | 删除标题 |
+| `Tab` | 切换项目 |
+| `/` | 筛选 |
+| `t` | 标签管理 |
+| `j` / `k` | 上移 / 下移 |
+| `h` / `l` | 提高 / 降低层级 |
+
+### 灵感面板
+
+| 快捷键 | 功能 |
+|--------|------|
+| `a` | 添加灵感 |
+| `d` | 删除灵感 |
+| `Enter` | 编辑内容 |
+| `k` | 编辑关键词 |
+| `/` | 检索灵感（内容 / 关键词） |
+| `c` | 复制到剪贴板 |
+| `q` / `Esc` | 返回 |
 
 ### 物理按键
 
@@ -78,7 +146,7 @@ ESP32-S3 上的个人日记工具，配备 4.2 寸RLCD黑白全反射屏，支�
 idf.py build
 
 # 生成合并固件（bootloader + partition + app）
-esptool.py --chip esp32s3 merge_bin -o build/merged-firmware.bin \
+esptool.py --chip esp32s3 merge_bin -o build/pjournal-merged.bin \
   --flash_mode dio --flash_size 16MB --flash_freq 80m \
   0x0 build/bootloader/bootloader.bin \
   0x8000 build/partition_table/partition-table.bin \
@@ -91,7 +159,7 @@ esptool.py --chip esp32s3 merge_bin -o build/merged-firmware.bin \
 # 合并固件一步烧录
 esptool.py --chip esp32s3 -p /dev/ttyUSB0 -b 460800 \
   --before default_reset --after hard_reset \
-  write_flash 0x0 build/merged-firmware.bin
+  write_flash 0x0 build/pjournal-merged.bin
 
 # 或分步烧录
 idf.py -p /dev/ttyUSB0 flash
@@ -100,10 +168,17 @@ idf.py -p /dev/ttyUSB0 flash
 ## SD 卡目录结构
 
 ```
-/sdcard/pjournal/
-├── entries/         # 日记文件 (YYYY-MM-DD_HHMMSS.txt)
-├── settings.json    # 设置
-└── bt_paired.dat    # 蓝牙配对信息
+/sdcard/
+├── pjournal/          # 日记
+│   ├── entries/       # 日记文件 (YYYY-MM-DD_HHMMSS.txt)
+│   ├── settings.json  # 设置
+│   └── bt_paired.dat  # 蓝牙配对信息
+├── gtd/               # GTD 任务管理
+│   ├── gtd.json       # 任务数据
+│   └── gtd_export_*.md  # 任务导出
+└── outline/           # 大纲写作 + 灵感面板
+    ├── *.json         # 大纲项目
+    └── inspiration.json  # 灵感数据
 ```
 
 ## 设置项
@@ -129,7 +204,11 @@ idf.py -p /dev/ttyUSB0 flash
 │   ├── Enter → 详情
 │   │   └── e → 编辑器 → ESC → 详情
 │   └── e → 编辑器 → ESC → 列表
+├── GTD 任务管理 (t)
+├── 大纲写作 (o)
+├── 灵感面板 (Ctrl+I)
 ├── 设置
+│   └── Web 文件管理（浏览器访问 SD 卡）
 ├── WebDAV 同步
 ├── 蓝牙管理（长按用户按键）
 └── Flomo 发送
@@ -137,7 +216,7 @@ idf.py -p /dev/ttyUSB0 flash
 
 ## 版本
 
-当前版本: v1.4.0
+当前版本: v2.4.0
 
 ## License
 
