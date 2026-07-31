@@ -67,3 +67,7 @@ AppState screen_outline_handle(int key, ScreenContext &ctx);
 // Inspiration screen
 void screen_inspiration_init(AppState returnTo);
 AppState screen_inspiration_handle(int key, ScreenContext &ctx);
+
+// Flomo send text (set by browser/viewer before entering APP_SYNC_SEND_FLOMO)
+extern std::string g_flomoPendingText;
+extern AppState g_flomoReturnTo;

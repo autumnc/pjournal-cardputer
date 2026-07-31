@@ -483,6 +483,16 @@ SyncResult WebDavClient::sync(const std::string &localDir) {
             // Both exist → compare mtimes
             time_t lm = localMtime ? localMtime : 0;
             time_t rm = remoteMtime ? remoteMtime : 0;
+            time_t pm = inPrev ? prevState[fname] : 0;
+
+            // Fast skip: if both local and remote mtimes match previous sync state,
+            // the file hasn't changed on either side — skip without any network I/O
+            if (pm > 0 && lm == pm && rm == pm) {
+                skipped++;
+                newState[fname] = pm;
+                continue;
+            }
+
             long diff = (long)(lm - rm);
             if (diff < 0) diff = -diff;
             if (diff <= 60) {

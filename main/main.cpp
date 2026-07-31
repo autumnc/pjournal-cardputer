@@ -393,7 +393,7 @@ extern "C" void app_main() {
             static bool browserInited = false;
             if (!browserInited) { screen_browser_init(); browserInited = true; }
             if (key > 0) currentState = screen_browser_handle(key, ctx);
-            else { screen_browser_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
+            else { screen_browser_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(100)); }
             if (currentState != APP_BROWSER) browserInited = false;
             break;
         }
@@ -403,7 +403,7 @@ extern "C" void app_main() {
             static bool viewerInited = false;
             if (!viewerInited) { screen_viewer_init(ctx.selectedEntry); viewerInited = true; }
             if (key > 0) currentState = screen_viewer_handle(key, ctx);
-            else { screen_viewer_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
+            else { screen_viewer_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(100)); }
             if (currentState != APP_VIEWER) viewerInited = false;
             break;
         }
@@ -414,7 +414,7 @@ extern "C" void app_main() {
             static bool settingsInited = false;
             if (!settingsInited) { screen_settings_init(); settingsInited = true; }
             if (key > 0) currentState = screen_settings_handle(key, ctx);
-            else { screen_settings_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
+            else { screen_settings_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(100)); }
             if (currentState != APP_SETTINGS) settingsInited = false;
             break;
         }
@@ -424,7 +424,7 @@ extern "C" void app_main() {
             static bool btInited = false;
             if (!btInited) { screen_bt_manage_init(); btInited = true; }
             if (key > 0) currentState = screen_bt_manage_handle(key, ctx);
-            else { screen_bt_manage_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
+            else { screen_bt_manage_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(100)); }
             if (currentState != APP_BT_MANAGE) btInited = false;
             break;
         }
@@ -445,7 +445,7 @@ extern "C" void app_main() {
             static bool gtdInited = false;
             if (!gtdInited) { screen_gtd_init(); gtdInited = true; }
             if (key > 0) currentState = screen_gtd_handle(key, ctx);
-            else { screen_gtd_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
+            else { screen_gtd_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(100)); }
             if (currentState != APP_GTD) gtdInited = false;
             break;
         }
@@ -456,7 +456,7 @@ extern "C" void app_main() {
             static bool outlineInited = false;
             if (!outlineInited) { screen_outline_init(); outlineInited = true; }
             if (key > 0) currentState = screen_outline_handle(key, ctx);
-            else { screen_outline_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
+            else { screen_outline_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(100)); }
             if (currentState != APP_OUTLINE) outlineInited = false;
             break;
         }
@@ -470,7 +470,7 @@ extern "C" void app_main() {
                 inspInited = true;
             }
             if (key > 0) currentState = screen_inspiration_handle(key, ctx);
-            else { screen_inspiration_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
+            else { screen_inspiration_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(100)); }
             if (currentState != APP_INSPIRATION) inspInited = false;
             break;
         }
@@ -534,43 +534,73 @@ extern "C" void app_main() {
                 vTaskDelay(pdMS_TO_TICKS(2000));
             }
 
-            if (!wifiWasConnected) g_wifi.disconnect();
+            // Always disconnect WiFi after sync to save power
+            g_wifi.disconnect();
             currentState = APP_MAIN;
             break;
         }
 
         case APP_SYNC_SEND_FLOMO: {
-            // Auto-connect WiFi if needed
-            bool wifiWasConnected = g_wifi.isConnected();
-            if (!wifiWasConnected) {
-                std::string ssid = g_settings.wifiSsid();
-                std::string pass = g_settings.wifiPassword();
-                if (!ssid.empty()) {
-                    g_wifi.begin();
-                    g_wifi.connect(ssid.c_str(), pass.c_str());
-                    // Wait up to 10s for WiFi connection
-                    for (int i = 0; i < 100; i++) {
-                        if (g_wifi.isConnected()) break;
-                        vTaskDelay(pdMS_TO_TICKS(100));
+            static int flomoStep = 0;
+            static std::string flomoText;
+            static std::string flomoResult;
+            static AppState flomoReturnTo = APP_EDITOR;
+            if (flomoStep == 0) {
+                if (!g_flomoPendingText.empty()) {
+                    flomoText = std::move(g_flomoPendingText);
+                    g_flomoPendingText.clear();
+                    flomoReturnTo = g_flomoReturnTo;
+                } else {
+                    flomoText = app_get_editor_text();
+                    flomoReturnTo = APP_EDITOR;
+                }
+                flomoResult.clear();
+                if (flomoText.empty()) {
+                    ui_clear(); ui_show_message_centered("内容为空");
+                    ui_commit(); vTaskDelay(pdMS_TO_TICKS(1500));
+                    g_wifi.disconnect();
+                    flomoStep = 0;
+                    currentState = flomoReturnTo;
+                    break;
+                }
+                flomoStep = 1;
+            }
+            if (flomoStep == 1) {
+                ui_clear(); ui_show_message_centered("正在连接WiFi...");
+                ui_commit();
+                if (!g_wifi.isConnected()) {
+                    std::string ssid = g_settings.wifiSsid();
+                    std::string pass = g_settings.wifiPassword();
+                    if (!ssid.empty()) {
+                        g_wifi.begin();
+                        g_wifi.connect(ssid.c_str(), pass.c_str());
+                        for (int i = 0; i < 100; i++) {
+                            if (g_wifi.isConnected()) break;
+                            vTaskDelay(pdMS_TO_TICKS(100));
+                        }
                     }
                 }
+                if (!g_wifi.isConnected()) {
+                    ui_clear(); ui_show_message_centered("WiFi未连接");
+                    ui_commit(); vTaskDelay(pdMS_TO_TICKS(1500));
+                    g_wifi.disconnect();
+                    flomoStep = 0;
+                    currentState = flomoReturnTo;
+                    break;
+                }
+                flomoStep = 2;
             }
-
-            ui_clear();
-            ui_show_message_centered("正在发送...");
-            std::string text = app_get_editor_text();
-            if (!text.empty()) {
-                auto result = g_flomo.send(text);
-                ui_clear();
-                ui_show_message_centered(result.message.c_str());
-            } else {
-                ui_clear();
-                ui_show_message_centered("内容为空");
+            if (flomoStep == 2) {
+                ui_clear(); ui_show_message_centered("正在发送...");
+                ui_commit();
+                auto result = g_flomo.send(flomoText);
+                flomoResult = result.message;
+                ui_clear(); ui_show_message_centered(flomoResult.c_str());
+                ui_commit(); vTaskDelay(pdMS_TO_TICKS(2000));
+                g_wifi.disconnect();
+                flomoStep = 0;
+                currentState = flomoReturnTo;
             }
-            vTaskDelay(pdMS_TO_TICKS(2000));
-
-            if (!wifiWasConnected) g_wifi.disconnect();
-            currentState = APP_EDITOR;  // Return to editor instead of main screen
             break;
         }
 

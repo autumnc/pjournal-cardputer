@@ -2,9 +2,6 @@
 #include "clipboard.h"
 #include "font_renderer.h"
 #include "journal_storage.h"
-#include "flomo_client.h"
-#include "wifi_manager.h"
-#include "settings_manager.h"
 #include "builtin_prompts.h"
 #include <cstdlib>
 #include <cstdio>
@@ -16,6 +13,8 @@
 extern void *g_u8g2;
 
 std::string g_clipboard;  // global clipboard definition
+std::string g_flomoPendingText;
+AppState g_flomoReturnTo = APP_EDITOR;
 
 extern "C" {
     extern void u8g2_SetDrawColor(void *g_u8g2, int color);
@@ -142,27 +141,10 @@ AppState screen_browser_handle(int key, ScreenContext &ctx) {
         if (!content.empty()) {
             auto body = extractBody(content);
             if (!body.empty()) {
-                ui_clear();
-                ui_show_message_centered("正在发送...");
-                ui_commit();
-                bool wifiWas = g_wifi.isConnected();
-                if (!wifiWas) {
-                    std::string ssid = g_settings.wifiSsid();
-                    std::string pass = g_settings.wifiPassword();
-                    if (!ssid.empty()) {
-                        g_wifi.begin();
-                        g_wifi.connect(ssid.c_str(), pass.c_str());
-                        for (int i = 0; i < 100; i++) {
-                            if (g_wifi.isConnected()) break;
-                            vTaskDelay(pdMS_TO_TICKS(100));
-                        }
-                    }
-                }
-                if (g_wifi.isConnected())
-                    ctx.statusMessage = g_flomo.send(body).message;
-                else
-                    ctx.statusMessage = "WiFi未连接";
-                if (!wifiWas) g_wifi.disconnect();
+                g_flomoPendingText = body;
+                g_flomoReturnTo = APP_BROWSER;
+                ctx.nextState = APP_SYNC_SEND_FLOMO;
+                return APP_SYNC_SEND_FLOMO;
             }
         }
     }
@@ -230,27 +212,10 @@ AppState screen_viewer_handle(int key, ScreenContext &ctx) {
         if (!content.empty()) {
             auto body = extractBody(content);
             if (!body.empty()) {
-                ui_clear();
-                ui_show_message_centered("正在发送...");
-                ui_commit();
-                bool wifiWas = g_wifi.isConnected();
-                if (!wifiWas) {
-                    std::string ssid = g_settings.wifiSsid();
-                    std::string pass = g_settings.wifiPassword();
-                    if (!ssid.empty()) {
-                        g_wifi.begin();
-                        g_wifi.connect(ssid.c_str(), pass.c_str());
-                        for (int i = 0; i < 100; i++) {
-                            if (g_wifi.isConnected()) break;
-                            vTaskDelay(pdMS_TO_TICKS(100));
-                        }
-                    }
-                }
-                if (g_wifi.isConnected())
-                    ctx.statusMessage = g_flomo.send(body).message;
-                else
-                    ctx.statusMessage = "WiFi未连接";
-                if (!wifiWas) g_wifi.disconnect();
+                g_flomoPendingText = body;
+                g_flomoReturnTo = APP_VIEWER;
+                ctx.nextState = APP_SYNC_SEND_FLOMO;
+                return APP_SYNC_SEND_FLOMO;
             }
         }
     }
