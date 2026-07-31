@@ -31,7 +31,7 @@ static const char *TAG = "Main";
 
 // Display device (global, used by font_renderer.cpp)
 static u8g2_st7305_t s_lcd_dev;
-void *g_u8g2 = nullptr;
+u8g2_t *g_u8g2 = nullptr;
 
 static bool initDisplay() {
     ESP_LOGI(TAG, "Initializing display...");

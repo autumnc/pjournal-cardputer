@@ -15,7 +15,7 @@
 
 #define KEY_CTRL_ENTER 0x85
 
-extern void *g_u8g2;
+extern u8g2_t *g_u8g2;
 extern "C" {
     extern void u8g2_SetDrawColor(void *g_u8g2, int color);
     extern void u8g2_DrawPixel(void *g_u8g2, int x, int y);

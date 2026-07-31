@@ -8,7 +8,7 @@
 #include <freertos/task.h>
 #include <cstdio>
 
-extern void *g_u8g2;
+extern u8g2_t *g_u8g2;
 
 extern "C" {
     extern void u8g2_SetDrawColor(void *u8g2, int color);

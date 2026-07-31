@@ -10,7 +10,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-extern void *g_u8g2;
+extern u8g2_t *g_u8g2;
 
 std::string g_clipboard;  // global clipboard definition
 std::string g_flomoPendingText;

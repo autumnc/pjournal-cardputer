@@ -181,7 +181,9 @@ extern "C" {
     extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
     extern void *u8g2_st7305_get_u8g2(void *dev);
 }
-extern void *g_u8g2;
+struct u8g2_struct;
+typedef struct u8g2_struct u8g2_t;
+extern u8g2_t *g_u8g2;
 
 void FontRenderer::drawGlyph(int x, int y, const GlyphMeta *meta, bool invert) {
     if (!g_u8g2 || !meta) return;

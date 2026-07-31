@@ -28,7 +28,7 @@
 
 
 
-extern void *g_u8g2;
+extern u8g2_t *g_u8g2;
 
 extern "C" {
 

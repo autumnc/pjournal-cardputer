@@ -6,6 +6,10 @@
 
 class IME;
 
+// Forward declaration matching u8g2.h so extern declarations can use u8g2_t*
+struct u8g2_struct;
+typedef struct u8g2_struct u8g2_t;
+
 // VRow structure for word-wrap rendering
 struct VRow { int lineIdx; int start; int end; };
 

@@ -12,17 +12,10 @@
 #include <esp_adc/adc_cali_scheme.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <esp_heap_caps.h>
+#include "u8g2.h"
 
-extern void *g_u8g2;
-
-extern "C" {
-    extern void u8g2_ClearBuffer(void *u8g2);
-    extern void u8g2_SendBuffer(void *u8g2);
-    extern void u8g2_SetDrawColor(void *u8g2, int color);
-    extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
-    extern void u8g2_DrawHLine(void *u8g2, int x, int y, int w);
-    extern void u8g2_DrawFrame(void *u8g2, int x, int y, int w, int h);
-}
+extern u8g2_t *g_u8g2;
 
 // ── Battery ADC ──────────────────────────────────────────────────────────
 static adc_oneshot_unit_handle_t s_adc_handle = NULL;
@@ -223,7 +216,42 @@ void ui_clear() {
         u8g2_SetDrawColor(g_u8g2, 0); }
 }
 
-void ui_commit() { if (g_u8g2) u8g2_SendBuffer(g_u8g2); }
+// ── Idle refresh optimization ─────────────────────────────────────────────
+// 空闲时屏幕内容逐字节不变(仅键盘输入/日期翻页/电量变化会改变内容),
+// 通过快照对比跳过重复的 SPI 刷新。ST7305 是 GRAM 型控制器,图像可长期
+// 保持,保留低频 KEEPALIVE_US 兜底以防 RLCD 残影。
+static uint8_t *s_frame_snapshot = nullptr;
+static int64_t s_last_send_us = 0;
+static const int64_t KEEPALIVE_US = 5 * 1000000;  // 5s
+
+void ui_commit() {
+    if (!g_u8g2) return;
+
+    uint8_t *buf = u8g2_GetBufferPtr(g_u8g2);
+    size_t size = u8g2_GetBufferSize(g_u8g2);
+
+    if (!s_frame_snapshot) {
+        s_frame_snapshot = (uint8_t *)heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!s_frame_snapshot) {
+            u8g2_SendBuffer(g_u8g2);  // 无快照时退回无条件发送
+            return;
+        }
+        memcpy(s_frame_snapshot, buf, size);
+        u8g2_SendBuffer(g_u8g2);
+        s_last_send_us = esp_timer_get_time();
+        return;
+    }
+
+    int64_t now = esp_timer_get_time();
+    if (memcmp(buf, s_frame_snapshot, size) != 0) {
+        u8g2_SendBuffer(g_u8g2);
+        memcpy(s_frame_snapshot, buf, size);
+        s_last_send_us = now;
+    } else if (now - s_last_send_us >= KEEPALIVE_US) {
+        u8g2_SendBuffer(g_u8g2);
+        s_last_send_us = now;
+    }
+}
 
 int ui_text_width(const char *text) { return g_font.textWidth(text); }
 
