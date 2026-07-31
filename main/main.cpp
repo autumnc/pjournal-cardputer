@@ -20,6 +20,7 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_timer.h>
+#include <esp_pm.h>
 #include <nvs_flash.h>
 #include <esp_sntp.h>
 #include <driver/gpio.h>
@@ -52,6 +53,21 @@ static bool initDisplay() {
     return true;
 }
 
+// BLE stack init + auto-connect in a background task so the main UI
+// renders immediately instead of waiting ~1s for the BT controller.
+static void btInitTask(void *arg) {
+    ESP_LOGI(TAG, "Starting Bluetooth...");
+    if (g_bt.init() == ESP_OK) {
+        uint8_t saved_bda[6];
+        esp_ble_addr_type_t saved_addr_type;
+        if (g_bt.loadPairedDevice(saved_bda, saved_addr_type)) {
+            ESP_LOGI(TAG, "Found saved keyboard, will auto-connect...");
+            g_bt.connectBDA(saved_bda, saved_addr_type);
+        }
+    }
+    vTaskDelete(NULL);
+}
+
 // ── Application Main Loop ──────────────────────────────────────────────
 
 extern "C" void app_main() {
@@ -66,6 +82,17 @@ extern "C" void app_main() {
     }
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "NVS init failed");
+    }
+
+    // Dynamic frequency scaling: CPU drops to 80MHz when idle (main loop delay),
+    // ramps back to 240MHz while WiFi/BT are active (they hold PM locks).
+    esp_pm_config_t pm_cfg = {
+        .max_freq_mhz = 240,
+        .min_freq_mhz = 80,
+        .light_sleep_enable = false,
+    };
+    if (esp_pm_configure(&pm_cfg) != ESP_OK) {
+        ESP_LOGW(TAG, "esp_pm_configure failed");
     }
 
     // Initialize buttons with pull-up for stable reading
@@ -199,19 +226,8 @@ extern "C" void app_main() {
     // Set candidate page size based on default 22pt font
     ime.setPageSize(7);
 
-    // Initialize Bluetooth keyboard
-    ESP_LOGI(TAG, "Starting Bluetooth...");
-    g_bt.init();
-
-    // Auto-connect saved keyboard (background, non-blocking)
-    {
-        uint8_t saved_bda[6];
-        esp_ble_addr_type_t saved_addr_type;
-        if (g_bt.loadPairedDevice(saved_bda, saved_addr_type)) {
-            ESP_LOGI(TAG, "Found saved keyboard, will auto-connect...");
-            g_bt.connectBDA(saved_bda, saved_addr_type);
-        }
-    }
+    // Initialize Bluetooth keyboard in background (non-blocking, faster boot)
+    xTaskCreatePinnedToCore(btInitTask, "bt_init", 8192, NULL, 5, NULL, 1);
 
     ESP_LOGI(TAG, "Ready!");
 
@@ -267,7 +283,7 @@ extern "C" void app_main() {
 
                 if (!bt_was_connected) {
                     // Periodically re-check for paired device file
-                    if (!bt_retry_loaded) {
+                    if (!bt_retry_loaded && g_bt.isInitialized()) {
                         int64_t now_us = esp_timer_get_time();
                         if (last_bt_reload_us == 0 || (now_us - last_bt_reload_us) > 30000000) {
                             last_bt_reload_us = now_us;

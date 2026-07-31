@@ -52,6 +52,7 @@ public:
 
     // Status
     bool isConnected() const;
+    bool isInitialized() const;  // true after init() completes (async boot)
     bool isScanning();
     bool isConnecting() const;  // 新增：检查是否正在连接
     void setConnected(bool c);

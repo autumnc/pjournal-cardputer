@@ -73,6 +73,7 @@ static QueueHandle_t s_queue = nullptr;
 static esp_hidh_dev_t *s_dev = nullptr;
 
 static bool s_connected = false;
+static bool s_init_done = false;   // set once esp_hidh init completes
 static bool s_scanning = false;
 static bool s_connecting = false;  // 新增：标记正在连接中
 static uint8_t s_last_keys[MAX_KEYS] = {0};
@@ -487,6 +488,7 @@ esp_err_t BtKeyboard::init() {
     s_ext_scan_params.uncoded_cfg.scan_window = 0x30;
 
     ESP_LOGI(TAG, "BT keyboard driver initialized");
+    s_init_done = true;
     return ESP_OK;
 }
 
@@ -503,6 +505,7 @@ void BtKeyboard::deinit() {
     esp_bt_controller_deinit();
     if (s_queue) { vQueueDelete(s_queue); s_queue = nullptr; }
     if (s_devices_mutex) { vSemaphoreDelete(s_devices_mutex); s_devices_mutex = nullptr; }
+    s_init_done = false;
 }
 
 void BtKeyboard::scanDevices() {
@@ -701,12 +704,18 @@ bool BtKeyboard::isConnected() const {
     return s_connected;
 }
 
+bool BtKeyboard::isInitialized() const {
+    return s_init_done;
+}
+
 void BtKeyboard::setConnected(bool c) {
     s_connected = c;
     connected_ = c;
 }
 
 esp_err_t BtKeyboard::connectBDA(const uint8_t *bda, esp_ble_addr_type_t addr_type) {
+    if (!s_init_done) return ESP_FAIL;  // BLE stack not initialized yet
+
     // 如果已连接或正在连接，不要重复发起连接
     if (s_connected || s_connecting) {
         ESP_LOGI(TAG, "Already connected or connecting, skip connect request");

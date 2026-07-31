@@ -4,6 +4,7 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
@@ -59,6 +60,17 @@ public:
 private:
     std::string basePath();
     void ensureDir();
+
+    // In-memory index of journal filenames (newest first) + distinct dates.
+    // Avoids repeated full-directory scans during boot and main screen draw.
+    void scanIndex();                  // rebuild both index structures
+    void ensureIndex();                // lazy rebuild if invalid
+    void indexAddFile(const std::string &fn);
+    void indexRemoveFile(const std::string &fn);
+    std::vector<std::string> m_fileIndex;      // newest first
+    std::unordered_set<std::string> m_dateSet; // distinct YYYY-MM-DD dates
+    bool m_indexValid = false;
+
     bool mounted_ = false;
 };
 

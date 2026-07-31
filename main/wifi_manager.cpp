@@ -15,7 +15,9 @@ const int WIFI_CONNECTED_BIT = BIT0;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
+        // Only auto-connect if explicitly requested; STA_START also fires after
+        // esp_wifi_stop() → esp_wifi_start() in connect(), which connects itself.
+        if (s_auto_reconnect) esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         bool auto_reconnect = s_auto_reconnect;  // Read before clearing state
         s_connected = false;
@@ -43,7 +45,7 @@ bool WifiManager::begin() {
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
     esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_start();
+    if (esp_wifi_start() == ESP_OK) _started = true;
 
     s_wifi_event = xEventGroupCreate();
     _inited = true;
@@ -53,6 +55,12 @@ bool WifiManager::begin() {
 bool WifiManager::connect(const char *ssid, const char *password) {
     if (!ssid || !*ssid) return false;
     s_auto_reconnect = true;
+
+    // Radio may have been stopped by a previous disconnect() — bring it back up
+    if (!_started) {
+        if (esp_wifi_start() != ESP_OK) return false;
+        _started = true;
+    }
 
     wifi_config_t cfg = {};
     strncpy((char *)cfg.sta.ssid, ssid, sizeof(cfg.sta.ssid) - 1);
@@ -77,6 +85,8 @@ void WifiManager::disconnect() {
     s_auto_reconnect = false;
     esp_wifi_disconnect();
     s_connected = false;
+    // Fully power down the radio; WiFi is only needed on demand
+    if (esp_wifi_stop() == ESP_OK) _started = false;
 }
 
 std::string WifiManager::getIp() {

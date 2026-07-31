@@ -13,6 +13,7 @@ public:
 
 private:
     bool _inited = false;
+    bool _started = false;  // wifi radio started (station active)
 };
 
 extern WifiManager g_wifi;
