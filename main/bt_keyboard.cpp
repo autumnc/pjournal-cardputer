@@ -34,6 +34,7 @@ static const char *TAG = "BtKeybrd";
 #define KEY_SHIFT_LEFT  0x88
 #define KEY_SHIFT_RIGHT 0x89
 #define KEY_CTRL_I      0x8A
+#define KEY_FULLWIDTH_TOGGLE 0x8B
 
 // HID Usage ID → ASCII
 static const uint8_t s_asc_low[] = {
@@ -241,6 +242,13 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                     // Ctrl+Space → IME toggle
                     uint8_t toggle = KEY_IME_TOGGLE;
                     xQueueSendToBack(s_queue, &toggle, 0);
+                    continue;
+                }
+                bool shift = (mod & 0x22) != 0;
+                if (shift && kc == 44) {
+                    // Shift+Space → fullwidth toggle
+                    uint8_t fwt = KEY_FULLWIDTH_TOGGLE;
+                    xQueueSendToBack(s_queue, &fwt, 0);
                     continue;
                 }
                 if (ctrl && kc == 40) {
@@ -626,6 +634,10 @@ void BtKeyboard::checkKeyRepeat() {
                 } else if (ctrl && kc == 40) {
                     uint8_t ce = KEY_CTRL_ENTER;
                     xQueueSendToBack(s_queue, &ce, 0);
+                } else if ((s_last_mod & 0x22) && kc == 44) {
+                    // Shift+Space → fullwidth toggle (repeat)
+                    uint8_t fwt = KEY_FULLWIDTH_TOGGLE;
+                    xQueueSendToBack(s_queue, &fwt, 0);
                 } else if (ctrl && kc >= 4 && kc <= 29) {
                     uint8_t cc = kc - 3;
                     xQueueSendToBack(s_queue, &cc, 0);

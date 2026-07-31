@@ -16,6 +16,10 @@ public:
     void setActive(bool on);
     void toggle() { setActive(!_active); }
 
+    bool fullwidth() const { return _fullwidth; }
+    void toggleFullwidth() { _fullwidth = !_fullwidth; }
+    void setFullwidth(bool on) { _fullwidth = on; }
+
     bool handleKey(int key, std::string &out);
 
     std::string displayCode() const {
@@ -129,10 +133,12 @@ private:
 
     bool _singleQuoteOpen = false;  // Track single quote pairing state
     bool _doubleQuoteOpen = false;  // Track double quote pairing state
+    bool _fullwidth = false;        // Fullwidth character mode
 
     void reset();
     void lookup();
     void buildPage();
     bool commit(int idx, std::string &out);
     bool handleFullwidthPunct(int key, std::string &out);
+    bool handleFullwidthChar(int key, std::string &out);
 };

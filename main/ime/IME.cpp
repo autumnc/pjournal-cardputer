@@ -8,6 +8,19 @@
 static const char *IME_TAG = "IME";
 static const uint8_t IME_MAGIC[4] = {'I', 'M', 'E', '3'};
 
+static void appendUtf8(uint32_t cp, std::string &out) {
+    if (cp < 0x80) {
+        out += (char)cp;
+    } else if (cp < 0x800) {
+        out += (char)(0xC0 | (cp >> 6));
+        out += (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += (char)(0xE0 | (cp >> 12));
+        out += (char)(0x80 | ((cp >> 6) & 0x3F));
+        out += (char)(0x80 | (cp & 0x3F));
+    }
+}
+
 // Embedded dictionary symbols (from CMakeLists EMBED_FILES "ime/ime_table_pinyin.bin")
 extern const uint8_t ime_table_pinyin_bin_start[] asm("_binary_ime_table_pinyin_bin_start");
 extern const uint8_t ime_table_pinyin_bin_end[]   asm("_binary_ime_table_pinyin_bin_end");
@@ -1058,6 +1071,41 @@ bool IME::handleFullwidthPunct(int key, std::string &out) {
     }
 }
 
+bool IME::handleFullwidthChar(int key, std::string &out) {
+    // Fullwidth mode: map ASCII letters, digits, space, and remaining symbols to fullwidth
+    if (key >= 'A' && key <= 'Z') {
+        // U+FF21 = fullwidth A
+        uint32_t cp = 0xFF21 + (key - 'A');
+        appendUtf8(cp, out);
+        return true;
+    }
+    if (key >= 'a' && key <= 'z') {
+        // U+FF41 = fullwidth a
+        uint32_t cp = 0xFF41 + (key - 'a');
+        appendUtf8(cp, out);
+        return true;
+    }
+    if (key >= '0' && key <= '9') {
+        // U+FF10 = fullwidth 0
+        uint32_t cp = 0xFF10 + (key - '0');
+        appendUtf8(cp, out);
+        return true;
+    }
+    if (key == ' ') {
+        // U+3000 = ideographic space (fullwidth space)
+        appendUtf8(0x3000, out);
+        return true;
+    }
+    // Remaining printable ASCII not already handled by handleFullwidthPunct
+    if (key >= 0x21 && key <= 0x7E) {
+        // U+FF01 = fullwidth !, offset from '!' is key - 0x21
+        uint32_t cp = 0xFF01 + (key - 0x21);
+        appendUtf8(cp, out);
+        return true;
+    }
+    return false;
+}
+
 bool IME::handleKey(int key, std::string &out) {
     if (!_active) return false;
     if (_predicting) {
@@ -1104,6 +1152,13 @@ bool IME::handleKey(int key, std::string &out) {
         _predicting = false;
         return false;
     }
+    // In fullwidth mode with no composition, output letters/digits/space as fullwidth
+    if (_fullwidth && _code.length() == 0 && !_deleteMode && !_lfMode) {
+        if (((key >= 'a' && key <= 'z') || (key >= 'A' && key <= 'Z')) ||
+            (key >= '0' && key <= '9') || key == ' ') {
+            return handleFullwidthChar(key, out);
+        }
+    }
     if ((key >= 'a' && key <= 'z') || (key >= 'A' && key <= 'Z')) {
         char cl = (char)tolower(key);
         char c = (char)key;
@@ -1126,7 +1181,9 @@ bool IME::handleKey(int key, std::string &out) {
         return true;
     }
     if (_code.length() == 0) {
-        return handleFullwidthPunct(key, out);
+        if (handleFullwidthPunct(key, out)) return true;
+        if (_fullwidth && handleFullwidthChar(key, out)) return true;
+        return false;
     }
     if (key >= '1' && key <= '9') {
         commit(key - '1', out);

@@ -236,6 +236,11 @@ extern "C" void app_main() {
             app_toggle_ime();
             key = 0;
         }
+        // Shift+Space fullwidth toggle (only when IME active in editor)
+        if (key == KEY_FULLWIDTH_TOGGLE && currentState == APP_EDITOR && app_ime_active()) {
+            app_toggle_fullwidth();
+            key = 0;
+        }
 
         // ── BT auto-reconnect retry ──────────────────────────────────────
         // 只在未连接且未正在连接时重试，间隔10秒
@@ -369,6 +374,7 @@ extern "C" void app_main() {
                 IME::getInstance().setPageSize(fs <= 22 ? 7 : 5);
             }
             static bool editorInited = false;
+            if (app_editor_needs_reinit()) editorInited = false;
             if (!editorInited) { screen_editor_init(ctx); editorInited = true; }
             if (key > 0) currentState = screen_editor_handle(key, ctx);
             else { screen_editor_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
@@ -380,10 +386,6 @@ extern "C" void app_main() {
                 } else {
                     editorInited = false;
                 }
-            }
-            // If another screen opened the editor, must re-init with new content
-            if (currentState == APP_EDITOR && ctx.prevState != APP_MAIN && ctx.prevState != APP_EDITOR) {
-                editorInited = false;
             }
             break;
         }

@@ -311,12 +311,13 @@ static void drawEditor() {
     char left[48];
     snprintf(left, sizeof(left), "%s", mode);
     int bpct = battery_pct();
-    const char *imeLabel = g_editor.imeActive ? "[中]" : "EN";
+    std::string imeLabel = g_editor.imeActive ? "[中]" : "EN";
+    if (g_editor.imeActive) imeLabel += g_ime.fullwidth() ? "\xe2\x97\x8f" : "\xe2\x97\x90"; // ● or ◐
     char right[64];
     if (bpct >= 0)
-        snprintf(right, sizeof(right), "%d字 %d%% %s", wc, bpct, imeLabel);
+        snprintf(right, sizeof(right), "%d字 %d%% %s", wc, bpct, imeLabel.c_str());
     else
-        snprintf(right, sizeof(right), "%d字 -- %s", wc, imeLabel);
+        snprintf(right, sizeof(right), "%d字 -- %s", wc, imeLabel.c_str());
 
     ui_draw_status(left, right);
 }
@@ -398,6 +399,8 @@ void screen_editor_init(ScreenContext &ctx) {
     g_editor.scroll = 0;
     g_editor.targetCx = -1;
     g_editor.imeActive = false;
+    g_ime.setActive(false);
+    g_ime.setFullwidth(false);
     g_editor.confirmSave = false;
     g_editor.modifiedSinceSave = false;
     g_editor.vrowsDirty = true; g_editor.wordCountDirty = true;
@@ -728,6 +731,28 @@ bool app_ime_active() {
 void app_toggle_ime() {
     g_editor.imeActive = !g_editor.imeActive;
     g_ime.setActive(g_editor.imeActive);
+}
+
+bool app_ime_fullwidth() {
+    return g_ime.fullwidth();
+}
+
+void app_toggle_fullwidth() {
+    g_ime.toggleFullwidth();
+}
+
+static bool g_editorNeedsReinit = false;
+
+void app_editor_request_reinit() {
+    g_editorNeedsReinit = true;
+}
+
+bool app_editor_needs_reinit() {
+    if (g_editorNeedsReinit) {
+        g_editorNeedsReinit = false;
+        return true;
+    }
+    return false;
 }
 
 std::string app_get_editor_text() {
