@@ -39,6 +39,7 @@ static const SettingField SETTINGS_FIELDS[] = {
     {"ntp_server", "NTP服务器", false, false},
     {"auto_save", "自动保存", false, false},
     {"auto_sleep", "自动休眠", false, false},
+    {"sleep_screen", "休眠保留画面", false, false},
     {"_font_size", "字体大小", false, true},
     {"_sync_time", "网络同步时间", false, true},
 };
@@ -46,7 +47,8 @@ static const int NUM_SETTINGS = sizeof(SETTINGS_FIELDS) / sizeof(SETTINGS_FIELDS
 
 // 布尔型开关项:显示 开/关,Enter 在 "0"/"1" 间切换
 static bool isToggleField(const char *key) {
-    return strcmp(key, "auto_save") == 0 || strcmp(key, "auto_sleep") == 0;
+    return strcmp(key, "auto_save") == 0 || strcmp(key, "auto_sleep") == 0 ||
+           strcmp(key, "sleep_screen") == 0;
 }
 
 static bool toggleValue(const char *key) {

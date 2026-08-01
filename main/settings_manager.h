@@ -25,6 +25,7 @@ public:
     std::string ntpServer();
     bool autoSave();
     bool autoSleep();
+    bool sleepScreen();
     int fontSize();
 
     void setFlomoEmail(const std::string &v);

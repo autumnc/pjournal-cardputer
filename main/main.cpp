@@ -83,8 +83,28 @@ static void btInitTask(void *arg) {
 static int64_t s_last_activity_us = 0;
 
 static void enterLightSleep(void) {
-    // 提示画面写入 GRAM,休眠期间持续显示(RLCD 零功耗),唤醒后无需重绘
-    ui_show_message_centered("休眠中 按键唤醒");
+    // 休眠提示画在底部状态栏位置、居中,不遮挡/清空上方画面——
+    // 保留画面模式下,最后画面 + 底部提示在整个休眠期间持续显示(RLCD 零功耗)
+    const char *hint = "休眠中 按键唤醒";
+    u8g2_SetDrawColor(g_u8g2, 0);
+    u8g2_DrawHLine(g_u8g2, 0, STATUS_Y, SCREEN_W);
+    u8g2_SetDrawColor(g_u8g2, 1);
+    u8g2_DrawBox(g_u8g2, 0, STATUS_Y + 1, SCREEN_W, FONT_H + 3);
+    u8g2_SetDrawColor(g_u8g2, 0);
+    g_font.drawText((SCREEN_W - g_font.textWidth(hint)) / 2,
+                    STATUS_Y + 1 + g_font.ascent(), hint, false);
+    u8g2_SetDrawColor(g_u8g2, 1);
+    ui_commit();
+
+    // 休眠屏保策略:保留画面(开)时让显示相关 GPIO 在休眠期间保持原状态,
+    // 防止 GPIO 隔离工作区把面板 RST 浮空导致复位清空 GRAM;白屏(关)则恢复隔离(默认)。
+    const gpio_num_t display_pins[] = {RLCD_RST_PIN, RLCD_CS_PIN, RLCD_DC_PIN,
+                                       RLCD_SCK_PIN, RLCD_MOSI_PIN};
+    bool retain = g_settings.sleepScreen();
+    for (size_t i = 0; i < sizeof(display_pins) / sizeof(display_pins[0]); i++) {
+        if (retain) gpio_sleep_sel_dis(display_pins[i]);
+        else        gpio_sleep_sel_en(display_pins[i]);
+    }
 
     // 完全关断 BLE 射频(若键盘已连接,deinit 会同时断开 HID 连接)
     g_bt.deinit();
@@ -102,7 +122,8 @@ static void enterLightSleep(void) {
     }
     ESP_LOGI(TAG, "Woke up, wakeup cause=%d", esp_sleep_get_wakeup_cause());
 
-    // 休眠期间 GPIO 被隔离、显示面板(RST)被复位,需重新初始化并强制整屏重绘
+    // 白屏模式下休眠时面板被隔离复位,必须重新初始化;保留画面模式下面板未复位,
+    // 但统一重新初始化 + 强制整屏重绘也无害,保证画面回到当前 UI
     u8g2_InitDisplay(g_u8g2);
     u8g2_SetPowerSave(g_u8g2, 0);
     ui_invalidate_snapshot();

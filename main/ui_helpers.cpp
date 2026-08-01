@@ -307,11 +307,22 @@ void ui_draw_status(const char *left, const char *right) {
     if (right) {
         int rw = g_font.textWidth(right);
         g_font.drawText(SCREEN_W - rw - 4, y + 1 + g_font.ascent(), right, false);
+    } else {
+        // 右侧槽位空闲时在最右侧显示电池电量(GTD/大纲等模块)
+        int bpct = battery_pct();
+        if (bpct >= 0) {
+            char pct[16];
+            snprintf(pct, sizeof(pct), "%d%%", bpct);
+            int pw = g_font.textWidth(pct);
+            g_font.drawText(SCREEN_W - pw - 4, y + 1 + g_font.ascent(), pct, false);
+        }
     }
     u8g2_SetDrawColor(g_u8g2, 1);
 }
 
 void ui_show_message_centered(const char *msg) {
+    // 先清屏,确保消息框是不透明对话框而不是盖在旧画面上
+    ui_clear();
     int mw = g_font.textWidth(msg);
     int mx = (SCREEN_W - mw) / 2 - 8; if (mx < 0) mx = 0;
     int my = (SCREEN_H - FONT_H - 28) / 2 + 28;
