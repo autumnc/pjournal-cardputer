@@ -32,6 +32,7 @@ void ui_draw_status(const char *left, const char *right);
 void ui_draw_title(const char *title);
 void ui_clear();
 void ui_commit();
+void ui_invalidate_snapshot();
 int  ui_text_width(const char *text);
 void ui_draw_text(int x, int y, const char *text, bool invert = false, bool bold = false);
 void ui_draw_text_centered(int y, const char *text, bool invert = false, bool bold = false);

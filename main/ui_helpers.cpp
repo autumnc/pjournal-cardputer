@@ -253,6 +253,16 @@ void ui_commit() {
     }
 }
 
+// 丢弃快照,使下一次 ui_commit 无条件整屏发送。
+// 用于 light sleep 唤醒后面板被复位、需要强制重绘的场景。
+void ui_invalidate_snapshot() {
+    if (s_frame_snapshot) {
+        heap_caps_free(s_frame_snapshot);
+        s_frame_snapshot = nullptr;
+    }
+    s_last_send_us = 0;
+}
+
 int ui_text_width(const char *text) { return g_font.textWidth(text); }
 
 void ui_draw_text(int x, int y, const char *text, bool invert, bool bold) {

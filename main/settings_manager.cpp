@@ -93,6 +93,7 @@ std::string SettingsManager::ntpServer() { return get("ntp_server"); }
 void SettingsManager::setTimezone(const std::string &v) { set("timezone", v); }
 void SettingsManager::setNtpServer(const std::string &v) { set("ntp_server", v); }
 bool SettingsManager::autoSave() { return get("auto_save") == "1"; }
+bool SettingsManager::autoSleep() { return get("auto_sleep") != "0"; }  // default on
 
 int SettingsManager::fontSize() {
     std::string v = get("font_size");

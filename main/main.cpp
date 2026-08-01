@@ -21,6 +21,7 @@
 #include <esp_system.h>
 #include <esp_timer.h>
 #include <esp_pm.h>
+#include <esp_sleep.h>
 #include <nvs_flash.h>
 #include <esp_sntp.h>
 #include <driver/gpio.h>
@@ -64,8 +65,82 @@ static void btInitTask(void *arg) {
             ESP_LOGI(TAG, "Found saved keyboard, will auto-connect...");
             g_bt.connectBDA(saved_bda, saved_addr_type);
         }
+    } else {
+        ESP_LOGE(TAG, "Bluetooth init failed");
     }
     vTaskDelete(NULL);
+}
+
+// ── Light sleep 空闲休眠 ────────────────────────────────────────────────
+// 键盘/物理按键无输入 ≥10 分钟后进入 ESP light sleep(RAM 保留、BLE 射频关闭),
+// 空闲电流从 ~2-5mA 降到 ~0.15mA。休眠期间 BLE 射频关闭,键盘无法唤醒,
+// 只能按物理按键(GPIO18/GPIO0)唤醒;唤醒后后台重新 init BLE 并自动重连。
+#define AUTO_SLEEP_TIMEOUT_US   (10 * 60 * 1000000LL)
+#define AUTO_SLEEP_GRACE_US     (2 * 60 * 1000000LL)
+#define SLEEP_WAKE_MASK         ((1ULL << PIN_USER_BTN) | (1ULL << PIN_BOOT))
+
+// 最近一次用户输入(BLE 键或物理按键)的时间,0 表示启动后尚未记录
+static int64_t s_last_activity_us = 0;
+
+static void enterLightSleep(void) {
+    // 提示画面写入 GRAM,休眠期间持续显示(RLCD 零功耗),唤醒后无需重绘
+    ui_show_message_centered("休眠中 按键唤醒");
+
+    // 完全关断 BLE 射频(若键盘已连接,deinit 会同时断开 HID 连接)
+    g_bt.deinit();
+
+    // 物理按键唤醒:两键都是 RTC GPIO、内部上拉、低电平有效,任意按下唤醒
+    esp_err_t ext1_ret = esp_sleep_enable_ext1_wakeup(SLEEP_WAKE_MASK, ESP_EXT1_WAKEUP_ANY_LOW);
+    if (ext1_ret != ESP_OK) {
+        ESP_LOGE(TAG, "esp_sleep_enable_ext1_wakeup failed: %d", ext1_ret);
+    }
+
+    ESP_LOGI(TAG, "Entering light sleep...");
+    esp_err_t ret = esp_light_sleep_start();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "esp_light_sleep_start failed: %d", ret);
+    }
+    ESP_LOGI(TAG, "Woke up, wakeup cause=%d", esp_sleep_get_wakeup_cause());
+
+    // 休眠期间 GPIO 被隔离、显示面板(RST)被复位,需重新初始化并强制整屏重绘
+    u8g2_InitDisplay(g_u8g2);
+    u8g2_SetPowerSave(g_u8g2, 0);
+    ui_invalidate_snapshot();
+
+    // 软件时钟在休眠期间冻结,从电池供电的 RTC 重同步,保证日记时间戳正确
+    time_t t = g_rtc.getTime();
+    if (t > 0) {
+        struct timeval tv = {(time_t)t, 0};
+        settimeofday(&tv, NULL);
+    }
+
+    // 后台重新 init BLE + 自动重连键盘(即使休眠失败也恢复 BT 栈)
+    xTaskCreatePinnedToCore(btInitTask, "bt_init", 8192, NULL, 5, NULL, 1);
+}
+
+static void checkLightSleep(AppState state) {
+    if (!g_settings.autoSleep()) return;
+    if (g_wifi.isConnected()) return;  // 网络操作中不休眠
+    if (state == APP_BT_MANAGE) return;  // 用户在蓝牙管理界面
+
+    static int64_t s_last_wake_us = 0;
+    int64_t now = esp_timer_get_time();
+
+    // 启动后首次调用:以当前时刻作为空闲计时起点
+    if (s_last_activity_us == 0) {
+        s_last_activity_us = now;
+        return;
+    }
+
+    // 唤醒后 2 分钟 grace,覆盖 BLE 重连窗口 + 用户操作
+    if (s_last_wake_us != 0 && (now - s_last_wake_us) < AUTO_SLEEP_GRACE_US) return;
+
+    // 键盘/按键空闲超过 10 分钟 → 进入休眠
+    if (now - s_last_activity_us >= AUTO_SLEEP_TIMEOUT_US) {
+        enterLightSleep();
+        s_last_wake_us = esp_timer_get_time();
+        s_last_activity_us = s_last_wake_us;  // 重置空闲计时基准,避免唤醒后立即再睡
+    }
 }
 
 // ── Application Main Loop ──────────────────────────────────────────────
@@ -241,8 +316,13 @@ extern "C" void app_main() {
     struct { int count; bool fired_long; } btn_user = {}, btn_boot = {};
 
     while (currentState != APP_QUIT) {
+        checkLightSleep(currentState);
+
         int key = g_bt.readKey();
         if (key < 0) key = 0;
+
+        // BLE 键盘输入视为活动,重置空闲休眠计时
+        if (key > 0) s_last_activity_us = esp_timer_get_time();
 
         // Check for key repeat events
         g_bt.checkKeyRepeat();
@@ -320,6 +400,7 @@ extern "C" void app_main() {
             if (held) {
                 if (btn_user.count == 0) {
                     int64_t now = esp_timer_get_time();
+                    s_last_activity_us = now;
                     if (user_btn_last_release_us > 0 &&
                         (now - user_btn_last_release_us) < 400000) {
                         user_btn_double = true;
@@ -353,6 +434,7 @@ extern "C" void app_main() {
         {
             bool held = PIN_LOW(PIN_BOOT);
             if (held) {
+                if (btn_boot.count == 0) s_last_activity_us = esp_timer_get_time();
                 btn_boot.count++;
                 // Long press → confirm (in BT screen only)
                 if (btn_boot.count == 14 && currentState == APP_BT_MANAGE) {

@@ -38,10 +38,22 @@ static const SettingField SETTINGS_FIELDS[] = {
     {"timezone", "时区(如CST-8)", false, false},
     {"ntp_server", "NTP服务器", false, false},
     {"auto_save", "自动保存", false, false},
+    {"auto_sleep", "自动休眠", false, false},
     {"_font_size", "字体大小", false, true},
     {"_sync_time", "网络同步时间", false, true},
 };
 static const int NUM_SETTINGS = sizeof(SETTINGS_FIELDS) / sizeof(SETTINGS_FIELDS[0]);
+
+// 布尔型开关项:显示 开/关,Enter 在 "0"/"1" 间切换
+static bool isToggleField(const char *key) {
+    return strcmp(key, "auto_save") == 0 || strcmp(key, "auto_sleep") == 0;
+}
+
+static bool toggleValue(const char *key) {
+    std::string v = g_settings.getString(key);
+    if (strcmp(key, "auto_sleep") == 0) return v != "0";  // 默认开
+    return v == "1";  // auto_save: 默认关
+}
 
 static struct {
     int selection = 0;
@@ -418,6 +430,9 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
                 g_settings.setString("font_size", std::to_string(newSize));
                 return APP_SETTINGS;
             }
+        } else if (isToggleField(f.key)) {
+            // 开/关切换:存 "1"(开) 或 "0"(关)
+            g_settings.setString(f.key, toggleValue(f.key) ? "0" : "1");
         } else {
             g_settingsState.editBuffer = g_settings.getString(f.key);
             g_settingsState.editCursor = (int)g_settingsState.editBuffer.length();
@@ -443,6 +458,8 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
             } else {
                 snprintf(buf, sizeof(buf), "▶ %s", f.label);
             }
+        } else if (isToggleField(f.key)) {
+            snprintf(buf, sizeof(buf), "%s:%s", f.label, toggleValue(f.key) ? "开" : "关");
         } else {
             std::string value = g_settings.getString(f.key);
             std::string display;

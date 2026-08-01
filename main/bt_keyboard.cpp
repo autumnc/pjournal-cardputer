@@ -496,6 +496,10 @@ void BtKeyboard::deinit() {
     s_connecting = false;
     if (s_dev) {
         esp_hidh_dev_close(s_dev);
+        // esp_hidh_deinit 要求所有设备已关闭,而 close 是异步的
+        // (close 事件约 60-100ms 后到达)。不等它完成就 deinit 会返回错误,
+        // 导致唤醒后 esp_hidh_init 无法重新初始化、键盘无法重连。
+        vTaskDelay(pdMS_TO_TICKS(200));
         s_dev = nullptr;
     }
     esp_hidh_deinit();
