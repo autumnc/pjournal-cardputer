@@ -311,8 +311,11 @@ static void drawEditor() {
     char left[48];
     snprintf(left, sizeof(left), "%s", mode);
     int bpct = battery_pct();
-    std::string imeLabel = g_editor.imeActive ? "[中]" : "EN";
-    if (g_editor.imeActive) {
+    std::string imeLabel;
+    if (!g_editor.imeActive) imeLabel = "EN";
+    else if (g_ime.english()) imeLabel = "[英]";
+    else {
+        imeLabel = "[中]";
         imeLabel += g_ime.fullwidth() ? "\xe2\x97\x8f" : "\xe2\x97\x90"; // ● or ◐
         imeLabel += g_ime.trad() ? "繁" : "简";
     }
@@ -404,6 +407,7 @@ void screen_editor_init(ScreenContext &ctx) {
     g_editor.imeActive = false;
     g_ime.setActive(false);
     g_ime.setFullwidth(false);
+    g_ime.setEnglish(false);
     g_editor.confirmSave = false;
     g_editor.modifiedSinceSave = false;
     g_editor.vrowsDirty = true; g_editor.wordCountDirty = true;
@@ -746,6 +750,10 @@ void app_toggle_fullwidth() {
 
 void app_toggle_trad() {
     g_ime.toggleTrad();
+}
+
+void app_toggle_english() {
+    g_ime.toggleEnglish();
 }
 
 static bool g_editorNeedsReinit = false;

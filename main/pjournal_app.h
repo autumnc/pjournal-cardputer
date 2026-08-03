@@ -48,6 +48,7 @@ struct ScreenContext {
 #define KEY_CTRL_I      0x8A
 #define KEY_FULLWIDTH_TOGGLE 0x8B
 #define KEY_TRAD_TOGGLE 0x8C
+#define KEY_LSHIFT_TAP 0x8D
 
 // Screen entry points (screens that remain in pjournal_app.cpp)
 void screen_main_init();

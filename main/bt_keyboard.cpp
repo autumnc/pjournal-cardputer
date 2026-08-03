@@ -36,6 +36,7 @@ static const char *TAG = "BtKeybrd";
 #define KEY_CTRL_I      0x8A
 #define KEY_FULLWIDTH_TOGGLE 0x8B
 #define KEY_TRAD_TOGGLE 0x8C
+#define KEY_LSHIFT_TAP 0x8D
 
 // HID Usage ID → ASCII
 static const uint8_t s_asc_low[] = {
@@ -77,6 +78,7 @@ static bool s_connected = false;
 static bool s_init_done = false;   // set once esp_hidh init completes
 static bool s_scanning = false;
 static bool s_connecting = false;  // 新增：标记正在连接中
+static bool s_shift_tap_armed = false;  // 左Shift 单击检测武装标记
 static uint8_t s_last_keys[MAX_KEYS] = {0};
 static uint8_t s_last_mod = 0;
 static int64_t s_key_press_time[MAX_KEYS] = {0};
@@ -186,6 +188,7 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
         memset(s_last_keys, 0, MAX_KEYS);
         memset(s_key_press_time, 0, MAX_KEYS * sizeof(int64_t));
         memset(s_last_repeat_time, 0, MAX_KEYS * sizeof(int64_t));
+        s_shift_tap_armed = false;
         if (s_self) s_self->setConnected(false);
         ESP_LOGI(TAG, "Keyboard disconnected (rsn=0x%x)", param->close.reason);
         break;
@@ -195,6 +198,10 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
         size_t len = param->input.length;
         if (!data || len < 2) break;
         uint8_t mod = data[0];
+        // 左Shift 单击检测: 按下时武装, 期间按下任何键则解除, 松开时若仍武装则触发
+        bool lshiftNow = (mod & 0x02) != 0;
+        bool lshiftWas = (s_last_mod & 0x02) != 0;
+        if (lshiftNow && !lshiftWas) s_shift_tap_armed = true;
         const uint8_t *keys = (len >= HID_REPORT_LEN) ? (data + 2) : (data + 1);
         int nkeys = (len >= HID_REPORT_LEN) ? 6 : ((int)len - 1);
         if (nkeys > MAX_KEYS) nkeys = MAX_KEYS;
@@ -222,6 +229,7 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
 
             // If new key press, record time and send event
             if (!old) {
+                s_shift_tap_armed = false;  // 与Shift组合使用的按键按下, 取消单击
                 // Find empty slot for this new key
                 for (int j = 0; j < MAX_KEYS; j++) {
                     if (s_last_keys[j] == 0) {
@@ -284,6 +292,14 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                 s_key_press_time[i] = 0;
                 s_last_repeat_time[i] = 0;
             }
+        }
+
+        if (!lshiftNow && lshiftWas) {
+            if (s_shift_tap_armed) {
+                uint8_t ev = KEY_LSHIFT_TAP;
+                xQueueSendToBack(s_queue, &ev, 0);
+            }
+            s_shift_tap_armed = false;
         }
 
         s_last_mod = mod;

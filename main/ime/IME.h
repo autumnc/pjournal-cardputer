@@ -24,6 +24,10 @@ public:
     void toggleTrad() { _trad = !_trad; buildPage(); }
     void setTrad(bool on) { _trad = on; buildPage(); }
 
+    bool english() const { return _english; }
+    void toggleEnglish() { setEnglish(!_english); }
+    void setEnglish(bool on) { _english = on; if (on) reset(); }
+
     bool handleKey(int key, std::string &out);
 
     std::string displayCode() const {
@@ -74,6 +78,7 @@ private:
 
     static const int INDEX_ENTRIES = 26 * 26 + 1; // 677
     static const int MAX_CODE_LEN = 6;
+    static const int MAX_CANDIDATES = 300;
 
     bool _loaded = false;
     bool _active = false;
@@ -100,7 +105,7 @@ private:
     std::string _remainder;
     std::string _codeOrig;
 
-    struct UserEntry { std::string code; std::string word; int count; };
+    struct UserEntry { std::string code; std::string word; int count; bool trad = false; };
     std::vector<UserEntry> _userWords;
     bool _userDirty = false;
     void loadUserDict();
@@ -141,6 +146,7 @@ private:
     bool _doubleQuoteOpen = false;  // Track double quote pairing state
     bool _fullwidth = false;        // Fullwidth character mode
     bool _trad = false;             // Traditional mode: hide simplified-only, show trad counterparts
+    bool _english = false;          // Temp English mode: pass keys through as ASCII
 
     void reset();
     void lookup();

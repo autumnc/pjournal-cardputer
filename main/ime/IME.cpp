@@ -161,24 +161,31 @@ void IME::loadUserDict() {
         auto sp2 = line.find(' ', sp1 + 1);
         std::string word;
         int count = 1;
+        bool trad = false;
         if (sp2 != std::string::npos) {
             word = line.substr(sp1 + 1, sp2 - sp1 - 1);
-            count = std::stoi(line.substr(sp2 + 1));
+            std::string tail = line.substr(sp2 + 1);
+            auto sp3 = tail.find(' ');
+            count = std::stoi((sp3 == std::string::npos) ? tail : tail.substr(0, sp3));
             if (count < 1) count = 1;
+            if (sp3 != std::string::npos) {
+                std::string fl = tail.substr(sp3 + 1);
+                if (fl == "1" || fl == "t" || fl == "T") trad = true;
+            }
         } else {
             word = line.substr(sp1 + 1);
         }
         if (code.length() >= 1 && word.length() >= 2) {
             bool isDup = false;
             for (auto &existing : _userWords) {
-                if (existing.code == code && existing.word == word) {
+                if (existing.code == code && existing.word == word && existing.trad == trad) {
                     isDup = true;
                     hadDuplicates = true;
                     if (existing.count < count) existing.count = count;
                     break;
                 }
             }
-            if (!isDup) _userWords.push_back({code, word, count});
+            if (!isDup) _userWords.push_back({code, word, count, trad});
         }
     }
     if (hadDuplicates) {
@@ -200,7 +207,8 @@ void IME::saveUserDict() {
     // Build full serialized string
     std::string allData;
     for (auto &p : _userWords) {
-        allData += p.code + " " + p.word + " " + std::to_string(p.count) + "\n";
+        allData += p.code + " " + p.word + " " + std::to_string(p.count)
+                 + (p.trad ? " 1" : "") + "\n";
     }
 
     // Write in chunks of 3800 bytes to stay within NVS string limits
@@ -230,17 +238,17 @@ void IME::saveUserDict() {
 void IME::addUserWord(const std::string &code, const std::string &word) {
     if (word.length() < 3 || code.length() == 0) return;
     for (auto &p : _userWords)
-        if (p.code == code && p.word == word) return;
+        if (p.code == code && p.word == word && p.trad == _trad) return;
     if (_userWords.size() >= 1000)
         _userWords.erase(_userWords.begin());
-    _userWords.push_back({code, word, 0});
+    _userWords.push_back({code, word, 0, _trad});
     _userDirty = true;
     saveUserDict();
 }
 
 void IME::removeUserWord(const std::string &code, const std::string &word) {
     for (auto it = _userWords.begin(); it != _userWords.end(); ++it) {
-        if (it->code == code && it->word == word) {
+        if (it->code == code && it->word == word && it->trad == _trad) {
             _userWords.erase(it);
             _userDirty = true;
             saveUserDict();
@@ -363,8 +371,8 @@ void IME::reset() {
     _displayCodeDirty = true;
     _all.clear();
     _candLen.clear();
-    if (_all.capacity() > 200) _all.shrink_to_fit();
-    else if (_all.capacity() < 50) _all.reserve(50);
+    if (_all.capacity() > MAX_CANDIDATES * 2) _all.shrink_to_fit();
+    else if (_all.capacity() < MAX_CANDIDATES / 3) _all.reserve(MAX_CANDIDATES / 3);
     _page.clear();
     if (_page.capacity() > _pageSize * 2) _page.shrink_to_fit();
     else if (_page.capacity() < _pageSize) _page.reserve(_pageSize);
@@ -440,7 +448,7 @@ void IME::lookup() {
             if (strncmp(code, q, qlen) < 0) llo = mid + 1;
             else lhi = mid;
         }
-        for (uint32_t i = llo; i < _lfCount && _all.size() < 100; i++) {
+        for (uint32_t i = llo; i < _lfCount && _all.size() < MAX_CANDIDATES; i++) {
             char code[13]; if (!readLfCode(i, code)) break;
             if (strncmp(code, q, qlen) != 0) break;
             uint8_t f = readLfFlag(i);
@@ -461,6 +469,7 @@ void IME::lookup() {
     if (_deleteMode) {
         std::vector< std::pair<int, std::string> > userMatches;
         for (auto &p : _userWords) {
+            if (p.trad != _trad) continue;
             if (qlen == 0 ||
                 ((int)p.code.length() >= qlen && strncmp(p.code.c_str(), q, qlen) == 0)) {
                 bool found = false;
@@ -481,17 +490,18 @@ void IME::lookup() {
         for (auto &m : userMatches) {
             _all.push_back(m.second);
             _candLen.push_back(0);
-            if (_all.size() >= 100) break;
+            if (_all.size() >= MAX_CANDIDATES) break;
         }
         buildPage();
         return;
     }
 
-    // Phase 1: user dict (single char + phrases) — priority over dictionary
+    // Phase 1: user dict single chars — highest priority (phrases emitted in Phase 3)
+    std::vector< std::pair<int, std::string> > userWordFreq;
     {
         std::vector< std::pair<int, std::string> > userSingleFreq;
-        std::vector< std::pair<int, std::string> > userWordFreq;
         for (auto &p : _userWords) {
+            if (p.trad != _trad) continue;
             if ((int)p.code.length() < qlen) continue;
             if (strncmp(p.code.c_str(), q, qlen) != 0) continue;
             if (p.word.length() <= 3) {
@@ -518,7 +528,6 @@ void IME::lookup() {
                 if (!found) userWordFreq.push_back({p.count, p.word});
             }
         }
-        // Single chars first (higher priority), then phrases
         std::sort(userSingleFreq.begin(), userSingleFreq.end(),
             [](const std::pair<int,std::string> &a, const std::pair<int,std::string> &b) {
                 return a.first > b.first;
@@ -526,19 +535,9 @@ void IME::lookup() {
         for (auto &f : userSingleFreq) {
             _all.push_back(f.second);
             _candLen.push_back(0);
-            if (_all.size() >= 100) break;
+            if (_all.size() >= MAX_CANDIDATES) break;
         }
-        if (_all.size() >= 100) { buildPage(); return; }
-        std::sort(userWordFreq.begin(), userWordFreq.end(),
-            [](const std::pair<int,std::string> &a, const std::pair<int,std::string> &b) {
-                return a.first > b.first;
-            });
-        for (auto &f : userWordFreq) {
-            _all.push_back(f.second);
-            _candLen.push_back(0);
-            if (_all.size() >= 100) break;
-        }
-        if (_all.size() >= 100) { buildPage(); return; }
+        if (_all.size() >= MAX_CANDIDATES) { buildPage(); return; }
     }
 
     // Phase 2: single char prefix match (dictionary)
@@ -557,7 +556,7 @@ void IME::lookup() {
             if (strncmp(code, q, qlen) < 0) lo = mid + 1;
             else hi = mid;
         }
-        for (uint32_t i = lo; i < scanEnd && _all.size() < 100; i++) {
+        for (uint32_t i = lo; i < scanEnd && _all.size() < MAX_CANDIDATES; i++) {
             char code[7];
             if (!readCode(i, code)) break;
             if (strncmp(code, q, qlen) != 0) break;
@@ -575,10 +574,24 @@ void IME::lookup() {
             }
         }
     }
-    if (_all.size() >= 100) { buildPage(); return; }
+    if (_all.size() >= MAX_CANDIDATES) { buildPage(); return; }
+
+    // Phase 3: user dict phrases — after dictionary single chars, before dictionary phrases
+    {
+        std::sort(userWordFreq.begin(), userWordFreq.end(),
+            [](const std::pair<int,std::string> &a, const std::pair<int,std::string> &b) {
+                return a.first > b.first;
+            });
+        for (auto &f : userWordFreq) {
+            _all.push_back(f.second);
+            _candLen.push_back(0);
+            if (_all.size() >= MAX_CANDIDATES) break;
+        }
+        if (_all.size() >= MAX_CANDIDATES) { buildPage(); return; }
+    }
+    size_t p4Start = _all.size();  // 词典词组排序起点(不含用户词组)
 
     // Phase 4: phrase prefix match (word dictionary)
-    size_t p4Start = _all.size();
     if (hasVowel && _wordCount > 0 && _wordData) {
         size_t wlo = 0, whi = _wordDataSize;
         if (qlen >= 2) {
@@ -590,7 +603,7 @@ void IME::lookup() {
         }
         size_t wpos = wlo;
         int safety = 0;
-        while (wpos < whi && _all.size() < 100 && safety++ < 5000) {
+        while (wpos < whi && _all.size() < MAX_CANDIDATES && safety++ < 5000) {
             uint8_t cl = _wordData[wpos];
             if (cl == 0 || wpos + 1 + cl > whi) break;
             const char *wc = (const char *)_wordData + wpos + 1;
@@ -650,12 +663,13 @@ void IME::lookup() {
             _candLen.swap(sortedLen);
         }
     }
-    if (_all.size() >= 100) { buildPage(); return; }
+    if (_all.size() >= MAX_CANDIDATES) { buildPage(); return; }
 
     // Phase 5: user dict initial match
     if (!hasVowel && _userWords.size() > 0) {
         std::vector< std::pair<int, std::string> > userInitFreq;
         for (auto &p : _userWords) {
+            if (p.trad != _trad) continue;
             int cl = (int)p.code.length();
             if (cl < 2) continue;
             const char *wc = p.code.c_str();
@@ -701,9 +715,9 @@ void IME::lookup() {
         for (auto &f : userInitFreq) {
             _all.push_back(f.second);
             _candLen.push_back(0);
-            if (_all.size() >= 100) break;
+            if (_all.size() >= MAX_CANDIDATES) break;
         }
-        if (_all.size() >= 100) { buildPage(); return; }
+        if (_all.size() >= MAX_CANDIDATES) { buildPage(); return; }
     }
 
     // Phase 6: initial match (no vowel, consonant-only)
@@ -716,7 +730,7 @@ void IME::lookup() {
         }
         size_t spos = slo;
         int safety = 0;
-        while (spos < shi && _all.size() < 100 && safety++ < 60000) {
+        while (spos < shi && _all.size() < MAX_CANDIDATES && safety++ < 60000) {
             uint8_t cl = _wordData[spos];
             if (cl == 0 || spos + 1 + cl > shi) break;
             const char *wc = (const char *)_wordData + spos + 1;
@@ -751,7 +765,7 @@ void IME::lookup() {
                     uint8_t wl = _wordData[spos++];
                     if (wl == 0 || spos + wl + 1 > shi) break;
                     uint8_t wf = _wordData[spos + wl];
-                    if (_all.size() < 100 && (!_trad || wf == 0)) {
+                    if (_all.size() < MAX_CANDIDATES && (!_trad || wf == 0)) {
                         std::string w;
                         w.append((const char *)_wordData + spos, wl);
                         bool dup = false;
@@ -803,7 +817,7 @@ void IME::lookup() {
                 }
             }
         }
-        if (shorthandTail && _wordCount > 0 && _wordData && _all.size() < 100) {
+        if (shorthandTail && _wordCount > 0 && _wordData && _all.size() < MAX_CANDIDATES) {
             size_t slo = 0, shi = _wordDataSize;
             if (typedInit.length() >= 1 && typedInit[0] >= 'a' && typedInit[0] <= 'z') {
                 int k = (typedInit[0] - 'a') * 26;
@@ -812,7 +826,7 @@ void IME::lookup() {
             }
             size_t spos = slo;
             int safety = 0;
-            while (spos < shi && _all.size() < 100 && safety++ < 60000) {
+            while (spos < shi && _all.size() < MAX_CANDIDATES && safety++ < 60000) {
                 uint8_t cl = _wordData[spos];
                 if (cl == 0 || spos + 1 + cl > shi) break;
                 const char *wc = (const char *)_wordData + spos + 1;
@@ -877,7 +891,7 @@ void IME::lookup() {
                     uint8_t wl = _wordData[spos++];
                     if (wl == 0 || spos + wl + 1 > shi) break;
                     uint8_t wf = _wordData[spos + wl];
-                    if (_all.size() < 100 && (!_trad || wf == 0)) {
+                    if (_all.size() < MAX_CANDIDATES && (!_trad || wf == 0)) {
                         std::string w;
                         w.append((const char *)_wordData + spos, wl);
                         bool dup = false;
@@ -897,12 +911,12 @@ void IME::lookup() {
     // Phase 8: partial (逐字) match
     _partialStart = (int)_all.size();
     _remainder.clear();
-    if (qlen > 1 && _all.size() < 100) {
+    if (qlen > 1 && _all.size() < MAX_CANDIDATES) {
         uint32_t zlo, zhi;
         int maxTry = qlen - 1;
         if (_maxMatchLen > 0 && _maxMatchLen < maxTry)
             maxTry = _maxMatchLen - 1;
-        for (int tryLen = maxTry; tryLen >= 1 && _all.size() < 100; tryLen--) {
+        for (int tryLen = maxTry; tryLen >= 1 && _all.size() < MAX_CANDIDATES; tryLen--) {
             searchWindow(q, tryLen, zlo, zhi);
             uint32_t sEnd = zhi;
             int bcount = 0;
@@ -912,7 +926,7 @@ void IME::lookup() {
                 if (strncmp(code, q, tryLen) < 0) zlo = mid + 1;
                 else zhi = mid;
             }
-            for (uint32_t i = zlo; i < sEnd && _all.size() < 100; i++) {
+            for (uint32_t i = zlo; i < sEnd && _all.size() < MAX_CANDIDATES; i++) {
                 char code[7]; if (!readCode(i, code)) break;
                 if (strncmp(code, q, tryLen) != 0) break;
                 uint8_t f = readRecordFlag(i);
@@ -984,7 +998,7 @@ bool IME::commit(int idx, std::string &out) {
     out = _page[idx];
     if (_deleteMode) {
         for (auto it = _userWords.begin(); it != _userWords.end(); ++it) {
-            if (it->word == out) {
+            if (it->word == out && it->trad == _trad) {
                 _userWords.erase(it);
                 _userDirty = true;
                 saveUserDict();
@@ -1129,6 +1143,7 @@ bool IME::handleFullwidthChar(int key, std::string &out) {
 
 bool IME::handleKey(int key, std::string &out) {
     if (!_active) return false;
+    if (_english) return false;  // 临时英文模式: 按键直接透传给编辑器
     if (_predicting) {
         if ((key >= 'a' && key <= 'z') || (key >= 'A' && key <= 'Z')) {
             _predicting = false;

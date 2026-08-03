@@ -363,6 +363,11 @@ extern "C" void app_main() {
             app_toggle_trad();
             key = 0;
         }
+        // Left Shift tap → temp English mode toggle (only when IME active in editor)
+        if (key == KEY_LSHIFT_TAP && currentState == APP_EDITOR && app_ime_active()) {
+            app_toggle_english();
+            key = 0;
+        }
 
         // ── BT auto-reconnect retry ──────────────────────────────────────
         // 只在未连接且未正在连接时重试，间隔10秒
