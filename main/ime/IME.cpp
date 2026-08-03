@@ -506,22 +506,22 @@ void IME::lookup() {
                 if (!found) userWordFreq.push_back({p.count, p.word});
             }
         }
-        // Phrases first (higher priority), then single chars
-        std::sort(userWordFreq.begin(), userWordFreq.end(),
-            [](const std::pair<int,std::string> &a, const std::pair<int,std::string> &b) {
-                return a.first > b.first;
-            });
-        for (auto &f : userWordFreq) {
-            _all.push_back(f.second);
-            _candLen.push_back(0);
-            if (_all.size() >= 100) break;
-        }
-        if (_all.size() >= 100) { buildPage(); return; }
+        // Single chars first (higher priority), then phrases
         std::sort(userSingleFreq.begin(), userSingleFreq.end(),
             [](const std::pair<int,std::string> &a, const std::pair<int,std::string> &b) {
                 return a.first > b.first;
             });
         for (auto &f : userSingleFreq) {
+            _all.push_back(f.second);
+            _candLen.push_back(0);
+            if (_all.size() >= 100) break;
+        }
+        if (_all.size() >= 100) { buildPage(); return; }
+        std::sort(userWordFreq.begin(), userWordFreq.end(),
+            [](const std::pair<int,std::string> &a, const std::pair<int,std::string> &b) {
+                return a.first > b.first;
+            });
+        for (auto &f : userWordFreq) {
             _all.push_back(f.second);
             _candLen.push_back(0);
             if (_all.size() >= 100) break;
