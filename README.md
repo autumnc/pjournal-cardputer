@@ -189,12 +189,17 @@ idf.py -p /dev/ttyUSB0 flash
 |------|------|
 | Deepseek Key | AI 提示生成 API Key |
 | Flomo 邮箱/密码 | Flomo API 登录凭证 |
+| 生成 Flomo Token | 由邮箱/密码生成 API Token |
 | WebDAV URL/用户/密码 | 远程同步地址 |
 | 个人经历/爱好 | AI 提示上下文 |
 | WiFi SSID/密码 | 网络连接 |
 | 时区 | 如 `CST-8` |
 | NTP 服务器 | 如 `pool.ntp.org` |
 | 自动保存 | 开启后 3 秒无操作自动存储 |
+| 自动休眠 | 开启后键盘/按键空闲 10 分钟进入 light sleep 休眠，物理按键唤醒 |
+| 休眠保留画面 | 开启后休眠期间保留最后画面；关闭则白屏最省电 |
+| 字体大小 | 候选字与正文显示字号 |
+| 网络同步时间 | 联网后同步 RTC 时间 |
 
 ## 导航层级
 
