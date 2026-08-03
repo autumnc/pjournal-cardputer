@@ -35,6 +35,7 @@ static const char *TAG = "BtKeybrd";
 #define KEY_SHIFT_RIGHT 0x89
 #define KEY_CTRL_I      0x8A
 #define KEY_FULLWIDTH_TOGGLE 0x8B
+#define KEY_TRAD_TOGGLE 0x8C
 
 // HID Usage ID → ASCII
 static const uint8_t s_asc_low[] = {
@@ -233,6 +234,13 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
 
                 // Ctrl modifier handling
                 bool ctrl = (mod & 0x11) != 0;
+                bool shift = (mod & 0x22) != 0;
+                if (ctrl && shift && kc == 9) {
+                    // Ctrl+Shift+F → simplified/traditional toggle (before generic Ctrl+letter)
+                    uint8_t tt = KEY_TRAD_TOGGLE;
+                    xQueueSendToBack(s_queue, &tt, 0);
+                    continue;
+                }
                 if (ctrl && kc == 12) {
                     // Ctrl+I → inspiration panel (must check before generic Ctrl+letter)
                     uint8_t ci = KEY_CTRL_I;
@@ -245,7 +253,6 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
                     xQueueSendToBack(s_queue, &toggle, 0);
                     continue;
                 }
-                bool shift = (mod & 0x22) != 0;
                 if (shift && kc == 44) {
                     // Shift+Space → fullwidth toggle
                     uint8_t fwt = KEY_FULLWIDTH_TOGGLE;
@@ -632,7 +639,9 @@ void BtKeyboard::checkKeyRepeat() {
             if (now >= s_last_repeat_time[i] + interval_us) {
                 // Ctrl modifier handling for repeat
                 bool ctrl = (s_last_mod & 0x11) != 0;
-                if (ctrl && kc == 12) {
+                if (ctrl && (s_last_mod & 0x22) && kc == 9) {
+                    // Ctrl+Shift+F → trad toggle; consume repeat
+                } else if (ctrl && kc == 12) {
                     uint8_t ci = KEY_CTRL_I;
                     xQueueSendToBack(s_queue, &ci, 0);
                 } else if (ctrl && kc == 44) {

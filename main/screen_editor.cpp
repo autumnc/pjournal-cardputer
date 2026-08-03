@@ -312,7 +312,10 @@ static void drawEditor() {
     snprintf(left, sizeof(left), "%s", mode);
     int bpct = battery_pct();
     std::string imeLabel = g_editor.imeActive ? "[中]" : "EN";
-    if (g_editor.imeActive) imeLabel += g_ime.fullwidth() ? "\xe2\x97\x8f" : "\xe2\x97\x90"; // ● or ◐
+    if (g_editor.imeActive) {
+        imeLabel += g_ime.fullwidth() ? "\xe2\x97\x8f" : "\xe2\x97\x90"; // ● or ◐
+        imeLabel += g_ime.trad() ? "繁" : "简";
+    }
     char right[64];
     if (bpct >= 0)
         snprintf(right, sizeof(right), "%d字 %d%% %s", wc, bpct, imeLabel.c_str());
@@ -739,6 +742,10 @@ bool app_ime_fullwidth() {
 
 void app_toggle_fullwidth() {
     g_ime.toggleFullwidth();
+}
+
+void app_toggle_trad() {
+    g_ime.toggleTrad();
 }
 
 static bool g_editorNeedsReinit = false;

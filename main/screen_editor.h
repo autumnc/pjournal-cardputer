@@ -11,6 +11,7 @@ bool app_ime_active();
 void app_toggle_ime();
 bool app_ime_fullwidth();
 void app_toggle_fullwidth();
+void app_toggle_trad();
 
 // Force editor re-initialization on next cycle
 void app_editor_request_reinit();

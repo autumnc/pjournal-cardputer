@@ -20,6 +20,10 @@ public:
     void toggleFullwidth() { _fullwidth = !_fullwidth; }
     void setFullwidth(bool on) { _fullwidth = on; }
 
+    bool trad() const { return _trad; }
+    void toggleTrad() { _trad = !_trad; buildPage(); }
+    void setTrad(bool on) { _trad = on; buildPage(); }
+
     bool handleKey(int key, std::string &out);
 
     std::string displayCode() const {
@@ -120,6 +124,8 @@ private:
     bool parseHeader(const uint8_t *hdrIndex, size_t total);
     bool readCode(uint32_t i, char out[MAX_CODE_LEN + 1]);
     bool readHanzi(uint32_t i, char out[HANZI_SIZE + 1]);
+    uint8_t readRecordFlag(uint32_t i);
+    uint8_t readLfFlag(uint16_t i);
 
     std::string _code;
     std::vector<std::string> _all;
@@ -134,6 +140,7 @@ private:
     bool _singleQuoteOpen = false;  // Track single quote pairing state
     bool _doubleQuoteOpen = false;  // Track double quote pairing state
     bool _fullwidth = false;        // Fullwidth character mode
+    bool _trad = false;             // Traditional mode: hide simplified-only, show trad counterparts
 
     void reset();
     void lookup();

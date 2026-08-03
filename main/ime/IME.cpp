@@ -342,6 +342,16 @@ bool IME::readHanzi(uint32_t i, char out[HANZI_SIZE + 1]) {
     return true;
 }
 
+uint8_t IME::readRecordFlag(uint32_t i) {
+    const uint8_t *rec = _blob + _recordBase + (size_t)i * _recordSize;
+    return rec[_codeLen + HANZI_SIZE];
+}
+
+uint8_t IME::readLfFlag(uint16_t i) {
+    const uint8_t *rec = _lfBlob + _lfRecordBase + (size_t)i * 16;
+    return rec[15];
+}
+
 void IME::setActive(bool on) {
     _active = on;
     if (on) loadUserDict();
@@ -433,6 +443,8 @@ void IME::lookup() {
         for (uint32_t i = llo; i < _lfCount && _all.size() < 100; i++) {
             char code[13]; if (!readLfCode(i, code)) break;
             if (strncmp(code, q, qlen) != 0) break;
+            uint8_t f = readLfFlag(i);
+            if (f & (_trad ? 0x01 : 0x02)) continue;
             char hz[4]; if (!readLfHanzi(i, hz)) break;
             std::string h(hz);
             bool dup = false;
@@ -549,6 +561,8 @@ void IME::lookup() {
             char code[7];
             if (!readCode(i, code)) break;
             if (strncmp(code, q, qlen) != 0) break;
+            uint8_t f = readRecordFlag(i);
+            if (f & (_trad ? 0x01 : 0x02)) continue;
             char hz[4];
             if (!readHanzi(i, hz)) break;
             std::string h(hz);
@@ -587,27 +601,30 @@ void IME::lookup() {
             if (strncmp(wc, q, matchLen) == 0) {
                 for (uint8_t j = 0; j < n && wpos < whi; j++) {
                     uint8_t wl = _wordData[wpos++];
-                    if (wl == 0 || wpos + wl > whi) break;
+                    if (wl == 0 || wpos + wl + 1 > whi) break;
+                    uint8_t wf = _wordData[wpos + wl];
                     if ((int)cl < qlen && wl <= 3) {
-                        wpos += wl;
+                        wpos += wl + 1;
                         continue;
                     }
-                    std::string w;
-                    w.append((const char *)_wordData + wpos, wl);
-                    wpos += wl;
-                    bool dup = false;
-                    for (auto &e : _all) if (e == w) { dup = true; break; }
-                    if (!dup) {
-                        _all.push_back(w);
-                        _candLen.push_back(std::min((int)cl, qlen));
-                        if ((int)cl > _maxMatchLen) _maxMatchLen = (int)cl;
+                    if (!_trad || wf == 0) {
+                        std::string w;
+                        w.append((const char *)_wordData + wpos, wl);
+                        bool dup = false;
+                        for (auto &e : _all) if (e == w) { dup = true; break; }
+                        if (!dup) {
+                            _all.push_back(w);
+                            _candLen.push_back(std::min((int)cl, qlen));
+                            if ((int)cl > _maxMatchLen) _maxMatchLen = (int)cl;
+                        }
                     }
+                    wpos += wl + 1;
                 }
             } else {
                 for (uint8_t j = 0; j < n && wpos < whi; j++) {
                     uint8_t wl = _wordData[wpos++];
-                    if (wpos + wl > whi) break;
-                    wpos += wl;
+                    if (wpos + wl + 1 > whi) break;
+                    wpos += wl + 1;
                 }
             }
         }
@@ -732,8 +749,9 @@ void IME::lookup() {
             if (o >= qlen && strncmp(init, q, qlen) == 0) {
                 for (uint8_t j = 0; j < n && spos < shi; j++) {
                     uint8_t wl = _wordData[spos++];
-                    if (wl == 0 || spos + wl > shi) break;
-                    if (_all.size() < 100) {
+                    if (wl == 0 || spos + wl + 1 > shi) break;
+                    uint8_t wf = _wordData[spos + wl];
+                    if (_all.size() < 100 && (!_trad || wf == 0)) {
                         std::string w;
                         w.append((const char *)_wordData + spos, wl);
                         bool dup = false;
@@ -744,13 +762,13 @@ void IME::lookup() {
                             if ((int)cl > _maxMatchLen) _maxMatchLen = (int)cl;
                         }
                     }
-                    spos += wl;
+                    spos += wl + 1;
                 }
             } else {
                 for (uint8_t j = 0; j < n && spos < shi; j++) {
                     uint8_t wl = _wordData[spos++];
-                    if (spos + wl > shi) break;
-                    spos += wl;
+                    if (spos + wl + 1 > shi) break;
+                    spos += wl + 1;
                 }
             }
         }
@@ -827,8 +845,8 @@ void IME::lookup() {
                 if (o < (int)typedInit.length() || strncmp(init, typedInit.c_str(), typedInit.length()) != 0) {
                     for (uint8_t j = 0; j < n && spos < shi; j++) {
                         uint8_t wl = _wordData[spos++];
-                        if (spos + wl > shi) break;
-                        spos += wl;
+                        if (spos + wl + 1 > shi) break;
+                        spos += wl + 1;
                     }
                     continue;
                 }
@@ -850,15 +868,16 @@ void IME::lookup() {
                 if (!tailMatch) {
                     for (uint8_t j = 0; j < n && spos < shi; j++) {
                         uint8_t wl = _wordData[spos++];
-                        if (spos + wl > shi) break;
-                        spos += wl;
+                        if (spos + wl + 1 > shi) break;
+                        spos += wl + 1;
                     }
                     continue;
                 }
                 for (uint8_t j = 0; j < n && spos < shi; j++) {
                     uint8_t wl = _wordData[spos++];
-                    if (wl == 0 || spos + wl > shi) break;
-                    if (_all.size() < 100) {
+                    if (wl == 0 || spos + wl + 1 > shi) break;
+                    uint8_t wf = _wordData[spos + wl];
+                    if (_all.size() < 100 && (!_trad || wf == 0)) {
                         std::string w;
                         w.append((const char *)_wordData + spos, wl);
                         bool dup = false;
@@ -869,7 +888,7 @@ void IME::lookup() {
                             if ((int)cl > _maxMatchLen) _maxMatchLen = (int)cl;
                         }
                     }
-                    spos += wl;
+                    spos += wl + 1;
                 }
             }
         }
@@ -896,6 +915,8 @@ void IME::lookup() {
             for (uint32_t i = zlo; i < sEnd && _all.size() < 100; i++) {
                 char code[7]; if (!readCode(i, code)) break;
                 if (strncmp(code, q, tryLen) != 0) break;
+                uint8_t f = readRecordFlag(i);
+                if (f & (_trad ? 0x01 : 0x02)) continue;
                 char hz[4]; if (!readHanzi(i, hz)) break;
                 std::string h(hz);
                 bool dup = false;
