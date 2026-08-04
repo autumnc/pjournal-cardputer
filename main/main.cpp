@@ -85,6 +85,14 @@ static int64_t s_last_activity_us = 0;
 // BOOT 唤醒后的首次短按释放不应再次触发休眠(唤醒按键与休眠按键是同一个键)
 static bool s_boot_wake_release_pending = false;
 
+// 物理按键时间判定(不依赖主循环节拍,各界面循环速度不同)
+#define BTN_DEBOUNCE_US       (30000)     // 30ms 防抖
+#define BTN_LONG_PRESS_US     (1000000)   // 1s 判定长按
+#define BTN_DOUBLE_WINDOW_US  (300000)    // 300ms 双击窗口
+
+// 单击动作排队: 松开后等待双击窗口确认非双击再执行,避免双击第一下误发导航键
+static struct { int key = 0; int64_t queued_us = 0; } s_pending_single;
+
 static void enterLightSleep(void) {
     // 休眠提示画在底部状态栏位置、居中,不遮挡/清空上方画面——
     // 保留画面模式下,最后画面 + 底部提示在整个休眠期间持续显示(RLCD 零功耗)
@@ -340,8 +348,13 @@ extern "C" void app_main() {
     ScreenContext ctx;
     static AppState inspReturnTo = APP_MAIN;
 
-    // Button debounce counters
-    struct { int count; bool fired_long; } btn_user = {}, btn_boot = {};
+    // 物理按键状态(时间制,不依赖主循环节拍)
+    struct BtnState {
+        int64_t press_start_us = 0;   // 当前按下起始时刻(0=未按下)
+        int64_t last_release_us = 0;  // 上次松开时刻(双击窗口基准)
+        bool is_double = false;       // 本次按下为双击第二下
+        bool long_fired = false;      // 本次按下已触发长按
+    } btn_user, btn_boot;
 
     while (currentState != APP_QUIT) {
         checkLightSleep(currentState);
@@ -437,26 +450,32 @@ extern "C" void app_main() {
 
         // ── Physical button handling ──────────────────────────────────────
         // With pull-up: 1=released, 0=pressed (active LOW)
-        // Simple counters, no auto-detection — just read the pin directly.
         #define PIN_LOW(gpio) (gpio_get_level(gpio) == 0)
+
+        // 单击动作在双击窗口结束后才生效(防止双击第一下误发导航键,仅蓝牙管理面板有双击动作)
+        if (s_pending_single.key != 0) {
+            if (esp_timer_get_time() - s_pending_single.queued_us >= BTN_DOUBLE_WINDOW_US) {
+                if (currentState == APP_BT_MANAGE) key = s_pending_single.key;
+                s_pending_single.key = 0;
+            }
+        }
 
         // USER button (GPIO 18)
         {
-            static int64_t user_btn_last_release_us = 0;
-            static bool user_btn_double = false;
-
             bool held = PIN_LOW(PIN_USER_BTN);
             if (held) {
-                if (btn_user.count == 0) {
-                    int64_t now = esp_timer_get_time();
-                    s_last_activity_us = now;
-                    if (user_btn_last_release_us > 0 &&
-                        (now - user_btn_last_release_us) < 400000) {
-                        user_btn_double = true;
-                    }
+                if (btn_user.press_start_us == 0) {
+                    btn_user.press_start_us = esp_timer_get_time();
+                    s_last_activity_us = btn_user.press_start_us;
+                    // 上次松开后的双击窗口内再次按下 → 双击第二下,取消第一下的单击排队
+                    btn_user.is_double = (btn_user.last_release_us > 0 &&
+                        (btn_user.press_start_us - btn_user.last_release_us) < BTN_DOUBLE_WINDOW_US);
+                    if (btn_user.is_double) s_pending_single.key = 0;
                 }
-                btn_user.count++;
-                if (btn_user.count == 14) {
+                if (!btn_user.long_fired &&
+                    (esp_timer_get_time() - btn_user.press_start_us) >= BTN_LONG_PRESS_US) {
+                    btn_user.long_fired = true;
+                    s_pending_single.key = 0;
                     if (currentState == APP_BT_MANAGE) {
                         // 蓝牙管理面板: 长按→连接选中设备(不经过短按,避免错位)
                         key = 0x0A;
@@ -466,67 +485,81 @@ extern "C" void app_main() {
                     }
                 }
             } else {
-                // 松开时判定: 单击→上移; 双击→(管理模式:添加/扫描模式:返回)
-                if (btn_user.count >= 3 && btn_user.count < 14) {
-                    if (currentState == APP_BT_MANAGE) {
-                        if (user_btn_double) {
+                if (btn_user.press_start_us != 0) {
+                    int64_t now = esp_timer_get_time();
+                    int64_t dur = now - btn_user.press_start_us;
+                    btn_user.press_start_us = 0;
+                    if (dur >= BTN_DEBOUNCE_US && !btn_user.long_fired) {
+                        if (currentState == APP_BT_MANAGE && btn_user.is_double) {
+                            // 双击: 管理模式→添加, 扫描模式→返回
                             key = screen_bt_manage_scan_mode() ? 0x1B : 'a';
-                        } else {
-                            key = KEY_UP;
+                        } else if (currentState == APP_BT_MANAGE) {
+                            // 单击: 上移,等待双击窗口确认非双击后生效
+                            s_pending_single.key = KEY_UP;
+                            s_pending_single.queued_us = now;
                         }
                     }
+                    btn_user.last_release_us = now;
+                    btn_user.long_fired = false;
+                    btn_user.is_double = false;
                 }
-                if (btn_user.count >= 1 && btn_user.count < 14)
-                    user_btn_last_release_us = esp_timer_get_time();
-                btn_user.count = 0;
-                user_btn_double = false;
             }
         }
 
         // BOOT button (GPIO 0)
         {
-            static int64_t boot_btn_last_release_us = 0;
-            static bool boot_btn_double = false;
-
             bool held = PIN_LOW(PIN_BOOT);
             if (held) {
-                if (btn_boot.count == 0) {
-                    s_last_activity_us = esp_timer_get_time();
-                    if (boot_btn_last_release_us > 0 &&
-                        (esp_timer_get_time() - boot_btn_last_release_us) < 400000) {
-                        boot_btn_double = true;
-                    }
+                if (btn_boot.press_start_us == 0) {
+                    btn_boot.press_start_us = esp_timer_get_time();
+                    s_last_activity_us = btn_boot.press_start_us;
+                    btn_boot.is_double = (btn_boot.last_release_us > 0 &&
+                        (btn_boot.press_start_us - btn_boot.last_release_us) < BTN_DOUBLE_WINDOW_US);
+                    if (btn_boot.is_double) s_pending_single.key = 0;
                 }
-                btn_boot.count++;
-                // Long press → 蓝牙管理面板: 长按→ESC(管理模式退出/扫描模式返回)
-                if (btn_boot.count == 14 && currentState == APP_BT_MANAGE) {
-                    key = 0x1B;
-                    btn_boot.fired_long = true;
+                if (!btn_boot.long_fired &&
+                    (esp_timer_get_time() - btn_boot.press_start_us) >= BTN_LONG_PRESS_US) {
+                    if (currentState == APP_BT_MANAGE) {
+                        // 长按→Esc(管理模式退出/扫描模式返回)
+                        btn_boot.long_fired = true;
+                        s_pending_single.key = 0;
+                        key = 0x1B;
+                    }
+                    // 其他界面 BOOT 长按与单击同义,松开时统一进入休眠
                 }
             } else {
-                // 松开时判定: 蓝牙管理面板处理短按/双击; 其他界面单击(不论按多久)→ 休眠
-                if (btn_boot.count >= 1 && !btn_boot.fired_long) {
-                    if (currentState == APP_BT_MANAGE) {
-                        if (btn_boot.count >= 3 && btn_boot.count < 14) {
-                            // 双击: 管理模式→删除, 扫描模式→返回; 单击→下移
-                            key = boot_btn_double ? (screen_bt_manage_scan_mode() ? 0x1B : 'd') : KEY_DOWN;
-                        }
-                    } else if (s_boot_wake_release_pending) {
-                        // 这是 BOOT 唤醒按键的释放,不进入休眠,避免唤醒即再睡
-                        s_boot_wake_release_pending = false;
-                    } else {
-                        // 除蓝牙管理外,单击 BOOT → 进入休眠(任一实体按键可唤醒)
-                        // count>=1 即触发:主循环在部分界面为 200ms/次,快速点击达不到旧阈值 count 3
-                        enterLightSleep();
-                        key = 0;  // 丢弃休眠前遗留的按键
-                        s_last_activity_us = esp_timer_get_time();
-                    }
+                // 唤醒按键可能已在扫描间隙松开,直接清除挂起的唤醒保护标记
+                if (s_boot_wake_release_pending && btn_boot.press_start_us == 0) {
+                    s_boot_wake_release_pending = false;
                 }
-                if (btn_boot.count >= 1 && btn_boot.count < 14)
-                    boot_btn_last_release_us = esp_timer_get_time();
-                btn_boot.count = 0;
-                btn_boot.fired_long = false;
-                boot_btn_double = false;
+                if (btn_boot.press_start_us != 0) {
+                    int64_t now = esp_timer_get_time();
+                    int64_t dur = now - btn_boot.press_start_us;
+                    btn_boot.press_start_us = 0;
+                    if (dur >= BTN_DEBOUNCE_US && !btn_boot.long_fired) {
+                        if (currentState == APP_BT_MANAGE) {
+                            if (btn_boot.is_double) {
+                                // 双击: 管理模式→删除, 扫描模式→返回
+                                key = screen_bt_manage_scan_mode() ? 0x1B : 'd';
+                            } else {
+                                // 单击: 下移,等待双击窗口确认非双击后生效
+                                s_pending_single.key = KEY_DOWN;
+                                s_pending_single.queued_us = now;
+                            }
+                        } else if (s_boot_wake_release_pending) {
+                            // 这是 BOOT 唤醒按键的释放,不进入休眠,避免唤醒即再睡
+                            s_boot_wake_release_pending = false;
+                        } else {
+                            // 除蓝牙管理外,单击 BOOT → 进入休眠(任一实体按键可唤醒)
+                            enterLightSleep();
+                            key = 0;  // 丢弃休眠前遗留的按键
+                            s_last_activity_us = esp_timer_get_time();
+                        }
+                    }
+                    btn_boot.last_release_us = now;
+                    btn_boot.long_fired = false;
+                    btn_boot.is_double = false;
+                }
             }
         }
 
