@@ -82,6 +82,8 @@ static void btInitTask(void *arg) {
 
 // 最近一次用户输入(BLE 键或物理按键)的时间,0 表示启动后尚未记录
 static int64_t s_last_activity_us = 0;
+// BOOT 唤醒后的首次短按释放不应再次触发休眠(唤醒按键与休眠按键是同一个键)
+static bool s_boot_wake_release_pending = false;
 
 static void enterLightSleep(void) {
     // 休眠提示画在底部状态栏位置、居中,不遮挡/清空上方画面——
@@ -122,6 +124,10 @@ static void enterLightSleep(void) {
         ESP_LOGW(TAG, "esp_light_sleep_start failed: %d", ret);
     }
     ESP_LOGI(TAG, "Woke up, wakeup cause=%d", esp_sleep_get_wakeup_cause());
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1 &&
+        (esp_sleep_get_ext1_wakeup_status() & (1ULL << PIN_BOOT))) {
+        s_boot_wake_release_pending = true;  // 被 BOOT 唤醒,忽略它本次释放以免立即再睡
+    }
 
     // 白屏模式下休眠时面板被隔离复位,必须重新初始化;保留画面模式下面板未复位,
     // 但统一重新初始化 + 强制整屏重绘也无害,保证画面回到当前 UI
@@ -498,11 +504,22 @@ extern "C" void app_main() {
                     btn_boot.fired_long = true;
                 }
             } else {
-                // Short press on release (only if didn't long-press)
-                if (btn_boot.count >= 3 && btn_boot.count < 14 && !btn_boot.fired_long) {
+                // 松开时判定: 蓝牙管理面板处理短按/双击; 其他界面单击(不论按多久)→ 休眠
+                if (btn_boot.count >= 1 && !btn_boot.fired_long) {
                     if (currentState == APP_BT_MANAGE) {
-                        // 双击: 管理模式→删除, 扫描模式→返回; 单击→下移
-                        key = boot_btn_double ? (screen_bt_manage_scan_mode() ? 0x1B : 'd') : KEY_DOWN;
+                        if (btn_boot.count >= 3 && btn_boot.count < 14) {
+                            // 双击: 管理模式→删除, 扫描模式→返回; 单击→下移
+                            key = boot_btn_double ? (screen_bt_manage_scan_mode() ? 0x1B : 'd') : KEY_DOWN;
+                        }
+                    } else if (s_boot_wake_release_pending) {
+                        // 这是 BOOT 唤醒按键的释放,不进入休眠,避免唤醒即再睡
+                        s_boot_wake_release_pending = false;
+                    } else {
+                        // 除蓝牙管理外,单击 BOOT → 进入休眠(任一实体按键可唤醒)
+                        // count>=1 即触发:主循环在部分界面为 200ms/次,快速点击达不到旧阈值 count 3
+                        enterLightSleep();
+                        key = 0;  // 丢弃休眠前遗留的按键
+                        s_last_activity_us = esp_timer_get_time();
                     }
                 }
                 if (btn_boot.count >= 1 && btn_boot.count < 14)

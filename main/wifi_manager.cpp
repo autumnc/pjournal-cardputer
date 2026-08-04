@@ -9,14 +9,16 @@ static const char *TAG = "WiFi";
 WifiManager g_wifi;
 
 static bool s_connected = false;
-static bool s_auto_reconnect = true;
+static bool s_auto_reconnect = false;
 static EventGroupHandle_t s_wifi_event = NULL;
 const int WIFI_CONNECTED_BIT = BIT0;
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        // Only auto-connect if explicitly requested; STA_START also fires after
-        // esp_wifi_stop() → esp_wifi_start() in connect(), which connects itself.
+        // STA_START also fires during connect()'s esp_wifi_start(), but the new
+        // config isn't applied yet — auto-connecting here would use the stale
+        // flash config and block the subsequent set_config. Only reconnect after
+        // a real disconnect (s_auto_reconnect is turned on post-set_config).
         if (s_auto_reconnect) esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
         bool auto_reconnect = s_auto_reconnect;  // Read before clearing state
@@ -54,7 +56,10 @@ bool WifiManager::begin() {
 
 bool WifiManager::connect(const char *ssid, const char *password) {
     if (!ssid || !*ssid) return false;
-    s_auto_reconnect = true;
+    // 先抑制自动重连：esp_wifi_start() 会触发 STA_START，若此处 auto_reconnect
+    // 已为 true，处理器会用旧配置抢先连接，导致下方的 set_config 报
+    // "sta is connecting, cannot set config"，新 SSID 从未生效
+    s_auto_reconnect = false;
 
     // Radio may have been stopped by a previous disconnect() — bring it back up
     if (!_started) {
@@ -68,6 +73,8 @@ bool WifiManager::connect(const char *ssid, const char *password) {
     cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
 
     esp_wifi_set_config(WIFI_IF_STA, &cfg);
+    // 新配置已生效，之后掉线才允许自动重连
+    s_auto_reconnect = true;
     esp_wifi_connect();
 
     // Wait for connection (10s timeout)
