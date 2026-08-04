@@ -24,6 +24,7 @@ extern "C" {
 struct SettingField { const char *key; const char *label; bool masked; bool action; };
 static const SettingField SETTINGS_FIELDS[] = {
     {"_file_mgr", "文件管理", false, true},
+    {"_bt_manage", "蓝牙设备管理", false, true},
     {"deepseek_key", "Deepseek Key", false, false},
     {"flomo_email", "Flomo 邮箱", false, false},
     {"flomo_pass", "Flomo 密码", false, false},
@@ -425,6 +426,10 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
             if (strcmp(f.key, "_file_mgr") == 0) {
                 ctx.nextState = APP_FILE_MANAGER;
                 return APP_FILE_MANAGER;
+            }
+            if (strcmp(f.key, "_bt_manage") == 0) {
+                ctx.nextState = APP_BT_MANAGE;
+                return APP_BT_MANAGE;
             }
             if (strcmp(f.key, "_font_size") == 0) {
                 int curSize = g_settings.fontSize();

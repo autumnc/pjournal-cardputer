@@ -59,11 +59,12 @@ static bool initDisplay() {
 static void btInitTask(void *arg) {
     ESP_LOGI(TAG, "Starting Bluetooth...");
     if (g_bt.init() == ESP_OK) {
-        uint8_t saved_bda[6];
-        esp_ble_addr_type_t saved_addr_type;
-        if (g_bt.loadPairedDevice(saved_bda, saved_addr_type)) {
-            ESP_LOGI(TAG, "Found saved keyboard, will auto-connect...");
-            g_bt.connectBDA(saved_bda, saved_addr_type);
+        g_bt.loadPairedDevices();
+        if (g_bt.pairedDeviceCount() > 0) {
+            ESP_LOGI(TAG, "Found %d saved keyboard(s), will auto-connect...",
+                     g_bt.pairedDeviceCount());
+            const BtPairedDevice *p = g_bt.getPairedDevice(0);
+            g_bt.connectBDA(p->bda, p->addr_type);
         }
     } else {
         ESP_LOGE(TAG, "Bluetooth init failed");
@@ -370,17 +371,20 @@ extern "C" void app_main() {
         }
 
         // ── BT auto-reconnect retry ──────────────────────────────────────
-        // 只在未连接且未正在连接时重试，间隔10秒
-        // 一旦连接成功，停止重试
+        // 多设备: 断线后按最近使用顺序轮询已配对设备, 谁在线连谁
+        // 面板内暂停自动重连, 避免干扰扫描/管理
         {
             static int64_t last_bt_retry_us = 0;
             static int64_t last_bt_reload_us = 0;
-            static bool bt_retry_loaded = false;
-            static uint8_t bt_retry_bda[6];
-            static esp_ble_addr_type_t bt_retry_addr_type;
+            static bool bt_list_loaded = false;
+            static int bt_try_idx = 0;
             static bool bt_was_connected = false;
 
-            if (g_bt.isConnected()) {
+            if (currentState == APP_BT_MANAGE) {
+                // 用户正在管理面板, 暂停自动重连
+                bt_was_connected = false;
+                last_bt_retry_us = 0;
+            } else if (g_bt.isConnected()) {
                 if (!bt_was_connected) {
                     ESP_LOGI(TAG, "Bluetooth connected, stopping retry logic");
                 }
@@ -393,24 +397,32 @@ extern "C" void app_main() {
                 }
 
                 if (!bt_was_connected) {
-                    // Periodically re-check for paired device file
-                    if (!bt_retry_loaded && g_bt.isInitialized()) {
+                    // Periodically reload paired device list (反映面板增删/新连接)
+                    if (g_bt.isInitialized()) {
                         int64_t now_us = esp_timer_get_time();
                         if (last_bt_reload_us == 0 || (now_us - last_bt_reload_us) > 30000000) {
                             last_bt_reload_us = now_us;
-                            bt_retry_loaded = g_bt.loadPairedDevice(bt_retry_bda, bt_retry_addr_type);
-                            if (bt_retry_loaded) {
-                                ESP_LOGI(TAG, "BT paired device file found, will auto-reconnect");
-                            }
+                            g_bt.loadPairedDevices();
+                            bt_list_loaded = g_bt.pairedDeviceCount() > 0;
+                            bt_try_idx = 0;
+                            if (bt_list_loaded)
+                                ESP_LOGI(TAG, "Loaded %d paired device(s)", g_bt.pairedDeviceCount());
                         }
                     }
 
-                    if (bt_retry_loaded && !g_bt.isConnecting()) {
+                    if (bt_list_loaded && !g_bt.isConnecting()) {
                         int64_t now_us = esp_timer_get_time();
-                        if (last_bt_retry_us == 0 || (now_us - last_bt_retry_us) > 10000000) {
+                        if (last_bt_retry_us == 0 || (now_us - last_bt_retry_us) > 2000000) {
                             last_bt_retry_us = now_us;
-                            ESP_LOGI(TAG, "BT auto-reconnect retry...");
-                            g_bt.connectBDA(bt_retry_bda, bt_retry_addr_type);
+                            int n = g_bt.pairedDeviceCount();
+                            if (n > 0) {
+                                if (bt_try_idx >= n) bt_try_idx = 0;
+                                const BtPairedDevice *p = g_bt.getPairedDevice(bt_try_idx);
+                                ESP_LOGI(TAG, "BT auto-reconnect retry %d/%d...",
+                                         bt_try_idx + 1, n);
+                                g_bt.connectBDA(p->bda, p->addr_type);
+                                bt_try_idx = (bt_try_idx + 1) % n;
+                            }
                         }
                     }
                 }
@@ -438,22 +450,26 @@ extern "C" void app_main() {
                     }
                 }
                 btn_user.count++;
-                if (btn_user.count == 3 && currentState == APP_BT_MANAGE) {
-                    if (user_btn_double) {
-                        key = 0x1B;
-                        user_btn_double = false;
-                        user_btn_last_release_us = 0;
-                    } else {
-                        key = KEY_UP;
-                    }
-                }
                 if (btn_user.count == 14) {
-                    if (currentState != APP_BT_MANAGE) {
+                    if (currentState == APP_BT_MANAGE) {
+                        // 蓝牙管理面板: 长按→连接选中设备(不经过短按,避免错位)
+                        key = 0x0A;
+                    } else {
                         currentState = APP_BT_MANAGE;
                         key = 0;
                     }
                 }
             } else {
+                // 松开时判定: 单击→上移; 双击→(管理模式:添加/扫描模式:返回)
+                if (btn_user.count >= 3 && btn_user.count < 14) {
+                    if (currentState == APP_BT_MANAGE) {
+                        if (user_btn_double) {
+                            key = screen_bt_manage_scan_mode() ? 0x1B : 'a';
+                        } else {
+                            key = KEY_UP;
+                        }
+                    }
+                }
                 if (btn_user.count >= 1 && btn_user.count < 14)
                     user_btn_last_release_us = esp_timer_get_time();
                 btn_user.count = 0;
@@ -463,22 +479,37 @@ extern "C" void app_main() {
 
         // BOOT button (GPIO 0)
         {
+            static int64_t boot_btn_last_release_us = 0;
+            static bool boot_btn_double = false;
+
             bool held = PIN_LOW(PIN_BOOT);
             if (held) {
-                if (btn_boot.count == 0) s_last_activity_us = esp_timer_get_time();
+                if (btn_boot.count == 0) {
+                    s_last_activity_us = esp_timer_get_time();
+                    if (boot_btn_last_release_us > 0 &&
+                        (esp_timer_get_time() - boot_btn_last_release_us) < 400000) {
+                        boot_btn_double = true;
+                    }
+                }
                 btn_boot.count++;
-                // Long press → confirm (in BT screen only)
+                // Long press → 蓝牙管理面板: 长按→ESC(管理模式退出/扫描模式返回)
                 if (btn_boot.count == 14 && currentState == APP_BT_MANAGE) {
-                    key = 0x0A;
+                    key = 0x1B;
                     btn_boot.fired_long = true;
                 }
             } else {
                 // Short press on release (only if didn't long-press)
                 if (btn_boot.count >= 3 && btn_boot.count < 14 && !btn_boot.fired_long) {
-                    if (currentState == APP_BT_MANAGE) key = KEY_DOWN;
+                    if (currentState == APP_BT_MANAGE) {
+                        // 双击: 管理模式→删除, 扫描模式→返回; 单击→下移
+                        key = boot_btn_double ? (screen_bt_manage_scan_mode() ? 0x1B : 'd') : KEY_DOWN;
+                    }
                 }
+                if (btn_boot.count >= 1 && btn_boot.count < 14)
+                    boot_btn_last_release_us = esp_timer_get_time();
                 btn_boot.count = 0;
                 btn_boot.fired_long = false;
+                boot_btn_double = false;
             }
         }
 

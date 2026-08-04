@@ -90,6 +90,10 @@ static BtDeviceInfo s_found_devices[MAX_BT_DEVICES];
 static int s_found_count = 0;
 static SemaphoreHandle_t s_devices_mutex = nullptr;
 
+// Paired device list (persisted to /sdcard/settings/bt_paired, most recent first)
+static BtPairedDevice s_paired[MAX_BT_DEVICES];
+static int s_paired_count = 0;
+
 // BLE scan params (extended)
 static esp_ble_ext_scan_params_t s_ext_scan_params = {};
 
@@ -686,47 +690,119 @@ void BtKeyboard::checkKeyRepeat() {
 }
 
 void BtKeyboard::savePairedDevice(const uint8_t *bda, esp_ble_addr_type_t addr_type, const char *name) {
-    char hex[13];
-    snprintf(hex, sizeof(hex), "%02x%02x%02x%02x%02x%02x",
-             bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
+    // Upsert: move to front (most recently used first), drop oldest if full
+    int idx = -1;
+    for (int i = 0; i < s_paired_count; i++) {
+        if (memcmp(s_paired[i].bda, bda, ESP_BD_ADDR_LEN) == 0) { idx = i; break; }
+    }
+    if (idx >= 0) {
+        for (int i = idx; i < s_paired_count - 1; i++) s_paired[i] = s_paired[i + 1];
+        s_paired_count--;
+    }
+    if (s_paired_count >= MAX_BT_DEVICES) s_paired_count = MAX_BT_DEVICES - 1;
+    for (int i = s_paired_count; i > 0; i--) s_paired[i] = s_paired[i - 1];
+    s_paired_count++;
+    memcpy(s_paired[0].bda, bda, ESP_BD_ADDR_LEN);
+    s_paired[0].addr_type = addr_type;
+    if (name && name[0]) {
+        snprintf(s_paired[0].name, sizeof(s_paired[0].name), "%.31s", name);
+    } else {
+        snprintf(s_paired[0].name, sizeof(s_paired[0].name), "BLE-%02x%02x%02x", bda[3], bda[4], bda[5]);
+    }
     mkdir("/sdcard/settings", 0777);
     FILE *f = fopen("/sdcard/settings/bt_paired", "w");
     if (!f) {
-        ESP_LOGE(TAG, "Failed to save paired device (no SD card?)");
+        ESP_LOGE(TAG, "Failed to save paired devices (no SD card?)");
         return;
     }
-    fprintf(f, "%s\n%d\n%s\n", hex, (int)addr_type, name ? name : "");
+    for (int i = 0; i < s_paired_count; i++) {
+        fprintf(f, "%02x%02x%02x%02x%02x%02x\n%d\n%s\n",
+                s_paired[i].bda[0], s_paired[i].bda[1], s_paired[i].bda[2],
+                s_paired[i].bda[3], s_paired[i].bda[4], s_paired[i].bda[5],
+                (int)s_paired[i].addr_type, s_paired[i].name);
+    }
     fclose(f);
-    ESP_LOGI(TAG, "Saved paired device %s (%s)", hex, name ? name : "?");
+    ESP_LOGI(TAG, "Saved %d paired device(s), first %s", s_paired_count, s_paired[0].name);
 }
 
-bool BtKeyboard::loadPairedDevice(uint8_t *bda, esp_ble_addr_type_t &addr_type) {
+void BtKeyboard::loadPairedDevices() {
+    s_paired_count = 0;
     FILE *f = fopen("/sdcard/settings/bt_paired", "r");
-    if (!f) {
-        ESP_LOGW(TAG, "No saved device file at /sdcard/settings/bt_paired");
-        return false;
-    }
-    char hex[16] = {0};
-    int at = 0;
-    if (fscanf(f, "%15s\n%d", hex, &at) < 2 || strlen(hex) != 12) {
-        ESP_LOGW(TAG, "Invalid saved device file (hex='%s', at=%d)", hex, at);
-        fclose(f);
-        return false;
+    if (!f) return;
+    char line[64];
+    while (s_paired_count < MAX_BT_DEVICES) {
+        if (!fgets(line, sizeof(line), f)) break;
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (strlen(line) != 12) continue;  // skip invalid line
+        char hex[13];
+        strncpy(hex, line, 12); hex[12] = '\0';
+        int at = 0;
+        if (!fgets(line, sizeof(line), f)) break;
+        at = atoi(line);
+        char name[32] = "";
+        if (fgets(line, sizeof(line), f)) {
+            nl = strchr(line, '\n');
+            if (nl) *nl = '\0';
+            snprintf(name, sizeof(name), "%.31s", line);
+        }
+        for (int i = 0; i < 6; i++) {
+            unsigned int byte;
+            sscanf(hex + i * 2, "%02x", &byte);
+            s_paired[s_paired_count].bda[i] = (uint8_t)byte;
+        }
+        s_paired[s_paired_count].addr_type = (esp_ble_addr_type_t)at;
+        if (!name[0]) {
+            snprintf(name, sizeof(name), "BLE-%02x%02x%02x",
+                     s_paired[s_paired_count].bda[3],
+                     s_paired[s_paired_count].bda[4],
+                     s_paired[s_paired_count].bda[5]);
+        }
+        snprintf(s_paired[s_paired_count].name, sizeof(s_paired[s_paired_count].name), "%s", name);
+        s_paired_count++;
     }
     fclose(f);
-    for (int i = 0; i < 6; i++) {
-        unsigned int byte;
-        sscanf(hex + i * 2, "%02x", &byte);
-        bda[i] = (uint8_t)byte;
-    }
-    addr_type = (esp_ble_addr_type_t)at;
-    ESP_LOGI(TAG, "Loaded saved device %s", hex);
-    return true;
+    ESP_LOGI(TAG, "Loaded %d paired device(s)", s_paired_count);
 }
 
-void BtKeyboard::clearPairedDevice() {
-    remove("/sdcard/settings/bt_paired");
-    ESP_LOGI(TAG, "Cleared saved paired device file");
+bool BtKeyboard::removePairedDevice(const uint8_t *bda) {
+    for (int i = 0; i < s_paired_count; i++) {
+        if (memcmp(s_paired[i].bda, bda, ESP_BD_ADDR_LEN) == 0) {
+            for (int j = i; j < s_paired_count - 1; j++) s_paired[j] = s_paired[j + 1];
+            s_paired_count--;
+            FILE *f = fopen("/sdcard/settings/bt_paired", "w");
+            if (!f) { ESP_LOGE(TAG, "Failed to save paired devices"); return true; }
+            for (int k = 0; k < s_paired_count; k++) {
+                fprintf(f, "%02x%02x%02x%02x%02x%02x\n%d\n%s\n",
+                        s_paired[k].bda[0], s_paired[k].bda[1], s_paired[k].bda[2],
+                        s_paired[k].bda[3], s_paired[k].bda[4], s_paired[k].bda[5],
+                        (int)s_paired[k].addr_type, s_paired[k].name);
+            }
+            fclose(f);
+            ESP_LOGI(TAG, "Removed paired device, %d remaining", s_paired_count);
+            return true;
+        }
+    }
+    return false;
+}
+
+int BtKeyboard::pairedDeviceCount() {
+    return s_paired_count;
+}
+
+const BtPairedDevice* BtKeyboard::getPairedDevice(int idx) {
+    if (idx < 0 || idx >= s_paired_count) return nullptr;
+    return &s_paired[idx];
+}
+
+int BtKeyboard::connectedPairedIndex() {
+    if (!s_connected || !s_dev) return -1;
+    const uint8_t *bda = esp_hidh_dev_bda_get(s_dev);
+    if (!bda) return -1;
+    for (int i = 0; i < s_paired_count; i++) {
+        if (memcmp(s_paired[i].bda, bda, ESP_BD_ADDR_LEN) == 0) return i;
+    }
+    return -1;
 }
 
 bool BtKeyboard::isConnected() const {

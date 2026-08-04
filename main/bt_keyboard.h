@@ -19,6 +19,12 @@ struct BtDeviceInfo {
     int rssi;
 };
 
+struct BtPairedDevice {
+    esp_bd_addr_t bda;
+    esp_ble_addr_type_t addr_type;
+    char name[32];
+};
+
 class BtKeyboard {
 public:
     BtKeyboard() = default;
@@ -39,10 +45,13 @@ public:
     esp_err_t connectDevice(int idx);
     void disconnect();
 
-    // Persistent pairing: save/load device on SD card for auto-reconnect
+    // Persistent pairing: save/load devices on SD card for auto-reconnect
     void savePairedDevice(const uint8_t *bda, esp_ble_addr_type_t addr_type, const char *name);
-    bool loadPairedDevice(uint8_t *bda, esp_ble_addr_type_t &addr_type);
-    void clearPairedDevice();
+    void loadPairedDevices();
+    bool removePairedDevice(const uint8_t *bda);
+    int pairedDeviceCount();
+    const BtPairedDevice* getPairedDevice(int idx);
+    int connectedPairedIndex();  // paired-list index of connected device, -1 if none
     esp_err_t connectBDA(const uint8_t *bda, esp_ble_addr_type_t addr_type);
 
     // Keyboard input

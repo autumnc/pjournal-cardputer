@@ -54,6 +54,7 @@ static struct {
 
     // editor return handling
     std::string pendingInspirationId;
+    bool preservePos = false;  // 发送到Flomo返回后保留列表位置
 } g;
 
 static void loadData() {
@@ -164,10 +165,10 @@ static void drawList() {
 
     if (g.itemCount == 0) ui_draw_text(8, y, "暂无灵感 — 按a添加");
 
-    // Status bar: ?:帮助 /:检索 | keywords
+    // Status bar: ?:帮助 | keywords (快捷键详见帮助面板)
     {
         char sl[128];
-        int n = snprintf(sl, sizeof(sl), "?:帮助 /:检索");
+        int n = snprintf(sl, sizeof(sl), "?:帮助");
         if (g.itemCount > 0 && g.sel >= 0 && g.sel < (int)g.itemCount) {
             std::string kw = (*g.items)[g.sel]["keywords"].asString();
             if (!kw.empty()) n += snprintf(sl + n, sizeof(sl) - n, " | %s", kw.c_str());
@@ -379,6 +380,7 @@ static const char *HELP_LINES[] = {
     "k     编辑关键词",
     "/     检索灵感",
     "c     复制到剪贴板",
+    "f     发送到Flomo(#灵感)",
     "q/Esc 返回",
     "",
     "── 通用 ──",
@@ -441,9 +443,12 @@ void screen_inspiration_init(AppState returnTo) {
         return; // preserve sel/scroll
     }
 
-    // Fresh init — reset navigation
-    g.sel = 0;
-    g.scroll = 0;
+    // Fresh init — reset navigation (skip if returning from Flomo send)
+    if (!g.preservePos) {
+        g.sel = 0;
+        g.scroll = 0;
+    }
+    g.preservePos = false;
 }
 
 AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
@@ -617,6 +622,22 @@ AppState screen_inspiration_handle(int key, ScreenContext &ctx) {
         g_clipboard = (*g.items)[g.sel]["content"].asString();
         ctx.statusMessage = "已复制到剪贴板";
         ctx.statusDuration = 30;
+    } else if ((key == 'f' || key == 'F') && g.sel >= 0 && g.sel < (int)g.itemCount) {
+        // Send selected inspiration to Flomo with #灵感 tag
+        std::string text = (*g.items)[g.sel]["content"].asString();
+        while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' '))
+            text.pop_back();
+        if (text.empty()) {
+            ctx.statusMessage = "内容为空";
+            ctx.statusDuration = 30;
+        } else {
+            text += " #灵感";
+            g_flomoPendingText = text;
+            g_flomoReturnTo = APP_INSPIRATION;
+            g.preservePos = true;
+            ctx.nextState = APP_SYNC_SEND_FLOMO;
+            return APP_SYNC_SEND_FLOMO;
+        }
     } else if (key == '/') {
         g.searchBuf.clear(); g.searchCur = 0;
         g.searchResults.clear();
