@@ -455,7 +455,10 @@ extern "C" void app_main() {
         // 单击动作在双击窗口结束后才生效(防止双击第一下误发导航键,仅蓝牙管理面板有双击动作)
         if (s_pending_single.key != 0) {
             if (esp_timer_get_time() - s_pending_single.queued_us >= BTN_DOUBLE_WINDOW_US) {
-                if (currentState == APP_BT_MANAGE) key = s_pending_single.key;
+                if (currentState == APP_BT_MANAGE ||
+                    (currentState == APP_GTD && screen_gtd_accept_physical_buttons())) {
+                    key = s_pending_single.key;
+                }
                 s_pending_single.key = 0;
             }
         }
@@ -479,6 +482,9 @@ extern "C" void app_main() {
                     if (currentState == APP_BT_MANAGE) {
                         // 蓝牙管理面板: 长按→连接选中设备(不经过短按,避免错位)
                         key = 0x0A;
+                    } else if (currentState == APP_GTD && screen_gtd_accept_physical_buttons()) {
+                        // GTD任务管理: 长按→Tab 切换标签
+                        key = '\t';
                     } else {
                         currentState = APP_BT_MANAGE;
                         key = 0;
@@ -490,11 +496,20 @@ extern "C" void app_main() {
                     int64_t dur = now - btn_user.press_start_us;
                     btn_user.press_start_us = 0;
                     if (dur >= BTN_DEBOUNCE_US && !btn_user.long_fired) {
+                        bool gtdBrowse = (currentState == APP_GTD && screen_gtd_accept_physical_buttons());
+                        bool gtdProjList = (currentState == APP_GTD && screen_gtd_in_project_list());
                         if (currentState == APP_BT_MANAGE && btn_user.is_double) {
                             // 双击: 管理模式→添加, 扫描模式→返回
                             key = screen_bt_manage_scan_mode() ? 0x1B : 'a';
                         } else if (currentState == APP_BT_MANAGE) {
                             // 单击: 上移,等待双击窗口确认非双击后生效
+                            s_pending_single.key = KEY_UP;
+                            s_pending_single.queued_us = now;
+                        } else if (gtdBrowse && btn_user.is_double) {
+                            // GTD任务管理双击: 项目列表→进入选中项目; 平铺/项目树→切换任务状态
+                            key = gtdProjList ? 0x0A : ' ';
+                        } else if (gtdBrowse) {
+                            // GTD任务管理单击: 上移,等待双击窗口确认非双击后生效
                             s_pending_single.key = KEY_UP;
                             s_pending_single.queued_us = now;
                         }
@@ -524,8 +539,12 @@ extern "C" void app_main() {
                         btn_boot.long_fired = true;
                         s_pending_single.key = 0;
                         key = 0x1B;
+                    } else if (currentState == APP_GTD && screen_gtd_accept_physical_buttons()) {
+                        // GTD任务管理: BOOT 长按不动作,避免面板内误触发休眠
+                        btn_boot.long_fired = true;
+                        s_pending_single.key = 0;
                     }
-                    // 其他界面 BOOT 长按与单击同义,松开时统一进入休眠
+                    // 其他界面: 长按 BOOT 在松开时进入休眠(单击不再休眠)
                 }
             } else {
                 // 唤醒按键可能已在扫描间隙松开,直接清除挂起的唤醒保护标记
@@ -546,11 +565,20 @@ extern "C" void app_main() {
                                 s_pending_single.key = KEY_DOWN;
                                 s_pending_single.queued_us = now;
                             }
+                        } else if (currentState == APP_GTD && screen_gtd_accept_physical_buttons()) {
+                            if (btn_boot.is_double) {
+                                // GTD任务管理双击: 项目树→返回项目选择菜单; 其他→无动作
+                                screen_gtd_physical_double_boot();
+                            } else {
+                                // GTD任务管理单击: 下移(不触发休眠)
+                                s_pending_single.key = KEY_DOWN;
+                                s_pending_single.queued_us = now;
+                            }
                         } else if (s_boot_wake_release_pending) {
                             // 这是 BOOT 唤醒按键的释放,不进入休眠,避免唤醒即再睡
                             s_boot_wake_release_pending = false;
-                        } else {
-                            // 除蓝牙管理外,单击 BOOT → 进入休眠(任一实体按键可唤醒)
+                        } else if (dur >= BTN_LONG_PRESS_US) {
+                            // 长按 BOOT → 进入休眠(单击不再休眠)
                             enterLightSleep();
                             key = 0;  // 丢弃休眠前遗留的按键
                             s_last_activity_us = esp_timer_get_time();

@@ -237,6 +237,16 @@ static struct {
 
     int confirmIdx = -1;
 
+    std::vector<int> confirmIdxs;  // 批量删除确认的任务下标(M_CONFIRM 用)
+
+
+
+    // multi-select (Shift+↑↓ 连续多选)
+
+    std::set<std::string> multiSel;  // 选中的任务 id 集合
+
+    int multiAnchor = -1;            // 选择锚点(g.filtered 显示下标), -1=未激活
+
 
 
     // project rename target
@@ -272,6 +282,27 @@ static struct {
     std::string archiveViewMonth;  // currently viewed month
 
 } g;
+
+// 仅列表浏览模式启用物理按键导航快捷键,避免与文本输入冲突
+bool screen_gtd_accept_physical_buttons() { return g.mode == M_BROWSE; }
+
+// 项目标签顶层(项目选择列表)
+bool screen_gtd_in_project_list() {
+    return g.mode == M_BROWSE && g.view == V_PROJECT && g.projectDrillIdx < 0;
+}
+
+// GTD 状态栏右侧: |当前日期(月-日)|电池电量 (日期左边始终有分隔符)
+static void gtdStatusRight(char *buf, size_t sz) {
+    time_t now; time(&now);
+    struct tm *tm = localtime(&now);
+    char date[8];
+    strftime(date, sizeof(date), "%m-%d", tm);
+    int bpct = battery_pct();
+    if (bpct >= 0)
+        snprintf(buf, sz, "|%s|%d%%", date, bpct);
+    else
+        snprintf(buf, sz, "|%s", date);
+}
 
 
 
@@ -536,7 +567,33 @@ static bool taskMatchesView(const JsonValue &task, int view) {
 
 static bool isInProjectList() { return g.view == V_PROJECT && g.projectDrillIdx < 0; }
 
+// ── Multi-select (Shift+↑↓) ────────────────────────────────────────────
+static bool hasMultiSel() { return !g.multiSel.empty(); }
 
+static void clearMultiSel() {
+    g.multiSel.clear();
+    g.multiAnchor = -1;
+}
+
+// 由锚点..光标的连续区间从 g.filtered 重建选中任务 id 集合
+static void rebuildMultiSel() {
+    g.multiSel.clear();
+    if (g.multiAnchor < 0) return;
+    int a = std::min(g.multiAnchor, g.sel);
+    int b = std::max(g.multiAnchor, g.sel);
+    auto &tasks = g.data["tasks"];
+    for (int i = a; i <= b && i < (int)g.filtered.size(); i++) {
+        g.multiSel.insert(tasks[g.filtered[i]]["id"].asString());
+    }
+}
+
+// displayIdx 位置的条目是否处于多选中
+static bool isMultiSelected(int displayIdx) {
+    if (g.multiSel.empty()) return false;
+    auto &tasks = g.data["tasks"];
+    if (displayIdx < 0 || displayIdx >= (int)g.filtered.size()) return false;
+    return g.multiSel.count(tasks[g.filtered[displayIdx]]["id"].asString()) > 0;
+}
 
 static void rebuildFilter() {
 
@@ -708,6 +765,19 @@ static void buildProjectList() {
 
     std::sort(g.projectList.begin(), g.projectList.end());
 
+}
+
+// 物理按键双击 BOOT: 项目树内返回项目选择菜单; 其他视图无动作
+void screen_gtd_physical_double_boot() {
+    if (g.mode != M_BROWSE) return;
+    if (g.view == V_PROJECT && g.projectDrillIdx >= 0) {
+        g.projectDrillIdx = -1;
+        g.sel = 0; g.scroll = 0;
+        g.foldedNodes.clear();
+        clearMultiSel();
+        buildProjectList();
+        rebuildFilter();
+    }
 }
 
 
@@ -1291,7 +1361,9 @@ static void drawArchiveMgr() {
             ui_draw_text(8, y + i * LINE_SPACING, buf, sel);
         }
 
-        ui_draw_status("?:帮助 | Enter展开 d:删除 Esc返回", "");
+        char rbuf[24]; gtdStatusRight(rbuf, sizeof(rbuf));
+
+        ui_draw_status("?:帮助|Enter展开 d:删除 Esc返回", rbuf);
     } else {
         // Task list for selected month
         char title[48];
@@ -1319,8 +1391,9 @@ static void drawArchiveMgr() {
         if (g.archiveTasks.empty()) ui_draw_text(8, y, "(空)");
 
         char sl[48];
-        snprintf(sl, sizeof(sl), "?:帮助 | %d项 Esc返回", (int)g.archiveTasks.size());
-        ui_draw_status(sl, "");
+        snprintf(sl, sizeof(sl), "?:帮助|%d项 Esc返回", (int)g.archiveTasks.size());
+        char rbuf[24]; gtdStatusRight(rbuf, sizeof(rbuf));
+        ui_draw_status(sl, rbuf);
     }
 
     drawIMEStatus(); ui_commit();
@@ -1373,8 +1446,9 @@ static void drawList() {
         }
 
         char sl[32];
-        snprintf(sl, sizeof(sl), "?:帮助 | %d个项目", (int)g.projectList.size());
-        ui_draw_status(sl, "");
+        snprintf(sl, sizeof(sl), "?:帮助|%d个项目", (int)g.projectList.size());
+        char rbuf[24]; gtdStatusRight(rbuf, sizeof(rbuf));
+        ui_draw_status(sl, rbuf);
 
         drawIMEStatus();
 
@@ -1396,7 +1470,9 @@ static void drawList() {
 
             snprintf(sl, sizeof(sl), "a:添加 Tab:切换");
 
-            ui_draw_status(sl, "");
+            char rbuf[24]; gtdStatusRight(rbuf, sizeof(rbuf));
+
+            ui_draw_status(sl, rbuf);
 
             drawIMEStatus();
 
@@ -1546,11 +1622,12 @@ static void drawList() {
             }
             while (!parts.empty() && parts.back() == ' ') parts.pop_back();
             if (!parts.empty())
-                snprintf(statusLine, sizeof(statusLine), "?:帮助 | %s", parts.c_str());
+                snprintf(statusLine, sizeof(statusLine), "?:帮助|%s", parts.c_str());
         }
         if (statusLine[0] == '\0')
             snprintf(statusLine, sizeof(statusLine), "?:帮助");
-        ui_draw_status(statusLine, "");
+        char rbuf[24]; gtdStatusRight(rbuf, sizeof(rbuf));
+        ui_draw_status(statusLine, rbuf);
 
         drawIMEStatus();
 
@@ -1584,6 +1661,8 @@ static void drawList() {
 
         bool sel = (g.scroll + i == g.sel);
 
+        bool msel = (!sel && isMultiSelected(g.scroll + i));
+
         std::string title = t["title"].asString();
 
         std::string status = t["status"].asString("todo");
@@ -1596,7 +1675,7 @@ static void drawList() {
 
         char line[160];
 
-        snprintf(line, sizeof(line), "%s %s", statusIcon(status), title.c_str());
+        snprintf(line, sizeof(line), "%s%s %s", msel ? "✓ " : "", statusIcon(status), title.c_str());
 
 
 
@@ -1723,11 +1802,16 @@ static void drawList() {
         }
         while (!parts.empty() && parts.back() == ' ') parts.pop_back();
         if (!parts.empty())
-            snprintf(statusLine, sizeof(statusLine), "?:帮助 | %s", parts.c_str());
+            snprintf(statusLine, sizeof(statusLine), "?:帮助|%s", parts.c_str());
+    }
+    if (hasMultiSel()) {
+        // 多选时状态栏显示选中数量(替换任务详情信息)
+        snprintf(statusLine, sizeof(statusLine), "已选%d项|?:帮助", (int)g.multiSel.size());
     }
     if (statusLine[0] == '\0')
         snprintf(statusLine, sizeof(statusLine), "?:帮助");
-    ui_draw_status(statusLine, "");
+    char rbuf[24]; gtdStatusRight(rbuf, sizeof(rbuf));
+    ui_draw_status(statusLine, rbuf);
 
 
 
@@ -1935,6 +2019,14 @@ static const char *HELP_LINES[] = {
 
     "── 列表视图 ──",
 
+    "USER键  上选(双击切换状态)",
+
+    "BOOT键  下选",
+
+    "USER长按 切换标签",
+
+    "",
+
     "↓     下移",
 
     "↑     上移",
@@ -1963,7 +2055,9 @@ static const char *HELP_LINES[] = {
 
     "Space 切换状态",
 
-    "d     删除",
+    "Shift+↑↓ 多选",
+
+    "d     删除(批量)",
 
     "Tab   切换标签",
 
@@ -3343,7 +3437,7 @@ static void drawDetail() {
 
         else
 
-            ui_draw_status("Enter编辑 ↑↓选择 ESC返回 ?", "帮助");
+            ui_draw_status("Enter编辑 ↑↓选择 ESC返回 ?:帮助", "");
 
     }
 
@@ -3382,6 +3476,12 @@ void screen_gtd_init() {
     g.projectDrillIdx = -1;
 
     g.insertAfter = -1;
+
+    g.confirmIdx = -1;
+
+    g.confirmIdxs.clear();
+
+    clearMultiSel();
 
     g_ime.setActive(false);
 
@@ -3685,11 +3785,26 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
         if (key == 0x0A || key == 0x0D) {
 
-            int idx = g.confirmIdx;
+            if (!g.confirmIdxs.empty()) {
 
-            if (idx >= 0 && idx < (int)tasks.size()) {
+                // 批量删除: 升序后从高下标往低擦除,避免下标漂移
+                std::sort(g.confirmIdxs.begin(), g.confirmIdxs.end());
+                for (int n = (int)g.confirmIdxs.size() - 1; n >= 0; n--) {
+                    int idx = g.confirmIdxs[n];
+                    if (idx >= 0 && idx < (int)tasks.size())
+                        tasks.elements.erase(tasks.elements.begin() + idx);
+                }
+                saveData();
+                rebuildFilter();
+                clearMultiSel();
+                if (g.sel >= (int)g.filtered.size()) g.sel = (int)g.filtered.size() - 1;
+                if (g.sel < 0) g.sel = 0;
+                ctx.statusMessage = "已删除";
+                g.confirmIdxs.clear();
 
-                tasks.elements.erase(tasks.elements.begin() + idx);
+            } else if (g.confirmIdx >= 0 && g.confirmIdx < (int)tasks.size()) {
+
+                tasks.elements.erase(tasks.elements.begin() + g.confirmIdx);
 
                 saveData();
 
@@ -3699,9 +3814,16 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
             }
 
+            g.confirmIdx = -1;
+
             g.mode = M_BROWSE;
 
         } else if (key == 0x1B) {
+
+            // 取消: 清确认列表但保留多选, 允许反悔后继续操作
+            g.confirmIdxs.clear();
+
+            g.confirmIdx = -1;
 
             g.mode = M_BROWSE;
 
@@ -4543,7 +4665,8 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
             snprintf(sl, sizeof(sl), "a:添加 d:删除 r:重命名 Enter/Space:筛选 Esc:返回 %d项", (int)list.size());
 
-        ui_draw_status(sl, "");
+        char rbuf[24]; gtdStatusRight(rbuf, sizeof(rbuf));
+        ui_draw_status(sl, rbuf);
 
         drawIMEStatus(); ui_commit();
 
@@ -5040,6 +5163,11 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
     // ── M_BROWSE: main list view ─────────────────────────────────────
 
+    // 任何非 Shift 多选/删除/空闲按键都清除多选状态
+    if (key != 0 && key != KEY_SHIFT_UP && key != KEY_SHIFT_DOWN && key != 'd' && key != 'D') {
+        clearMultiSel();
+    }
+
     // Project list management (only in project list view)
 
     if (isInProjectList()) {
@@ -5171,6 +5299,31 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
     if (key == KEY_DOWN) {
 
         if (g.sel < (int)g.filtered.size() - 1) g.sel++;
+
+    }
+
+    // Shift+↑/↓ 连续多选(仅平铺列表; 项目列表/项目树显示顺序与 filtered 不一致)
+    if (g.view != V_PROJECT) {
+
+        if (key == KEY_SHIFT_UP) {
+
+            if (g.multiAnchor < 0) g.multiAnchor = g.sel;
+
+            if (g.sel > 0) g.sel--;
+
+            rebuildMultiSel();
+
+        }
+
+        if (key == KEY_SHIFT_DOWN) {
+
+            if (g.multiAnchor < 0) g.multiAnchor = g.sel;
+
+            if (g.sel < (int)g.filtered.size() - 1) g.sel++;
+
+            rebuildMultiSel();
+
+        }
 
     }
 
@@ -5522,13 +5675,30 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
     if ((key == 'd' || key == 'D') && g.sel < (int)g.filtered.size()) {
 
-        int idx = g.filtered[g.sel];
+        if (g.view != V_PROJECT && hasMultiSel()) {
 
-        g.confirmIdx = idx;
+            // 批量删除: 收集选中 id 对应的任务下标
+            std::vector<int> idxs;
+            for (int i = 0; i < (int)tasks.size(); i++) {
+                if (g.multiSel.count(tasks[i]["id"].asString()) > 0) idxs.push_back(i);
+            }
+            if (!idxs.empty()) {
+                g.confirmIdxs = idxs;
+                g.confirmMsg = "删除所选 " + std::to_string((int)idxs.size()) + " 个任务?";
+                g.mode = M_CONFIRM;
+            }
 
-        g.confirmMsg = std::string("删除任务「") + tasks[idx]["title"].asString() + "」?";
+        } else {
 
-        g.mode = M_CONFIRM;
+            int idx = g.filtered[g.sel];
+
+            g.confirmIdx = idx;
+
+            g.confirmMsg = std::string("删除任务「") + tasks[idx]["title"].asString() + "」?";
+
+            g.mode = M_CONFIRM;
+
+        }
 
     }
 
