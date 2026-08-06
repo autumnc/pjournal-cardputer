@@ -85,6 +85,14 @@ static int64_t s_key_press_time[MAX_KEYS] = {0};
 static int64_t s_last_repeat_time[MAX_KEYS] = {0};
 static esp_ble_addr_type_t s_paired_addr_type = BLE_ADDR_TYPE_RANDOM;
 
+// 连接在后台任务里执行: esp_hidh_dev_open 是同步阻塞的(连接失败要等链路层
+// 超时 ~30s),不能放在主循环里,否则 UI 会卡死。s_connect_task 非空表示任务存活。
+static TaskHandle_t s_connect_task = nullptr;
+static struct {
+    uint8_t bda[ESP_BD_ADDR_LEN];
+    esp_ble_addr_type_t addr_type;
+} s_connect_req;
+
 // Device list collected during scan
 static BtDeviceInfo s_found_devices[MAX_BT_DEVICES];
 static int s_found_count = 0;
@@ -454,6 +462,46 @@ static void scan_task(void *arg) {
     vTaskDelete(NULL);
 }
 
+// 后台执行实际连接。esp_hidh_dev_open 同步阻塞: 成功时返回 dev,随后由异步的
+// ESP_HIDH_OPEN_EVENT 复位 s_connecting;失败时返回 NULL 且不发任何事件,
+// 必须在这里复位 s_connecting,否则重连逻辑会永远被 isConnecting() 卡住。
+static void connect_task(void *arg) {
+    if (s_scanning) {
+        s_scanning = false;
+        esp_ble_gap_stop_ext_scan();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    char hex[13];
+    snprintf(hex, sizeof(hex), "%02x%02x%02x%02x%02x%02x",
+             s_connect_req.bda[0], s_connect_req.bda[1], s_connect_req.bda[2],
+             s_connect_req.bda[3], s_connect_req.bda[4], s_connect_req.bda[5]);
+    ESP_LOGI(TAG, "Connecting to %s...", hex);
+
+    esp_hidh_dev_t *dev = esp_hidh_dev_open(s_connect_req.bda, ESP_HID_TRANSPORT_BLE,
+                                            s_connect_req.addr_type);
+    if (dev == nullptr) {
+        s_connecting = false;
+        ESP_LOGE(TAG, "HID open failed for %s", hex);
+    }
+    s_connect_task = nullptr;
+    vTaskDelete(NULL);
+}
+
+// 记录连接请求并启动后台连接任务。s_connected/s_connecting 门控避免重复发起,
+// 连接中状态下后续请求直接跳过。
+static void requestConnect(const uint8_t *bda, esp_ble_addr_type_t addr_type) {
+    if (s_connected || s_connecting) {
+        ESP_LOGI(TAG, "Already connected or connecting, skip connect request");
+        return;
+    }
+    memcpy(s_connect_req.bda, bda, ESP_BD_ADDR_LEN);
+    s_connect_req.addr_type = addr_type;
+    s_connecting = true;
+    s_connect_task = nullptr;
+    xTaskCreate(connect_task, "bt_conn", 4096, NULL, 3, &s_connect_task);
+}
+
 BtKeyboard& BtKeyboard::getInstance() {
     static BtKeyboard inst;
     s_self = &inst;
@@ -521,6 +569,7 @@ esp_err_t BtKeyboard::init() {
 
 void BtKeyboard::deinit() {
     s_connecting = false;
+    s_connect_task = nullptr;
     if (s_dev) {
         esp_hidh_dev_close(s_dev);
         // esp_hidh_deinit 要求所有设备已关闭,而 close 是异步的
@@ -587,15 +636,6 @@ esp_err_t BtKeyboard::connectDevice(int idx) {
     }
     s_connected = false;
     connected_ = false;
-    s_connecting = true;  // 标记正在连接
-
-    // Stop scan before connecting to avoid HCI command disallowed error
-    if (s_scanning) {
-        ESP_LOGI(TAG, "Stopping scan before connect...");
-        s_scanning = false;
-        esp_ble_gap_stop_ext_scan();
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
 
     auto &d = s_found_devices[idx];
     ESP_LOGI(TAG, "Connecting to %s...", d.name);
@@ -605,7 +645,7 @@ esp_err_t BtKeyboard::connectDevice(int idx) {
     // encounters issues after BLE pairing succeeds
     savePairedDevice(d.bda, d.addr_type, d.name);
 
-    esp_hidh_dev_open(d.bda, ESP_HID_TRANSPORT_BLE, d.addr_type);
+    requestConnect(d.bda, d.addr_type);
     return ESP_OK;
 }
 
@@ -821,34 +861,18 @@ void BtKeyboard::setConnected(bool c) {
 esp_err_t BtKeyboard::connectBDA(const uint8_t *bda, esp_ble_addr_type_t addr_type) {
     if (!s_init_done) return ESP_FAIL;  // BLE stack not initialized yet
 
-    // 如果已连接或正在连接，不要重复发起连接
-    if (s_connected || s_connecting) {
-        ESP_LOGI(TAG, "Already connected or connecting, skip connect request");
-        return ESP_OK;
-    }
-
     if (s_dev) {
         esp_hidh_dev_close(s_dev);
         s_dev = nullptr;
     }
     s_connected = false;
     connected_ = false;
-    s_connecting = true;  // 标记正在连接
-
-    // Stop scan if running
-    if (s_scanning) {
-        s_scanning = false;
-        esp_ble_gap_stop_ext_scan();
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
 
     s_paired_addr_type = addr_type;
     char hex[13];
     snprintf(hex, sizeof(hex), "%02x%02x%02x%02x%02x%02x",
              bda[0], bda[1], bda[2], bda[3], bda[4], bda[5]);
     ESP_LOGI(TAG, "Auto-connecting to saved device %s...", hex);
-    esp_bd_addr_t bda_copy;
-    memcpy(bda_copy, bda, ESP_BD_ADDR_LEN);
-    esp_hidh_dev_open(bda_copy, ESP_HID_TRANSPORT_BLE, addr_type);
+    requestConnect(bda, addr_type);
     return ESP_OK;
 }
