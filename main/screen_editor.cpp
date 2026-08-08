@@ -310,7 +310,6 @@ static void drawEditor() {
     int wc = getWordCount();
     char left[48];
     snprintf(left, sizeof(left), "%s", mode);
-    int bpct = battery_pct();
     std::string imeLabel;
     if (!g_editor.imeActive) imeLabel = "EN";
     else if (g_ime.english()) imeLabel = "[英]";
@@ -319,13 +318,11 @@ static void drawEditor() {
         imeLabel += g_ime.fullwidth() ? "\xe2\x97\x8f" : "\xe2\x97\x90"; // ● or ◐
         imeLabel += g_ime.trad() ? "繁" : "简";
     }
-    char right[64];
-    if (bpct >= 0)
-        snprintf(right, sizeof(right), "%d字 %d%% %s", wc, bpct, imeLabel.c_str());
-    else
-        snprintf(right, sizeof(right), "%d字 -- %s", wc, imeLabel.c_str());
+    std::string right = std::to_string(wc) + "字 " + imeLabel;
+    std::string bt = battery_status_text();
+    if (!bt.empty()) right += " " + bt;
 
-    ui_draw_status(left, right);
+    ui_draw_status(left, right.c_str());
 }
 
 static void drawConfirmDialog() {

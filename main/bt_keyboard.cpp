@@ -79,6 +79,7 @@ static bool s_init_done = false;   // set once esp_hidh init completes
 static bool s_scanning = false;
 static bool s_connecting = false;  // 新增：标记正在连接中
 static bool s_shift_tap_armed = false;  // 左Shift 单击检测武装标记
+static int s_kb_battery = -1;           // 键盘电池电量 %，-1=未知/未连接
 static uint8_t s_last_keys[MAX_KEYS] = {0};
 static uint8_t s_last_mod = 0;
 static int64_t s_key_press_time[MAX_KEYS] = {0};
@@ -197,6 +198,7 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
         s_dev = nullptr;
         s_connected = false;
         s_connecting = false;  // 连接断开
+        s_kb_battery = -1;     // 键盘电量失效
         memset(s_last_keys, 0, MAX_KEYS);
         memset(s_key_press_time, 0, MAX_KEYS * sizeof(int64_t));
         memset(s_last_repeat_time, 0, MAX_KEYS * sizeof(int64_t));
@@ -317,6 +319,10 @@ static void hidh_cb(void *handler_args, esp_event_base_t base, int32_t id, void 
         s_last_mod = mod;
         break;
     }
+    case ESP_HIDH_BATTERY_EVENT:
+        s_kb_battery = param->battery.level;
+        ESP_LOGI(TAG, "Keyboard battery: %d%%", s_kb_battery);
+        break;
     default:
         break;
     }
@@ -596,6 +602,7 @@ void BtKeyboard::scanDevices() {
     }
     s_connected = false;
     connected_ = false;
+    s_kb_battery = -1;  // 键盘电量失效
     memset(s_last_keys, 0, MAX_KEYS);
     // Clear device list
     if (s_devices_mutex) xSemaphoreTake(s_devices_mutex, portMAX_DELAY);
@@ -636,6 +643,7 @@ esp_err_t BtKeyboard::connectDevice(int idx) {
     }
     s_connected = false;
     connected_ = false;
+    s_kb_battery = -1;  // 键盘电量失效
 
     auto &d = s_found_devices[idx];
     ESP_LOGI(TAG, "Connecting to %s...", d.name);
@@ -657,8 +665,13 @@ void BtKeyboard::disconnect() {
     }
     s_connected = false;
     connected_ = false;
+    s_kb_battery = -1;  // 键盘电量失效
     memset(s_last_keys, 0, MAX_KEYS);
     if (s_queue) xQueueReset(s_queue);
+}
+
+int BtKeyboard::keyboardBatteryPct() {
+    return s_kb_battery;
 }
 
 uint8_t BtKeyboard::readKey() {

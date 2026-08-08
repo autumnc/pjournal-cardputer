@@ -87,11 +87,10 @@ AppState screen_main_handle(int key, ScreenContext &ctx) {
     ui_draw_text_centered(y, "[o] 大纲写作"); y += FONT_H;
     ui_draw_text_centered(y, "[s] 设置"); y += FONT_H;
 
-    int bpct = battery_pct();
-    if (bpct >= 0) {
-        char pctStr[16]; snprintf(pctStr, sizeof(pctStr), "%d%%", bpct);
-        int pw = g_font.textWidth(pctStr);
-        g_font.drawText(SCREEN_W - pw - 4, STATUS_Y + g_font.ascent(), pctStr, false);
+    std::string batteryGroup = battery_status_text();
+    if (!batteryGroup.empty()) {
+        int pw = g_font.textWidth(batteryGroup.c_str());
+        g_font.drawText(SCREEN_W - pw - 4, STATUS_Y + g_font.ascent(), batteryGroup.c_str(), false);
     }
     ui_commit();
 

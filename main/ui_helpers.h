@@ -42,6 +42,10 @@ void ui_show_message_centered(const char *msg);
 // Battery ADC
 void battery_init();
 int battery_pct();
+// 设备电池文本:"[电池图标] 电量";电量未知时返回空串
+std::string battery_text();
+// 设备电量 + 有蓝牙键盘时追加 " [蓝牙图标] 键盘电量"
+std::string battery_status_text();
 
 // Word-wrap builder
 std::vector<VRow> buildVrows(const std::vector<std::string> &lines);

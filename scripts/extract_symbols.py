@@ -8,16 +8,36 @@ import freetype
 import sys
 import os
 
-# (codepoint_to_render, target_codepoint_in_font, name, advance_override_28, advance_override_22)
-# We render the "big" variant but store it under the "small" codepoint for matching
+# (codepoint_to_render, target_codepoint_in_font, name, advance_override_28,
+#  advance_override_22, x_off_override_28, x_off_override_22, y_off_override_28, y_off_override_22)
+# We render the "big" variant but store it under the "small" codepoint for matching.
+# x_off/y_off/advance overrides only apply to the specific pixel size (None = use font metric).
+# Progress icons (PROG0..PROG8) are rendered at 40px for the 22pt table to give a 20x20 bitmap
+# (see PX_22 below); the 28pt table keeps the base 14x14 size.
+
+# 22pt pixel size for PROG icons (UI only uses 22pt): 40px render -> 20x20 fullwidth cell
+PX_22 = {"PROG0": 40, "PROG1": 40, "PROG2": 40, "PROG3": 40, "PROG4": 40,
+         "PROG5": 40, "PROG6": 40, "PROG7": 40, "PROG8": 40}
 SYMBOLS = [
-    (0x25B6, 0x25B8, "TRI_RIGHT", None, None),   # ▶→▸
-    (0x25BC, 0x25BE, "TRI_DOWN",  None, None),   # ▼→▾
-    (0x2605, 0x2605, "STAR",      None, None),   # ★
-    (0x25EF, 0x25CB, "CIRCLE_EMPTY", 28, 22),    # ◯→○ (fullwidth)
-    (0x25D0, 0x25D0, "CIRCLE_HALF",  28, 22),    # ◐ (fullwidth)
-    (0x2B24, 0x25CF, "CIRCLE_FULL",  28, 22),    # ⬤→● (fullwidth)
-    (0xF040, 0x270E, "PENCIL",       None, None),# fa-pen→✎ (Nerd Font icon)
+    (0x25B6, 0x25B8, "TRI_RIGHT",      None, None, None, None, None, None),   # ▶→▸
+    (0x25BC, 0x25BE, "TRI_DOWN",       None, None, None, None, None, None),   # ▼→▾
+    (0x2605, 0x2605, "STAR",           None, None, None, None, None, None),   # ★
+    (0x25EF, 0x25CB, "CIRCLE_EMPTY",   28,   22,   None, None, None, None),   # ◯→○ (fullwidth)
+    (0x25D0, 0x25D0, "CIRCLE_HALF",    28,   22,   None, None, None, None),   # ◐ (fullwidth)
+    (0x2B24, 0x25CF, "CIRCLE_FULL",    28,   22,   None, None, None, None),   # ⬤→● (fullwidth)
+    (0xF040, 0x270E, "PENCIL",         None, None, None, None, None, None),   # fa-pen→✎ (Nerd Font icon)
+    (0xF0084, 0xE001, "BATTERY",       None, None, None, None, 19,   15),    # mdi-battery-charging-100 (竖版实心, y_off -1 下移1px)
+    (0xF0949, 0xE002, "BLUETOOTH",     None, None, None, None, 19,   15),    # 用户指定的蓝牙符号, y_off -1 下移1px
+    (0xF0954, 0xE003, "DIVIDER",       None, 15,   None, 2,    None, 12),   # mdi-divider-variant (GTD状态栏日期分隔符;22pt上移1px=12+左右各留2px)
+    (0xF4AA,  0xE004, "PROG0",         None, None, None, None, None, 16),   # 进度0% (22pt 20x20, y_off 16)
+    (0xF0A9E, 0xE005, "PROG1",         None, None, None, None, None, 16),   # 进度1/8
+    (0xF0A9F, 0xE006, "PROG2",         None, None, None, None, None, 16),   # 进度2/8
+    (0xF0AA0, 0xE007, "PROG3",         None, None, None, None, None, 16),   # 进度3/8
+    (0xF0AA1, 0xE008, "PROG4",         None, None, None, None, None, 16),   # 进度4/8
+    (0xF0AA2, 0xE009, "PROG5",         None, None, None, None, None, 16),   # 进度5/8
+    (0xF0AA3, 0xE00A, "PROG6",         None, None, None, None, None, 16),   # 进度6/8
+    (0xF0AA4, 0xE00B, "PROG7",         None, None, None, None, None, 16),   # 进度7/8
+    (0xF0AA5, 0xE00C, "PROG8",         None, None, None, None, None, 16),   # 进度8/8
 ]
 
 # Fullwidth characters missing from 28pt font (present in 22pt)
@@ -114,13 +134,16 @@ def main():
             m = METRICS[size]
             f.write(f"// --- {size}pt (ascent={m['ascent']}) ---\n")
             glyphs = []
-            for render_cp, target_cp, name, adv28, adv22 in SYMBOLS:
+            for render_cp, target_cp, name, adv28, adv22, xo28, xo22, yo28, yo22 in SYMBOLS:
                 adv_override = adv28 if size == 28 else adv22
+                xo_override = xo28 if size == 28 else xo22
+                yo_override = yo28 if size == 28 else yo22
+                px_size = PX_22.get(name, size) if size == 22 else size
                 if name == "CIRCLE_HALF":
                     # Custom: left half filled + right half outline only
                     # Use full circle, then clear right-half interior (keep edge pixels)
-                    w, h, xo, yo, adv_orig, bits_unused = render_glyph(face, 0x2B24, size)
-                    w_o, h_o, _, _, _, full_bits = render_glyph(face, 0x2B24, size)
+                    w, h, xo, yo, adv_orig, bits_unused = render_glyph(face, 0x2B24, px_size)
+                    w_o, h_o, _, _, _, full_bits = render_glyph(face, 0x2B24, px_size)
                     adv = adv_override if adv_override else adv_orig
                     # Center the bitmap in the fullwidth advance
                     if adv > w:
@@ -166,11 +189,15 @@ def main():
                                 half_bits[byte_idx] &= ~(1 << bit)
                     bits = bytes(half_bits)
                 else:
-                    w, h, xo, yo, adv_orig, bits = render_glyph(face, render_cp, size)
+                    w, h, xo, yo, adv_orig, bits = render_glyph(face, render_cp, px_size)
                     adv = adv_override if adv_override else adv_orig
                     # Center the bitmap in the fullwidth advance
                     if adv > w:
                         xo = (adv - w) // 2
+                    if xo_override is not None:
+                        xo = xo_override
+                    if yo_override is not None:
+                        yo = yo_override
                 var_name = f"SYM_{name}_{size}_BITS"
                 f.write(f"static const uint8_t {var_name}[] = {{\n    ")
                 for i, b in enumerate(bits):

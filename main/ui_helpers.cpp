@@ -3,6 +3,7 @@
 #include "wifi_manager.h"
 #include "settings_manager.h"
 #include "ime/IME.h"
+#include "bt_keyboard.h"
 #include <cstdlib>
 #include <cstring>
 #include <esp_log.h>
@@ -70,6 +71,34 @@ int battery_pct() {
         }
     }
     return cached;
+}
+
+// 设备电池文本:"[电池图标] 电量";电量未知时返回空串
+// 图标为 PUA 码点,drawText 会渲染成符号
+std::string battery_text() {
+    int bpct = battery_pct();
+    if (bpct < 0) return "";
+    char buf[24];
+    // U+E001 电池图标(图标后不加空格,紧贴电量)
+    snprintf(buf, sizeof(buf), "\xEE\x80\x81%d%%", bpct);
+    return buf;
+}
+
+// 设备电量 + 有蓝牙键盘时追加 " [蓝牙图标] 键盘电量"
+std::string battery_status_text() {
+    std::string s = battery_text();
+    if (s.empty()) return "";
+    if (g_bt.isConnected()) {
+        int kb = g_bt.keyboardBatteryPct();
+        // U+E002 蓝牙图标,前导空格作为与电池组的间隔
+        char buf[24];
+        if (kb >= 0)
+            snprintf(buf, sizeof(buf), " \xEE\x80\x82%d%%", kb);
+        else
+            snprintf(buf, sizeof(buf), " \xEE\x80\x82--");
+        s += buf;
+    }
+    return s;
 }
 
 // ── Word wrap helpers ────────────────────────────────────────────────────
@@ -297,6 +326,9 @@ void ui_draw_text_centered(int y, const char *text, bool invert, bool bold) {
 }
 
 void ui_draw_status(const char *left, const char *right) {
+    // 状态栏始终用22号字体;画完恢复原字号,不影响同帧后续绘制(如编辑器保存确认框)
+    int prev_size = g_font.fontSize();
+    if (prev_size != 22) g_font.setSize(22);
     int y = STATUS_Y;
     u8g2_SetDrawColor(g_u8g2, 0);
     u8g2_DrawHLine(g_u8g2, 0, y, SCREEN_W);
@@ -307,17 +339,9 @@ void ui_draw_status(const char *left, const char *right) {
     if (right) {
         int rw = g_font.textWidth(right);
         g_font.drawText(SCREEN_W - rw - 4, y + 1 + g_font.ascent(), right, false);
-    } else {
-        // 右侧槽位空闲时在最右侧显示电池电量(GTD/大纲等模块)
-        int bpct = battery_pct();
-        if (bpct >= 0) {
-            char pct[16];
-            snprintf(pct, sizeof(pct), "%d%%", bpct);
-            int pw = g_font.textWidth(pct);
-            g_font.drawText(SCREEN_W - pw - 4, y + 1 + g_font.ascent(), pct, false);
-        }
     }
     u8g2_SetDrawColor(g_u8g2, 1);
+    if (g_font.fontSize() != prev_size) g_font.setSize(prev_size);
 }
 
 void ui_show_message_centered(const char *msg) {

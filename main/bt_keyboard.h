@@ -65,6 +65,7 @@ public:
     bool isScanning();
     bool isConnecting() const;  // 新增：检查是否正在连接
     void setConnected(bool c);
+    int keyboardBatteryPct();  // 键盘电池电量 %，-1=未知/未连接
 
 private:
     bool connected_ = false;

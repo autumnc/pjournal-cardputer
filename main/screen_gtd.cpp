@@ -291,17 +291,28 @@ bool screen_gtd_in_project_list() {
     return g.mode == M_BROWSE && g.view == V_PROJECT && g.projectDrillIdx < 0;
 }
 
-// GTD 状态栏右侧: |当前日期(月-日)|电池电量 (日期左边始终有分隔符)
+// 进度百分比(0-100) → 图标(U+E004=0%, U+E005..U+E00C=1/8..8/8)
+static const char *progressIconStr(int pct) {
+    static const char *icons[9] = { "\xEE\x80\x84", "\xEE\x80\x85", "\xEE\x80\x86", "\xEE\x80\x87",
+                                    "\xEE\x80\x88", "\xEE\x80\x89", "\xEE\x80\x8A", "\xEE\x80\x8B",
+                                    "\xEE\x80\x8C" };
+    if (pct <= 0) return icons[0];
+    int lvl = (pct * 2 + 24) / 25;
+    if (lvl > 8) lvl = 8;
+    return icons[lvl];
+}
+
+// GTD 状态栏右侧: 分隔符图标 + 当前日期(月-日) + 设备电量 (日期左边始终有分隔符)
 static void gtdStatusRight(char *buf, size_t sz) {
     time_t now; time(&now);
     struct tm *tm = localtime(&now);
     char date[8];
     strftime(date, sizeof(date), "%m-%d", tm);
-    int bpct = battery_pct();
-    if (bpct >= 0)
-        snprintf(buf, sz, "|%s|%d%%", date, bpct);
+    std::string bt = battery_text();
+    if (!bt.empty())
+        snprintf(buf, sz, "\xEE\x80\x83%s %s", date, bt.c_str());
     else
-        snprintf(buf, sz, "|%s", date);
+        snprintf(buf, sz, "\xEE\x80\x83%s", date);
 }
 
 
@@ -1568,7 +1579,7 @@ static void drawList() {
 
             if (pct > 0) {
 
-                char buf[16]; snprintf(buf, sizeof(buf), "%d%%", pct);
+                const char *buf = progressIconStr(pct);
 
                 int info_w = g_font.textWidth(buf);
 
@@ -1710,7 +1721,7 @@ static void drawList() {
 
         if (pct > 0) {
 
-            char buf[16]; snprintf(buf, sizeof(buf), "%d%%", pct);
+            const char *buf = progressIconStr(pct);
 
             int info_w = g_font.textWidth(buf);
 
@@ -2181,7 +2192,7 @@ static void drawSummary() {
 
     // Progress
     int pct = (int)task["progress"].asNumber(0);
-    snprintf(line, sizeof(line), "进度: %d%%", pct);
+    snprintf(line, sizeof(line), "进度: %s", progressIconStr(pct));
     ui_draw_text(textX, y, line, false);
     y += LINE_SPACING + 4;
 
@@ -2480,6 +2491,39 @@ static void openPicker(int fieldIdx) {
             }
 
         }
+
+    } else if (df.type == 'n') {
+
+        static const int PROG_VALS[] = {0, 12, 25, 37, 50, 62, 75, 87, 100};
+
+        for (int i = 0; i < 9; i++) {
+
+            char label[16];
+
+            snprintf(label, sizeof(label), " %d%%", PROG_VALS[i]);
+
+            g.pickerOpts.push_back({std::to_string(PROG_VALS[i]),
+                                    std::string(progressIconStr(PROG_VALS[i])) + label});
+
+        }
+
+        int cur = task["progress"].asInt(0);
+
+        g.pickerSel = 0;
+
+        int best = 0, bestDist = 100000;
+
+        for (int i = 0; i < 9; i++) {
+
+            int d = PROG_VALS[i] - cur;
+
+            if (d < 0) d = -d;
+
+            if (d < bestDist) { bestDist = d; best = i; }
+
+        }
+
+        g.pickerSel = best;
 
     }
 
@@ -3211,7 +3255,12 @@ static void drawDetail() {
 
             }
 
-            case 'n': val = std::to_string(task["progress"].asInt(0)) + "%"; break;
+            case 'n': {
+                int pct = task["progress"].asInt(0);
+                std::string icon = progressIconStr(pct);
+                val = icon + " " + std::to_string(pct) + "%";
+                break;
+            }
 
             case 'd': {
 
@@ -3291,7 +3340,7 @@ static void drawDetail() {
 
         // Draw cursor when editing string/number/multiline fields
 
-        if (editing && (df.type == 's' || df.type == 'n' || df.type == 'm')) {
+        if (editing && (df.type == 's' || df.type == 'm')) {
 
             std::string prefix = std::string(df.label) + ": ";
 
@@ -4151,6 +4200,8 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
                 else if (df.type == 'c') task.set("context", val);
 
+                else if (df.type == 'n') task.set("progress", std::stoi(val));
+
                 else if (df.type == 'g') {
 
                     JsonValue tags(JsonValue::array());
@@ -4271,10 +4322,6 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
                     task.set(df.key, g.editBuf);
 
-                else if (df.type == 'n')
-
-                    task.set("progress", std::stoi(g.editBuf));
-
                 saveData();
 
                 if (g.view == V_PROJECT) buildProjectList();
@@ -4353,7 +4400,7 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
 
             switch (df.type) {
 
-            case 'p': case 't': case 'j': case 'c': case 'g':
+            case 'p': case 't': case 'j': case 'c': case 'g': case 'n':
 
                 openPicker(g.detailField);
 
@@ -4382,20 +4429,6 @@ AppState screen_gtd_handle(int key, ScreenContext &ctx) {
             case 'm':
 
                 openNoteEditor();
-
-                break;
-
-            case 'n':
-
-                g.editBuf = std::to_string(task["progress"].asInt(0));
-
-                g.editCur = (int)g.editBuf.length();
-
-                g.imeActive = false;
-
-                g_ime.setActive(false);
-
-                g.mode = M_EDIT_FIELD;
 
                 break;
 
