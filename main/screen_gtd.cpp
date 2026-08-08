@@ -1531,23 +1531,14 @@ static void drawList() {
 
             std::string prefix;
 
-            if (ti.depth > 0) {
+            for (int a = 0; a < ti.depth; a++)
 
-                for (int a = 0; a < ti.depth; a++)
+                prefix += ti.ancLast[a] ? "  " : "│ ";
 
-                    prefix += ti.ancLast[a] ? "  " : "│ ";
-
-                prefix += ti.isLast ? "└─ " : "├─ ";
-
-            } else {
-
-                prefix = "◆ ";
-
-            }
-
-            // Add fold indicator
-            if (hasChildren && isFolded) prefix += "▸ ";
-            else if (hasChildren) prefix += "▾ ";
+            // 折叠项:三角在缩进线位置(替换 ◆/├);无折叠项:根用 ◆,子项用 ├─/└─
+            if (hasChildren) prefix += isFolded ? "▸ " : "▾ ";
+            else if (ti.depth > 0) prefix += ti.isLast ? "└─ " : "├─ ";
+            else prefix += "◆ ";
 
 
 
