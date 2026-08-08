@@ -101,6 +101,48 @@ std::string battery_status_text() {
     return s;
 }
 
+// ── 纯图标电量(电平图标,无数字) ──────────────────────────────────────
+// U+E018..E022 设备充电电平: 0=不足10%, 1..9=10%~90%, 10=100%
+static const char *const s_devBatteryIcons[11] = {
+    "\xEE\x80\x98", "\xEE\x80\x99", "\xEE\x80\x9A", "\xEE\x80\x9B",
+    "\xEE\x80\x9C", "\xEE\x80\x9D", "\xEE\x80\x9E", "\xEE\x80\x9F",
+    "\xEE\x80\xA0", "\xEE\x80\xA1", "\xEE\x80\xA2",
+};
+// U+E023..E02D 蓝牙键盘电平: 0=不足10%, 1..9=10%~90%, 10=100%
+static const char *const s_btBatteryIcons[11] = {
+    "\xEE\x80\xA3", "\xEE\x80\xA4", "\xEE\x80\xA5", "\xEE\x80\xA6",
+    "\xEE\x80\xA7", "\xEE\x80\xA8", "\xEE\x80\xA9", "\xEE\x80\xAA",
+    "\xEE\x80\xAB", "\xEE\x80\xAC", "\xEE\x80\xAD",
+};
+
+static const char *batteryLevelIcon(int pct, const char *const icons[11]) {
+    if (pct < 0) return nullptr;
+    int lvl = pct / 10;
+    if (lvl > 10) lvl = 10;
+    return icons[lvl];
+}
+
+// 设备电池电平图标;电量未知返回空串。目前恒用充电图标(无充电检测,见 memory)。
+std::string battery_icon_text() {
+    int bpct = battery_pct();
+    const char *ic = batteryLevelIcon(bpct, s_devBatteryIcons);
+    if (!ic) return "";
+    return ic;
+}
+
+// 设备电平图标 + 有蓝牙键盘时追加 " [蓝牙电平图标]"
+std::string battery_icon_status_text() {
+    std::string s = battery_icon_text();
+    if (s.empty()) return "";
+    if (g_bt.isConnected()) {
+        int kb = g_bt.keyboardBatteryPct();
+        const char *ic = (kb >= 0) ? batteryLevelIcon(kb, s_btBatteryIcons) : s_btBatteryIcons[0];
+        s += " ";
+        s += ic;
+    }
+    return s;
+}
+
 // ── Word wrap helpers ────────────────────────────────────────────────────
 static int charCellWidth(unsigned char c) {
     return (c < 0x80) ? 1 : 2;

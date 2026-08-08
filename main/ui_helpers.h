@@ -46,6 +46,9 @@ int battery_pct();
 std::string battery_text();
 // 设备电量 + 有蓝牙键盘时追加 " [蓝牙图标] 键盘电量"
 std::string battery_status_text();
+// 纯图标电量:设备电平图标(放电) + 蓝牙键盘电平图标,无数字
+std::string battery_icon_text();
+std::string battery_icon_status_text();
 
 // Word-wrap builder
 std::vector<VRow> buildVrows(const std::vector<std::string> &lines);

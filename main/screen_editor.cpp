@@ -319,7 +319,7 @@ static void drawEditor() {
         imeLabel += g_ime.trad() ? "繁" : "简";
     }
     std::string right = std::to_string(wc) + "字 " + imeLabel;
-    std::string bt = battery_status_text();
+    std::string bt = battery_icon_status_text();
     if (!bt.empty()) right += " " + bt;
 
     ui_draw_status(left, right.c_str());

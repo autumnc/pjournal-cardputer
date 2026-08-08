@@ -71,6 +71,53 @@ FULLWIDTH_22 = [
     (0x3000, "FW_IDEO_SPACE"),  # 全角空格
 ]
 
+# 22pt-only battery level icons (UI runs at 22pt; no 28pt versions per user).
+# Rendered from NF-Mono.ttf at 44px, box-downscaled to 20x20, appended at
+# 22pt table indices 20-52 in symbol_glyphs.h (hand-applied; see the
+# regeneration note at the bottom — do NOT run this script standalone).
+# Layout: E00D-E017 discharge (unused by UI), E018-E022 charge (device battery
+# display, user's exact 11-level mapping), E023-E02D BT keyboard.
+# (render_cp, target_pua_cp, name)
+BATTERY_22 = [
+    (0xF10CD, 0xE00D, "BAT_DIS_0"),
+    (0xF0808, 0xE00E, "BAT_DIS_10"),
+    (0xF0809, 0xE00F, "BAT_DIS_20"),
+    (0xF080A, 0xE010, "BAT_DIS_30"),
+    (0xF080B, 0xE011, "BAT_DIS_40"),
+    (0xF080C, 0xE012, "BAT_DIS_50"),
+    (0xF080D, 0xE013, "BAT_DIS_60"),
+    (0xF080E, 0xE014, "BAT_DIS_70"),
+    (0xF080F, 0xE015, "BAT_DIS_80"),
+    (0xF0810, 0xE016, "BAT_DIS_90"),
+    (0xF0807, 0xE017, "BAT_DIS_100"),
+    (0xF10CD, 0xE018, "BAT_CHG_0"),
+    (0xF089C, 0xE019, "BAT_CHG_10"),
+    (0xF0086, 0xE01A, "BAT_CHG_20"),
+    (0xF0087, 0xE01B, "BAT_CHG_30"),
+    (0xF0088, 0xE01C, "BAT_CHG_40"),
+    (0xF089D, 0xE01D, "BAT_CHG_50"),
+    (0xF0089, 0xE01E, "BAT_CHG_60"),
+    (0xF089E, 0xE01F, "BAT_CHG_70"),
+    (0xF008A, 0xE020, "BAT_CHG_80"),
+    (0xF008B, 0xE021, "BAT_CHG_90"),
+    (0xF0085, 0xE022, "BAT_CHG_100"),
+    (0xF0947, 0xE023, "BT_BAT_0"),
+    (0xF093E, 0xE024, "BT_BAT_10"),
+    (0xF093F, 0xE025, "BT_BAT_20"),
+    (0xF0940, 0xE026, "BT_BAT_30"),
+    (0xF0941, 0xE027, "BT_BAT_40"),
+    (0xF0942, 0xE028, "BT_BAT_50"),
+    (0xF0943, 0xE029, "BT_BAT_60"),
+    (0xF0944, 0xE02A, "BT_BAT_70"),
+    (0xF0945, 0xE02B, "BT_BAT_80"),
+    (0xF0946, 0xE02C, "BT_BAT_90"),
+    (0xF0948, 0xE02D, "BT_BAT_100"),
+]
+# Charge 20-90 mapping resolved: uF089D=50%, uF089E=70% fill the gap left by
+# the 6-icon F0086-F008B set, so charge now has a full 11-level 0-100 ladder
+# (fills 42/42/45/49/49/52/57/58/61/62/67% at 44px). Device battery display
+# uses charge icons unconditionally (no charge detection in firmware).
+
 # Font metrics for each size
 METRICS = {
     28: {'ascent': 22, 'descent': 6, 'line_height': 28},
