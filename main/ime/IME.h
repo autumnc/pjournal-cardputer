@@ -47,6 +47,7 @@ public:
     void beginPredict(const std::string &text);
     void endPredict() { _predicting = false; _predChar = ""; }
     bool predicting() const { return _predicting; }
+    void cancelComposition() { reset(); }
 
     void removeUserWord(const std::string &code, const std::string &word);
     void clearUserDict();

@@ -14,6 +14,8 @@
 #include "screen_outline.h"
 #include "screen_bt_manage.h"
 #include "screen_file_manager.h"
+#include "screen_voice.h"
+#include "voice_input.h"
 #include "u8g2_st7305.h"
 #include "pcf85063.h"
 
@@ -505,6 +507,13 @@ extern "C" void app_main() {
                             // 单击: 上移,等待双击窗口确认非双击后生效
                             s_pending_single.key = KEY_UP;
                             s_pending_single.queued_us = now;
+                        } else if (currentState == APP_EDITOR && btn_user.is_double) {
+                            // 编辑器双击: 进入语音听写(会话在screen_voice_init启动)
+                            currentState = APP_VOICE;
+                            key = 0;
+                        } else if (currentState == APP_VOICE && btn_user.is_double) {
+                            // 语音听写双击: 注入ESC,由voice屏停止会话并返回编辑器
+                            key = 0x1B;
                         } else if (gtdBrowse && btn_user.is_double) {
                             // GTD任务管理双击: 项目列表→进入选中项目; 平铺/项目树→切换任务状态
                             key = gtdProjList ? 0x0A : ' ';
@@ -844,6 +853,16 @@ extern "C" void app_main() {
             break;
         }
 
+        case APP_VOICE: {
+            g_font.setSize(g_settings.fontSize());
+            static bool voiceInited = false;
+            if (!voiceInited) { screen_voice_init(); voiceInited = true; }
+            if (key > 0) currentState = screen_voice_handle(key, ctx);
+            else { screen_voice_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
+            if (currentState != APP_VOICE) voiceInited = false;
+            break;
+        }
+
         default:
             currentState = APP_MAIN;
             break;
@@ -855,6 +874,9 @@ extern "C" void app_main() {
             ctx.statusMessage.clear();
             vTaskDelay(pdMS_TO_TICKS(1500));
         }
+
+        // Voice session WiFi idle: 5 min after the session ends, shut the radio.
+        g_voice.update();
     }
 
     ESP_LOGI(TAG, "Goodbye.");

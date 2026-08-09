@@ -146,6 +146,10 @@ static int getWordCount() {
 }
 
 // ── Editor drawing ────────────────────────────────────────────────────────
+// When true, drawEditor renders the content but skips the IME strip and the
+// status bar — used by the voice dictation screen as a transparent background.
+static bool s_skipStatusBarAndIme = false;
+
 static void drawEditor() {
     int y = FONT_H;
 
@@ -175,7 +179,7 @@ static void drawEditor() {
     }
 
     const auto& vrows = getVrows();
-    bool composing = g_ime.composing();
+    bool composing = g_ime.composing() && !s_skipStatusBarAndIme;
     int contentEndY = composing ? IME_CODE_Y : STATUS_Y;
     int visibleVrows = (contentEndY - y + LINE_SPACING - 1) / LINE_SPACING;
     if (visibleVrows < 1) visibleVrows = 1;
@@ -306,23 +310,34 @@ static void drawEditor() {
         }
     }
 
-    const char *mode = g_editor.promptMode ? "提示写作" : "自由写作";
-    int wc = getWordCount();
-    char left[48];
-    snprintf(left, sizeof(left), "%s", mode);
-    std::string imeLabel;
-    if (!g_editor.imeActive) imeLabel = "EN";
-    else if (g_ime.english()) imeLabel = "[英]";
-    else {
-        imeLabel = "[中]";
-        imeLabel += g_ime.fullwidth() ? "\xe2\x97\x8f" : "\xe2\x97\x90"; // ● or ◐
-        imeLabel += g_ime.trad() ? "繁" : "简";
-    }
-    std::string right = std::to_string(wc) + "字 " + imeLabel;
-    std::string bt = battery_icon_status_text();
-    if (!bt.empty()) right += " " + bt;
+    if (!s_skipStatusBarAndIme) {
+        const char *mode = g_editor.promptMode ? "提示写作" : "自由写作";
+        int wc = getWordCount();
+        char left[48];
+        snprintf(left, sizeof(left), "%s", mode);
+        std::string imeLabel;
+        if (!g_editor.imeActive) imeLabel = "EN";
+        else if (g_ime.english()) imeLabel = "[英]";
+        else {
+            imeLabel = "[中]";
+            imeLabel += g_ime.fullwidth() ? "\xe2\x97\x8f" : "\xe2\x97\x90"; // ● or ◐
+            imeLabel += g_ime.trad() ? "繁" : "简";
+        }
+        std::string right = std::to_string(wc) + "字 " + imeLabel;
+        std::string bt = battery_icon_status_text();
+        if (!bt.empty()) right += " " + bt;
 
-    ui_draw_status(left, right.c_str());
+        ui_draw_status(left, right.c_str());
+    }
+}
+
+// Draw only the editor content (no IME strip, no status bar) so the voice
+// dictation screen can show the editor as a live-transparent background.
+void screen_editor_draw_voice_bg() {
+    g_ime.cancelComposition();  // cancel any in-progress composition
+    s_skipStatusBarAndIme = true;
+    drawEditor();
+    s_skipStatusBarAndIme = false;
 }
 
 static void drawConfirmDialog() {
@@ -434,15 +449,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     if (g_editor.imeActive && key != 0) {
         std::string imeOut;
         if (g_ime.handleKey(key, imeOut)) {
-            if (!imeOut.empty()) {
-                if (g_editor.hasSelection) deleteSelection();
-                g_editor.lines[g_editor.cy].insert(g_editor.cx, imeOut);
-                g_editor.cx += (int)imeOut.length();
-                g_editor.targetCx = -1;
-                g_editor.vrowsDirty = true; g_editor.wordCountDirty = true;
-                g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
-                g_editor.modifiedSinceSave = true;
-            }
+            editorInsertText(imeOut);
             ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
         }
     }
@@ -772,4 +779,16 @@ std::string app_get_editor_text() {
     for (auto &l : g_editor.lines) { text += l; text += '\n'; }
     while (!text.empty() && text.back() == '\n') text.pop_back();
     return text;
+}
+
+// Insert text at the cursor, shared by IME commit and voice dictation.
+void editorInsertText(const std::string &text) {
+    if (text.empty()) return;
+    if (g_editor.hasSelection) deleteSelection();
+    g_editor.lines[g_editor.cy].insert(g_editor.cx, text);
+    g_editor.cx += (int)text.length();
+    g_editor.targetCx = -1;
+    g_editor.vrowsDirty = true; g_editor.wordCountDirty = true;
+    g_editor.autoSaveTime = esp_timer_get_time() + 3000000;
+    g_editor.modifiedSinceSave = true;
 }

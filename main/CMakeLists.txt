@@ -22,6 +22,8 @@ idf_component_register(SRCS
     "screen_gtd.cpp"
     "screen_outline.cpp"
     "screen_inspiration.cpp"
+    "screen_voice.cpp"
+    "voice_input.cpp"
     INCLUDE_DIRS "."
     EMBED_FILES
         "ime/ime_table_pinyin.bin"
@@ -47,6 +49,10 @@ idf_component_register(SRCS
         u8g2
         u8g2_st7305
         esp_adc
+        esp_websocket_client
+        esp_codec_dev
+        esp_audio_codec
+        efuse
 )
 
 target_compile_definitions(${COMPONENT_LIB} PRIVATE PJOURNAL_VERSION="2.9.0")

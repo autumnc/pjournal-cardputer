@@ -25,6 +25,10 @@ PCF85063 g_rtc;
 static i2c_master_bus_handle_t s_i2c_bus = nullptr;
 static i2c_master_dev_handle_t s_rtc_dev = nullptr;
 
+i2c_master_bus_handle_t pjournal_get_i2c_bus() {
+    return s_i2c_bus;
+}
+
 PCF85063::PCF85063() : _initialized(false) {
 }
 

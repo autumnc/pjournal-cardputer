@@ -3,6 +3,14 @@
 #include <cstdint>
 #include <ctime>
 
+// I2C bus handle type (forward decl from driver/i2c_master.h)
+struct i2c_master_bus_t;
+typedef struct i2c_master_bus_t *i2c_master_bus_handle_t;
+
+// Expose the shared I2C bus so the audio codec can attach ES7210/ES8311 to it.
+// Returns nullptr if the RTC hasn't been initialized yet.
+i2c_master_bus_handle_t pjournal_get_i2c_bus();
+
 class PCF85063 {
 public:
     PCF85063();

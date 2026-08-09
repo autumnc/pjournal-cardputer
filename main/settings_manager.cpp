@@ -4,6 +4,7 @@
 #include <map>
 #include <sys/stat.h>
 #include <esp_log.h>
+#include <esp_random.h>
 
 static const char *TAG = "Settings";
 static const char *BASE_DIR = "/sdcard/settings";
@@ -76,6 +77,26 @@ std::string SettingsManager::personalExperience() { return get("personal_exp"); 
 std::string SettingsManager::personalHobbies() { return get("personal_hob"); }
 std::string SettingsManager::wifiSsid() { return get("wifi_ssid"); }
 std::string SettingsManager::wifiPassword() { return get("wifi_pass"); }
+std::string SettingsManager::xiaozhiOtaUrl() { return getString("xiaozhi_ota_url", "https://api.tenclass.net/xiaozhi/ota/"); }
+
+std::string SettingsManager::clientId() {
+    std::string id = getString("xiaozhi_client_id");
+    if (id.empty()) {
+        // UUID v4, persisted so the xiaozhi server keeps identifying the same device.
+        uint8_t u[16];
+        esp_fill_random(u, sizeof(u));
+        u[6] = (u[6] & 0x0F) | 0x40;  // version 4
+        u[8] = (u[8] & 0x3F) | 0x80;  // variant 1
+        char buf[37];
+        snprintf(buf, sizeof(buf),
+                 "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                 u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+                 u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+        id = buf;
+        setString("xiaozhi_client_id", id);
+    }
+    return id;
+}
 
 void SettingsManager::setFlomoEmail(const std::string &v) { set("flomo_email", v); }
 void SettingsManager::setFlomoPassword(const std::string &v) { set("flomo_pass", v); }

@@ -26,3 +26,12 @@
 
 // Battery ADC (ADC1_CH3 = GPIO4, voltage divider 3:1)
 #define BATTERY_ADC_CHAN ADC_CHANNEL_3
+
+// Audio (ES7210 mic ADC + ES8311 DAC + MAX98357A amp, matching xiaozhi waveshare-s3-rlcd-4.2 board)
+#define AUDIO_I2S_GPIO_MCLK  GPIO_NUM_16
+#define AUDIO_I2S_GPIO_WS    GPIO_NUM_45
+#define AUDIO_I2S_GPIO_BCLK  GPIO_NUM_9
+#define AUDIO_I2S_GPIO_DIN   GPIO_NUM_10
+#define AUDIO_I2S_GPIO_DOUT  GPIO_NUM_8
+#define AUDIO_CODEC_PA_PIN   GPIO_NUM_46
+#define AUDIO_SAMPLE_RATE    16000

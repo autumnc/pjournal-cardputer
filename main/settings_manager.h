@@ -23,6 +23,8 @@ public:
     std::string wifiPassword();
     std::string timezone();
     std::string ntpServer();
+    std::string xiaozhiOtaUrl();
+    std::string clientId();
     bool autoSave();
     bool autoSleep();
     bool sleepScreen();
