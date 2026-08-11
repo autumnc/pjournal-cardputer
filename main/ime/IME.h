@@ -152,6 +152,7 @@ private:
     void reset();
     void lookup();
     void lookupSegmented();  // 单引号分词编码的查词路径
+    void appendSingleCharCandidates(const std::string &prefix, int candLen);  // 主词典单字前缀候选
     void buildPage();
     bool commit(int idx, std::string &out);
     bool handleFullwidthPunct(int key, std::string &out);

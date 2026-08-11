@@ -978,9 +978,11 @@ void IME::lookup() {
     buildPage();
 }
 
-// 单引号分词查词: 编码形如 "xi'an" / "an'guang", 按 ' 切成音节段, 只匹配词组。
+// 单引号分词查词: 编码形如 "xi'an" / "an'guang", 按 ' 切成音节段。
 // 1) 补充词典表(seg_table.h) 分段前缀匹配; 2) 用户词典带撇号码精确匹配;
-// 3) 主词典词组: 拼接码精确匹配且字数=段数。全部视为整码消费。
+// 3) 主词典词组: 拼接码精确匹配且字数=段数;
+// 4) 逐字匹配: 首段单字候选, 选中后按 seg0Next 消费跳下一段续拼(见 commit 的 candContinue)。
+// 全部视为整码消费。
 void IME::lookupSegmented() {
     std::vector<std::string> segs;
     std::string cur;
@@ -1083,7 +1085,47 @@ void IME::lookupSegmented() {
         }
     }
 
+    // 4) 逐字匹配: 首段单字前缀候选(词组之后)。选中后消费 seg0Next 字节跳到
+    //    下一段续拼(如 xi'an 选"西"后余下 "an" 查字), 由 commit 的 candContinue 推进。
+    if (_all.size() < MAX_CANDIDATES) {
+        int seg0Next = (segs.size() > 1) ? ((int)segs[0].length() + 1) : fullLen;
+        appendSingleCharCandidates(segs[0], seg0Next);
+    }
+
     _partialStart = (int)_all.size();
+}
+
+// 主词典单字前缀匹配: 与 lookup() Phase 2 相同扫描, 但消费长度由调用方指定
+// (分词逐字续拼时是跳到下一段的字节偏移, 而非词典码长)。
+void IME::appendSingleCharCandidates(const std::string &prefix, int candLen) {
+    int qlen = (int)prefix.length();
+    if (qlen < 1 || _all.size() >= MAX_CANDIDATES) return;
+    uint32_t lo, hi;
+    searchWindow(prefix.c_str(), qlen, lo, hi);
+    uint32_t scanEnd = hi;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        char code[7];
+        if (!readCode(mid, code)) break;
+        if (strncmp(code, prefix.c_str(), qlen) < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    for (uint32_t i = lo; i < scanEnd && _all.size() < MAX_CANDIDATES; i++) {
+        char code[7];
+        if (!readCode(i, code)) break;
+        if (strncmp(code, prefix.c_str(), qlen) != 0) break;
+        uint8_t f = readRecordFlag(i);
+        if (f & (_trad ? 0x01 : 0x02)) continue;
+        char hz[4];
+        if (!readHanzi(i, hz)) break;
+        std::string h(hz);
+        bool dup = false;
+        for (auto &e : _all) if (e == h) { dup = true; break; }
+        if (!dup) {
+            _all.push_back(h);
+            _candLen.push_back(candLen);
+        }
+    }
 }
 
 void IME::beginPredict(const std::string &text) {
