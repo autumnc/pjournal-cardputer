@@ -3,6 +3,8 @@
 #include "font_renderer.h"
 #include "journal_storage.h"
 #include "builtin_prompts.h"
+#include "settings_manager.h"
+#include "markdown_render.h"
 #include <cstdlib>
 #include <cstdio>
 #include <ctime>
@@ -240,10 +242,17 @@ AppState screen_viewer_handle(int key, ScreenContext &ctx) {
     u8g2_SetDrawColor(g_u8g2, 0);
     u8g2_DrawHLine(g_u8g2, 4, sepY, SCREEN_W - 8);
 
+    bool mdOn = g_settings.markdownRender();
+    mdSetRenderEnabled(mdOn);
+    std::vector<MdLineInfo> mdInfo;
+    if (mdOn) {
+        mdInfo = mdClassifyLines(g_viewer.lines);
+    } else {
+        mdInfo.assign(g_viewer.lines.size(), MdLineInfo{});
+    }
     for (int i = 0; i < visible && (g_viewer.scroll + i) < (int)vrows.size(); i++) {
         auto &vr = vrows[g_viewer.scroll + i];
-        std::string text = g_viewer.lines[vr.lineIdx].substr(vr.start, vr.end - vr.start);
-        ui_draw_text(4, contentY + i * LINE_SPACING, text.c_str(), false);
+        mdDrawVrow(4, contentY + i * LINE_SPACING, g_viewer.lines[vr.lineIdx], vr.start, vr.end, mdInfo[vr.lineIdx]);
     }
 
     if (g_viewer.scroll > 0 && maxScroll > 0) {
