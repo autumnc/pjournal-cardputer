@@ -81,6 +81,23 @@ def find_stars(line, frm, ln, n):
         i += 1
     return -1
 
+def emit_plain(line, frm, to, base, segs):
+    """Mirror of markdown_render.cpp emitPlain: backslash-escaped ASCII becomes a
+    space plus the literal next char."""
+    p = frm
+    while p < to:
+        if line[p] == BS and p + 1 < to and line[p + 1] < 0x80:
+            if p > frm:
+                segs.append([frm, p, dict(base), line[frm:p]])
+            segs.append([p, p + 1, dict(base), b" "])
+            segs.append([p + 1, p + 2, dict(base), line[p + 1:p + 2]])
+            p += 2
+            frm = p
+        else:
+            p += 1
+    if frm < to:
+        segs.append([frm, to, dict(base), line[frm:to]])
+
 def md_parse_inline(line, frm, base, segs):
     ln = len(line)
     plain = frm
@@ -88,16 +105,8 @@ def md_parse_inline(line, frm, base, segs):
         m = next_marker(line, plain, ln)
         if m == ln: break
         if m > plain:
-            segs.append([plain, m, dict(base), line[plain:m]])
+            emit_plain(line, plain, m, base, segs)
         c = line[m]
-        if c == BS:
-            if m + 1 < ln:
-                segs.append([m, m+1, dict(base), b" "])
-                segs.append([m+1, m+2, dict(base), line[m+1:m+2]])
-                plain = m + 2
-            else:
-                plain = m + 1
-            continue
         if c == ST:
             n = 1
             while m + n < ln and line[m+n] == ST: n += 1
@@ -111,7 +120,7 @@ def md_parse_inline(line, frm, base, segs):
             else: st['underline'] = True
             segs.append([m, m+n, dict(base), b" "])
             if cc > m + n:
-                segs.append([m+n, cc, st, line[m+n:cc]])
+                emit_plain(line, m + n, cc, st, segs)
             segs.append([cc, cc+n, dict(base), b" "])
             plain = cc + n
             continue
@@ -121,7 +130,7 @@ def md_parse_inline(line, frm, base, segs):
                 segs.append([m, m+1, dict(base), line[m:m+1]]); plain = m + 1; continue
             st = dict(base); st['invert'] = True
             segs.append([m, m+1, dict(base), b" "])
-            segs.append([m+1, cc, st, line[m+1:cc]])
+            emit_plain(line, m + 1, cc, st, segs)
             segs.append([cc, cc+1, dict(base), b" "])
             plain = cc + 1
             continue
@@ -131,7 +140,7 @@ def md_parse_inline(line, frm, base, segs):
                 segs.append([m, m+1, dict(base), line[m:m+1]]); plain = m + 1; continue
             st = dict(base); st['strike'] = True
             segs.append([m, m+2, dict(base), b" "])
-            segs.append([m+2, cc, st, line[m+2:cc]])
+            emit_plain(line, m + 2, cc, st, segs)
             segs.append([cc, cc+2, dict(base), b" "])
             plain = cc + 2
             continue
@@ -141,7 +150,7 @@ def md_parse_inline(line, frm, base, segs):
                 segs.append([m, m+1, dict(base), line[m:m+1]]); plain = m + 1; continue
             st = dict(base); st['emph'] = True
             segs.append([m, m+2, dict(base), b" "])
-            segs.append([m+2, cc, st, line[m+2:cc]])
+            emit_plain(line, m + 2, cc, st, segs)
             segs.append([cc, cc+2, dict(base), b" "])
             plain = cc + 2
             continue
@@ -152,13 +161,13 @@ def md_parse_inline(line, frm, base, segs):
                 if cp >= 0 and cp < ln:
                     st = dict(base); st['invert'] = True; st['underline'] = True
                     segs.append([m, m+1, dict(base), b" "])
-                    segs.append([m+1, p, st, line[m+1:p]])
+                    emit_plain(line, m + 1, p, st, segs)
                     segs.append([p, cp+1, dict(base), spaces_for_width(line, p, cp+1)])
                     plain = cp + 1
                     continue
         segs.append([m, m+1, dict(base), line[m:m+1]]); plain = m + 1
     if plain < ln:
-        segs.append([plain, ln, dict(base), line[plain:]])
+        emit_plain(line, plain, ln, base, segs)
 
 def md_list_marker(line):
     """Mirror of markdown_render.cpp mdListMarker. Returns a dict or None."""

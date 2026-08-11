@@ -164,7 +164,17 @@ void IME::loadUserDict() {
             word = line.substr(sp1 + 1, sp2 - sp1 - 1);
             std::string tail = line.substr(sp2 + 1);
             auto sp3 = tail.find(' ');
-            count = std::stoi((sp3 == std::string::npos) ? tail : tail.substr(0, sp3));
+            // 纯数字解析:std::stoi 遇到非数字会抛异常,而本工程 C++ 异常关闭,
+            // 畸形/被手工编辑的词库文件会让 stoi 直接 abort 重启。非法计数回退为 1。
+            count = 1;
+            std::string cntStr = (sp3 == std::string::npos) ? tail : tail.substr(0, sp3);
+            bool validCount = !cntStr.empty();
+            for (char cc : cntStr)
+                if (cc < '0' || cc > '9') { validCount = false; break; }
+            if (validCount) {
+                count = 0;
+                for (char cc : cntStr) count = count * 10 + (cc - '0');
+            }
             if (count < 1) count = 1;
             if (sp3 != std::string::npos) {
                 std::string fl = tail.substr(sp3 + 1);

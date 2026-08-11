@@ -32,6 +32,29 @@ std::string spacesForWidth(const std::string &line, int from, int to) {
     return sp;
 }
 
+// Emit [from,to) as text, turning backslash escapes into a space plus the literal
+// next char (`\*` → " *") so an escaped marker doesn't trigger styling and the
+// backslash itself is hidden. Escapes apply to single-byte ASCII only (CommonMark
+// style); `\中` keeps the backslash. Either way the emitted width equals the raw
+// width, so mdContentWidth (which counts escapes at raw width via nextMarker's
+// skip) stays in sync and cursor/selection remain aligned.
+void emitPlain(const std::string &line, int from, int to, const TextStyle &base,
+               std::vector<MdSeg> &segs) {
+    int p = from;
+    while (p < to) {
+        if (line[p] == '\\' && p + 1 < to && (unsigned char)line[p + 1] < 0x80) {
+            if (p > from) segs.push_back({from, p, base, line.substr(from, p - from)});
+            segs.push_back({p, p + 1, base, " "});
+            segs.push_back({p + 1, p + 2, base, line.substr(p + 1, 1)});
+            p += 2;
+            from = p;
+        } else {
+            p++;
+        }
+    }
+    if (from < to) segs.push_back({from, to, base, line.substr(from, to - from)});
+}
+
 // Next inline marker byte, skipping escaped characters. Returns len if none.
 int nextMarker(const std::string &line, int from, int len) {
     for (int i = from; i < len; i++) {
@@ -240,19 +263,9 @@ void mdParseInline(const std::string &line, int from, const TextStyle &base,
         int m = nextMarker(line, plainStart, len);
         if (m == len) break;
         if (m > plainStart)
-            segs.push_back({plainStart, m, base, line.substr(plainStart, m - plainStart)});
+            emitPlain(line, plainStart, m, base, segs);
 
         char c = line[m];
-        if (c == '\\') {  // escape: backslash becomes a space, next char literal
-            if (m + 1 < len) {
-                segs.push_back({m, m + 1, base, " "});
-                segs.push_back({m + 1, m + 2, base, line.substr(m + 1, 1)});
-                plainStart = m + 2;
-            } else {
-                plainStart = m + 1;
-            }
-            continue;
-        }
         if (c == '*') {
             int n = 1;
             while (m + n < len && line[m + n] == '*') n++;
@@ -269,7 +282,7 @@ void mdParseInline(const std::string &line, int from, const TextStyle &base,
             else st.underline = true;  // single * = italic → underline
             segs.push_back({m, m + n, base, " "});
             if (cclose > m + n)
-                segs.push_back({m + n, cclose, st, line.substr(m + n, cclose - (m + n))});
+                emitPlain(line, m + n, cclose, st, segs);
             segs.push_back({cclose, cclose + n, base, " "});
             plainStart = cclose + n;
             continue;
@@ -284,7 +297,7 @@ void mdParseInline(const std::string &line, int from, const TextStyle &base,
             TextStyle st = base;
             st.invert = true;
             segs.push_back({m, m + 1, base, " "});
-            segs.push_back({m + 1, cclose, st, line.substr(m + 1, cclose - (m + 1))});
+            emitPlain(line, m + 1, cclose, st, segs);
             segs.push_back({cclose, cclose + 1, base, " "});
             plainStart = cclose + 1;
             continue;
@@ -299,7 +312,7 @@ void mdParseInline(const std::string &line, int from, const TextStyle &base,
             TextStyle st = base;
             st.strike = true;
             segs.push_back({m, m + 2, base, " "});
-            segs.push_back({m + 2, cclose, st, line.substr(m + 2, cclose - (m + 2))});
+            emitPlain(line, m + 2, cclose, st, segs);
             segs.push_back({cclose, cclose + 2, base, " "});
             plainStart = cclose + 2;
             continue;
@@ -314,7 +327,7 @@ void mdParseInline(const std::string &line, int from, const TextStyle &base,
             TextStyle st = base;
             st.emph = true;
             segs.push_back({m, m + 2, base, " "});
-            segs.push_back({m + 2, cclose, st, line.substr(m + 2, cclose - (m + 2))});
+            emitPlain(line, m + 2, cclose, st, segs);
             segs.push_back({cclose, cclose + 2, base, " "});
             plainStart = cclose + 2;
             continue;
@@ -328,7 +341,7 @@ void mdParseInline(const std::string &line, int from, const TextStyle &base,
                     st.invert = true;
                     st.underline = true;
                     segs.push_back({m, m + 1, base, " "});
-                    segs.push_back({m + 1, p, st, line.substr(m + 1, p - (m + 1))});
+                    emitPlain(line, m + 1, p, st, segs);
                     segs.push_back({p, cp + 1, base, spacesForWidth(line, p, cp + 1)});
                     plainStart = cp + 1;
                     continue;
@@ -339,7 +352,7 @@ void mdParseInline(const std::string &line, int from, const TextStyle &base,
         segs.push_back({m, m + 1, base, line.substr(m, 1)});
     }
     if (plainStart < len)
-        segs.push_back({plainStart, len, base, line.substr(plainStart)});
+        emitPlain(line, plainStart, len, base, segs);
 }
 
 void mdParseLine(const std::string &line, const MdLineInfo &info, std::vector<MdSeg> &segs) {
