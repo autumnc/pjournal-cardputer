@@ -18,6 +18,31 @@ struct MdLineInfo {
     bool hr = false;           // horizontal rule or code fence line
 };
 
+// List-family marker geometry (unordered `- `, ordered `1. `/`1、`, task `- [ ]`),
+// including any leading whitespace (nested lists). ok=false if `line` isn't a
+// list block. start = byte offset after leading whitespace; len = marker byte
+// length (incl. trailing space); cells = visual cells the marker occupies, i.e.
+// the content x offset (in cells) relative to start. Used by both the renderer
+// and ui_helpers buildVrows so marker width / indent stay in sync.
+struct MdListMarker {
+    bool ok = false;
+    bool task = false;
+    bool ordered = false;
+    int start = 0;
+    int len = 0;
+    int cells = 0;
+};
+MdListMarker mdListMarker(const std::string &line);
+
+// Parse a leading Chinese numeral (零/一/二/…/十/十一/…) starting at line[from].
+// Returns the value (0..9999) or -1 if `from` isn't a Chinese numeral char.
+// numLen = consumed bytes (0 when -1).
+int mdCnNumValue(const std::string &line, int from, int &numLen);
+
+// 1..9999 → Chinese numeral string (一/二/…/十/十一/…); other values → decimal.
+// Used by the editor's list auto-continuation.
+std::string mdCnNumeral(int n);
+
 // Classify every line of the document in one pass.
 std::vector<MdLineInfo> mdClassifyLines(const std::vector<std::string> &lines);
 

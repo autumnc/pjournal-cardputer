@@ -1,5 +1,6 @@
 #include "ui_helpers.h"
 #include "font_renderer.h"
+#include "markdown_render.h"
 #include "wifi_manager.h"
 #include "settings_manager.h"
 #include "ime/IME.h"
@@ -180,33 +181,29 @@ int cellsToByte(const std::string &line, int start, int end, int targetCells) {
 }
 
 // Leading markdown block marker length in bytes (0 if the line doesn't start
-// with one). Keeps the marker ("# ", "> ", "- ", "- [ ] ", ...) from being
-// split onto its own vrow by the space word-break below.
+// with one). Keeps the marker ("# ", "> ", "- ", "- [ ] ", "1. ", ...) from
+// being split onto its own vrow by the space word-break below. Nested list
+// markers include their leading whitespace (mdListMarker.start).
 static int mdPrefixLen(const std::string &line) {
+    MdListMarker m = mdListMarker(line);
+    if (m.ok) return m.start + m.len;
     int len = (int)line.size();
     if (len >= 2 && line[0] == '>' && line[1] == ' ') return 2;
-    if (len >= 5 && (line.compare(0, 5, "- [ ]") == 0 || line.compare(0, 5, "- [x]") == 0 ||
-                     line.compare(0, 5, "- [X]") == 0))
-        return (len >= 6 && line[5] == ' ') ? 6 : 5;
-    if (len >= 2 && (line[0] == '-' || line[0] == '*' || line[0] == '+') && line[1] == ' ')
-        return 2;
     int h = 0;
     while (h < len && h < 6 && line[h] == '#') h++;
     if (h >= 1 && h < len && line[h] == ' ') return h + 1;
     return 0;
 }
 
-// Cells reserved per vrow for the RENDERED markdown block indent (task content
-// at cell 4, list at cell 4, quote at cell 5, heading at cell 2) so wrapped
-// content doesn't overrun the screen. Must match markdown_render.cpp layout.
+// Cells reserved per vrow for the RENDERED block indent so wrapped content
+// doesn't overrun the screen. Must match markdown_render.cpp layout: heading at
+// cell 2, list/task at marker cells (content at start+cells), quote 4 cells
+// (bar at cell 4 + 2px gap). Nested markers reserve leading ws + marker cells.
 static int mdIndentCells(const std::string &line) {
+    MdListMarker m = mdListMarker(line);
+    if (m.ok) return m.start + m.cells;
     int len = (int)line.size();
-    if (len >= 5 && (line.compare(0, 5, "- [ ]") == 0 || line.compare(0, 5, "- [x]") == 0 ||
-                     line.compare(0, 5, "- [X]") == 0))
-        return 3;  // task: content at cell 4 (shifted right 1 like lists)
-    if (len >= 2 && line[0] == '>' && line[1] == ' ') return 4;  // quote: content at cell 5
-    if (len >= 2 && (line[0] == '-' || line[0] == '*' || line[0] == '+') && line[1] == ' ')
-        return 3;  // list: bullet + text shifted right 1 cell
+    if (len >= 2 && line[0] == '>' && line[1] == ' ') return 4;
     return mdPrefixLen(line) > 0 ? 2 : 0;  // heading
 }
 
@@ -228,7 +225,9 @@ std::vector<VRow> buildVrows(const std::vector<std::string> &lines) {
             int end = pos;
             int lastBreak = -1;
             int pe = (pos == 0) ? prefixEnd : 0;  // only the first vrow has the marker
-            int cap = maxc - indent + pe;        // first vrow also counts the marker bytes
+            // cap 用标记的格数而非字节数(pe):CJK 标记(如 `一、`/`1、`)字节数大于格数,
+            // 用 pe 会让首 vrow 内容多塞几格、画到屏幕右缘之外。
+            int cap = maxc - indent + ((pos == 0) ? byteToCells(line, prefixEnd) : 0);
             if (cap > maxc) cap = maxc;
             while (end < len) {
                 unsigned char c = (unsigned char)line[end];

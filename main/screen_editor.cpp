@@ -637,10 +637,46 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
     // Navigation & editing
     if (key == 0x0A || key == 0x0D) { // Enter
         if (g_editor.hasSelection) deleteSelection();
+        // 列表行在行尾回车时自动续行:下一行带上同款列表标记
+        std::string prefix;
+        if (g_editor.cx >= (int)g_editor.lines[g_editor.cy].length()) {
+            const std::string &cur = g_editor.lines[g_editor.cy];
+            MdListMarker m = mdListMarker(cur);
+            if (m.ok) {
+                bool emptyItem = cur.substr(m.start + m.len).find_first_not_of(" \t") == std::string::npos;
+                if (!emptyItem) {
+                    std::string lead = cur.substr(0, m.start);  // 嵌套缩进
+                    if (m.task) {
+                        prefix = lead + "- [ ] ";
+                    } else if (m.ordered) {
+                        int d = m.start;
+                        while (d < (int)cur.length() && cur[d] >= '0' && cur[d] <= '9') d++;
+                        if (d == m.start) {  // 中文序号:一、二、十、… 递增(一→二→…→十→十一)
+                            int nlen = 0;
+                            int n = mdCnNumValue(cur, m.start, nlen);
+                            if (n >= 0)
+                                prefix = lead + mdCnNumeral(n + 1) + cur.substr(m.start + nlen, m.len - nlen);
+                            else
+                                prefix = lead + cur.substr(m.start, m.len);
+                        } else {
+                            int n = 0;
+                            for (int k = m.start; k < d; k++) n = n * 10 + (cur[k] - '0');
+                            n++;
+                            char num[16];
+                            snprintf(num, sizeof(num), "%d", n);
+                            prefix = lead + num + cur.substr(d, m.len - (d - m.start));
+                        }
+                    } else {
+                        prefix = lead + cur.substr(m.start, 1) + " ";  // 保留 -/*/+
+                    }
+                }
+            }
+        }
         std::string rest = g_editor.lines[g_editor.cy].substr(g_editor.cx);
         g_editor.lines[g_editor.cy] = g_editor.lines[g_editor.cy].substr(0, g_editor.cx);
         g_editor.cx = 0; g_editor.cy++;
-        g_editor.lines.insert(g_editor.lines.begin() + g_editor.cy, rest);
+        g_editor.lines.insert(g_editor.lines.begin() + g_editor.cy, prefix + rest);
+        g_editor.cx = (int)prefix.length();  // 光标落在续行标记之后
         g_editor.targetCx = -1;
         g_editor.vrowsDirty = true; g_editor.wordCountDirty = true;
         g_editor.autoSaveTime = esp_timer_get_time() + 3000000;

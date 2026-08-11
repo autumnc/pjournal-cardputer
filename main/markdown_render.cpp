@@ -42,11 +42,125 @@ int nextMarker(const std::string &line, int from, int len) {
     return len;
 }
 
-// Byte length of the "- [ ]"/"- [x]" marker: 6 when followed by a space,
-// 5 otherwise, so the space (or first content char) never gets swallowed.
-int taskPrefixEnd(const std::string &line) {
-    return ((int)line.size() >= 6 && line[5] == ' ') ? 6 : 5;
+// True if line[at] is the start of a Chinese numeral char (零一二三四五六七八九十百千).
+bool isCnNumChar(const std::string &line, int at) {
+    static const char *kCn[13] = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "百", "千"};
+    if (at + 3 > (int)line.size()) return false;
+    for (int k = 0; k < 13; k++)
+        if (line.compare(at, 3, kCn[k]) == 0) return true;
+    return false;
 }
+
+}  // namespace
+
+// List-family marker geometry. Skips leading whitespace so nested lists work.
+// cells = content offset in cells from marker start: unordered/task bullet is 3
+// cells (" • " / " ☐ "), ordered keeps its digits+separator width (bytes==cells
+// for ASCII `.`/`)`, `、` is 2 cells, 3 bytes).
+MdListMarker mdListMarker(const std::string &line) {
+    MdListMarker m;
+    int len = (int)line.size();
+    int i = 0;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+    m.start = i;
+    int rest = len - i;
+
+    if (rest >= 5 && (line.compare(i, 5, "- [ ]") == 0 ||
+                      line.compare(i, 5, "- [x]") == 0 ||
+                      line.compare(i, 5, "- [X]") == 0)) {
+        m.ok = m.task = true;
+        m.len = (i + 5 < len && line[i + 5] == ' ') ? 6 : 5;
+        m.cells = 3;
+        return m;
+    }
+    if (rest >= 2 && (line[i] == '-' || line[i] == '*' || line[i] == '+') && line[i + 1] == ' ') {
+        m.ok = true;
+        m.len = 2;
+        m.cells = 3;
+        return m;
+    }
+    int d = i;
+    while (d < len && line[d] >= '0' && line[d] <= '9') d++;
+    int nd = d - i;
+    if (nd >= 1 && d + 2 < len && (unsigned char)line[d] == 0xE3 &&
+        (unsigned char)line[d + 1] == 0x80 && (unsigned char)line[d + 2] == 0x81) {  // 、
+        m.len = nd + 3;                     // digits + 、 (3 bytes)
+        m.cells = nd + 3;                   // digits + 、(1+2格) + 1格右移,与无序一致
+        if (d + 3 < len && line[d + 3] == ' ') { m.len++; m.cells++; }
+        m.ordered = m.ok = true;
+        return m;
+    }
+    if (nd >= 1 && d < len && (line[d] == '.' || line[d] == ')')) {
+        if (d + 1 >= len) m.len = nd + 1;              // "1." at EOL
+        else if (line[d + 1] == ' ') m.len = nd + 2;   // "1. "
+        else return m;                                  // "1.5" → not a list
+        m.cells = m.len + 1;   // 数字+分隔符后补1格右移内容,与无序列表一致
+        m.ordered = m.ok = true;
+    }
+    // 中文序号 + 顿号:一、二、十、十一、… 原文渲染,前导1空格缩进,序号+顿号加粗
+    int c = i;
+    int nchars = 0;
+    while (c + 3 <= len && isCnNumChar(line, c)) { c += 3; nchars++; }
+    if (nchars >= 1 && c + 2 < len && (unsigned char)line[c] == 0xE3 &&
+        (unsigned char)line[c + 1] == 0x80 && (unsigned char)line[c + 2] == 0x81) {  // 、
+        m.len = (c - i) + 3;                // 序号字节 + `、`(3 bytes)
+        m.cells = 1 + 2 * nchars + 2;       // 前导1格 + 每字2格 + `、`2格
+        if (c + 3 < len && line[c + 3] == ' ') { m.len++; m.cells++; }
+        m.ordered = m.ok = true;
+    }
+    return m;
+}
+
+// Parse a Chinese numeral starting at line[from] (零一二三四五六七八九十百千).
+int mdCnNumValue(const std::string &line, int from, int &numLen) {
+    static const char *kDg[10] = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
+    int len = (int)line.size();
+    int value = 0, section = 0;
+    int i = from;
+    while (i + 3 <= len) {
+        const std::string c = line.substr(i, 3);
+        int dv = -1, mult = 0;
+        for (int k = 0; k < 10; k++)
+            if (c == kDg[k]) { dv = k; break; }
+        if (dv < 0) {
+            if (c == "十") mult = 10;
+            else if (c == "百") mult = 100;
+            else if (c == "千") mult = 1000;
+            else break;
+        }
+        if (mult) { value += (section == 0 ? 1 : section) * mult; section = 0; }
+        else section = dv;
+        i += 3;
+    }
+    numLen = i - from;
+    if (numLen == 0) return -1;
+    return value + section;
+}
+
+std::string mdCnNumeral(int n) {
+    static const char *kCN[10] = {"零", "一", "二", "三", "四", "五", "六", "七", "八", "九"};
+    static const char *kUnit[4] = {"", "十", "百", "千"};
+    if (n < 0 || n > 9999) return std::to_string(n);
+    if (n < 10) return kCN[n];
+    std::string out;
+    int digits[4] = {0, 0, 0, 0};
+    int len = 0;
+    for (int t = n; t > 0; t /= 10) digits[len++] = t % 10;
+    bool zeroPending = false;
+    for (int i = len - 1; i >= 0; i--) {
+        if (digits[i] == 0) {
+            if (i > 0) zeroPending = true;
+        } else {
+            if (zeroPending) { out += kCN[0]; zeroPending = false; }
+            out += kCN[digits[i]];
+            out += kUnit[i];
+        }
+    }
+    if (n >= 10 && n < 20) out.erase(0, 3);  // "一十"→"十"
+    return out;
+}
+
+namespace {
 
 int findStars(const std::string &line, int from, int len, int n) {
     for (int i = from; i <= len - n; i++) {
@@ -258,16 +372,25 @@ void mdParseLine(const std::string &line, const MdLineInfo &info, std::vector<Md
         // Heading glyph advance is 2 cells; content starts right after it.
         segs.push_back({0, n, base, kLevelGlyph[info.headingLevel - 1]});
         pos = n;
-    } else if (info.task) {
-        bool checked = len >= 5 && (line[3] == 'x' || line[3] == 'X');
-        int pe = taskPrefixEnd(line);
-        std::string repl = checked ? " ✓ " : " ☐ ";  // box at cell 2, content at cell 4
-        segs.push_back({0, pe, base, repl});
-        pos = pe;
-    } else if (info.list) {
-        // bullet at cell 2, content at cell 4 (whole marker shifted right 1 cell)
-        segs.push_back({0, 2, base, " \xE2\x80\xA2 "});
-        pos = 2;
+    } else if (info.list || info.task) {
+        MdListMarker m = mdListMarker(line);
+        if (m.ok) {
+            int mend = m.start + m.len;
+            if (m.task) {
+                bool checked = (m.start + 3 < len) &&
+                               (line[m.start + 3] == 'x' || line[m.start + 3] == 'X');
+                std::string repl = checked ? " \xE2\x9C\x93 " : " \xE2\x98\x90 ";  // ☐/✓, content after marker
+                segs.push_back({0, mend, base, line.substr(0, m.start) + repl});
+            } else if (m.ordered) {
+                TextStyle nst = base;
+                nst.bold = true;
+                // 前导补1格:序号(阿拉伯或中文)随整体右移1格,与无序列表一致(无序子弹在1格处)
+                segs.push_back({0, mend, nst, std::string(" ") + line.substr(0, mend)});
+            } else {
+                segs.push_back({0, mend, base, line.substr(0, m.start) + " \xE2\x80\xA2 "});  // bullet
+            }
+            pos = mend;
+        }
     } else if (info.quote) {
         segs.push_back({0, 2, base, "    "});  // bar at cell 4, 1-space gap, content at cell 5
         pos = 2;
@@ -304,11 +427,17 @@ std::vector<MdLineInfo> mdClassifyLines(const std::vector<std::string> &lines) {
         }
         if (inCode) { info.inCodeBlock = true; continue; }
 
-        int h = 0;
-        while (h < end && ln[h] == '#') h++;
-        if (h >= 1 && h <= 6 && h < end && ln[h] == ' ') {
-            info.headingLevel = h;
-            continue;
+        int ws = 0;
+        while (ws < end && (ln[ws] == ' ' || ln[ws] == '\t')) ws++;
+
+        // heading / quote only at column 0; horizontal rule tolerates leading ws
+        if (ws == 0) {
+            int h = 0;
+            while (h < end && ln[h] == '#') h++;
+            if (h >= 1 && h <= 6 && h < end && ln[h] == ' ') {
+                info.headingLevel = h;
+                continue;
+            }
         }
         if (end >= 3) {  // horizontal rule: only - * _ (and whitespace), >= 3
             bool hr = true;
@@ -322,17 +451,11 @@ std::vector<MdLineInfo> mdClassifyLines(const std::vector<std::string> &lines) {
             }
             if (hr && cnt >= 3) { info.hr = true; continue; }
         }
-        if (end >= 5 && ln.compare(0, 5, "- [ ]") == 0) { info.task = true; continue; }
-        if (end >= 5 && (ln.compare(0, 5, "- [x]") == 0 || ln.compare(0, 5, "- [X]") == 0)) {
-            info.task = true;
-            continue;
-        }
-        if (end >= 2 && ln[0] == '-' && ln[1] == ' ') { info.list = true; continue; }
-        if (end >= 2 && (ln[0] == '*' || ln[0] == '+') && ln[1] == ' ') {
-            info.list = true;
-            continue;
-        }
-        if (end >= 2 && ln[0] == '>' && ln[1] == ' ') { info.quote = true; continue; }
+        if (ws == 0 && end >= 2 && ln[0] == '>' && ln[1] == ' ') { info.quote = true; continue; }
+
+        // list family (unordered/ordered/task), allowed after leading ws = nested
+        MdListMarker lm = mdListMarker(ln);
+        if (lm.ok) { info.task = lm.task; info.list = true; }
     }
     return out;
 }
@@ -345,15 +468,16 @@ int mdVisualX(const std::string &line, const MdLineInfo &info, int bytePos) {
             return 2 * cell + mdContentWidth(line, info.headingLevel, bytePos);
         return 0;
     }
-    if (info.task) {
-        int pe = taskPrefixEnd(line);
-        if (bytePos >= pe)
-            return 3 * cell + mdContentWidth(line, pe, bytePos);
-        return std::min(mdContentWidth(line, 0, bytePos), 3 * cell);
-    }
-    if (info.list) {
-        if (bytePos >= 2)
-            return 3 * cell + mdContentWidth(line, 2, bytePos);
+    if (info.list || info.task) {
+        MdListMarker m = mdListMarker(line);
+        if (m.ok) {
+            int mend = m.start + m.len;
+            if (bytePos >= mend)
+                return (m.start + m.cells) * cell + mdContentWidth(line, mend, bytePos);
+            if (bytePos <= m.start)
+                return mdContentWidth(line, 0, bytePos);
+            return (m.start + (bytePos - m.start)) * cell;  // inside marker (approx)
+        }
         return mdContentWidth(line, 0, bytePos);
     }
     if (info.quote) {
@@ -365,7 +489,7 @@ int mdVisualX(const std::string &line, const MdLineInfo &info, int bytePos) {
 }
 
 // Visual x (px) of raw bytePos within a vrow that starts at raw byte vrowStart.
-// Continuation vrows (vrowStart > 0) of heading/task/quote lines repeat the
+// Continuation vrows (vrowStart > 0) of heading/task/quote/list lines repeat the
 // prefix indent so wrapped text stays aligned under the first line. Without
 // this, wrapped lines were placed at their whole-line x, i.e. off-screen.
 int mdVrowX(const std::string &line, const MdLineInfo &info, int bytePos, int vrowStart) {
@@ -375,9 +499,11 @@ int mdVrowX(const std::string &line, const MdLineInfo &info, int bytePos, int vr
     int prefix = 0;
     if (vrowStart > 0) {
         if (info.headingLevel > 0) prefix = 2 * cell;
-        else if (info.task) prefix = 3 * cell;
         else if (info.quote) prefix = 4 * cell + 2;
-        else if (info.list) prefix = 3 * cell;
+        else if (info.list || info.task) {
+            MdListMarker m = mdListMarker(line);
+            if (m.ok) prefix = (m.start + m.cells) * cell;
+        }
     }
     return mdVisualX(line, info, bytePos) - mdVisualX(line, info, vrowStart) + prefix;
 }

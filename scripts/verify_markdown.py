@@ -46,6 +46,14 @@ def width(line):  # bytes
 BS = ord('\\'); ST = ord('*'); BT = ord('`'); LB = ord('['); TL = ord('~'); EQ = ord('=')
 SP = ord(' '); HT = ord('#'); DD = ord('-'); PL = ord('+'); GT = ord('>'); US = ord('_')
 
+_CN_NUMS = ('零', '一', '二', '三', '四', '五', '六', '七', '八', '九', '十', '百', '千')
+
+def is_cn_num(line, at):
+    """Mirror of isCnNumChar: True if line[at] starts a Chinese numeral char."""
+    if at + 3 > len(line):
+        return False
+    return line[at:at + 3] in (s.encode() for s in _CN_NUMS)
+
 # ---- Mirror of the C++ logic (byte offsets) ----
 
 def spaces_for_width(line, frm, to):
@@ -152,8 +160,40 @@ def md_parse_inline(line, frm, base, segs):
     if plain < ln:
         segs.append([plain, ln, dict(base), line[plain:]])
 
-def task_prefix_end(line):
-    return 6 if (len(line) >= 6 and line[5] == ord(' ')) else 5
+def md_list_marker(line):
+    """Mirror of markdown_render.cpp mdListMarker. Returns a dict or None."""
+    ln = len(line)
+    i = 0
+    while i < ln and line[i] in (SP, ord('\t')): i += 1
+    rest = ln - i
+    if rest >= 5 and line[i:i+5] in (b'- [ ]', b'- [x]', b'- [X]'):
+        mlen = 6 if (i + 5 < ln and line[i+5] == SP) else 5
+        return {'ok': True, 'task': True, 'ordered': False, 'start': i, 'len': mlen, 'cells': 3}
+    if rest >= 2 and line[i] in (DD, ST, PL) and line[i+1] == SP:
+        return {'ok': True, 'task': False, 'ordered': False, 'start': i, 'len': 2, 'cells': 3}
+    d = i
+    while d < ln and 48 <= line[d] <= 57: d += 1
+    nd = d - i
+    if nd >= 1 and d + 2 < ln and line[d:d+3] == b'\xe3\x80\x81':  # 、
+        mlen = nd + 3; mcells = nd + 3  # 内容右移1格,与无序一致
+        if d + 3 < ln and line[d+3] == SP:
+            mlen += 1; mcells += 1
+        return {'ok': True, 'task': False, 'ordered': True, 'start': i, 'len': mlen, 'cells': mcells}
+    if nd >= 1 and d < ln and line[d] in (ord('.'), ord(')')):
+        if d + 1 >= ln: mlen = nd + 1          # "1." at EOL
+        elif line[d+1] == SP: mlen = nd + 2    # "1. "
+        else: return None                      # "1.5" → not a list
+        return {'ok': True, 'task': False, 'ordered': True, 'start': i, 'len': mlen, 'cells': mlen + 1}
+    # 中文序号 + 顿号:一、二、十、十一、… 原文渲染,前导1空格缩进
+    c = i; nchars = 0
+    while c + 3 <= ln and is_cn_num(line, c):
+        c += 3; nchars += 1
+    if nchars >= 1 and c + 2 < ln and line[c:c+3] == b'\xe3\x80\x81':  # 、
+        mlen = (c - i) + 3; mcells = 1 + 2 * nchars + 2  # 前导1格 + 每字2格 + `、`2格
+        if c + 3 < ln and line[c+3] == SP:
+            mlen += 1; mcells += 1
+        return {'ok': True, 'task': False, 'ordered': True, 'start': i, 'len': mlen, 'cells': mcells}
+    return None
 
 def md_visual_x(line, info, pos):
     cell = 1  # cells
@@ -162,20 +202,36 @@ def md_visual_x(line, info, pos):
         if pos >= n:
             return 2 + md_content_width(line, n, pos)
         return 0
-    if info['task']:
-        pe = task_prefix_end(line)
-        if pos >= pe:
-            return 3 + md_content_width(line, pe, pos)
-        return min(md_content_width(line, 0, pos), 3 * cell)
-    if info['list']:
-        if pos >= 2:
-            return 3 + md_content_width(line, 2, pos)
+    if info['list'] or info['task']:
+        m = md_list_marker(line)
+        if m is not None:
+            mend = m['start'] + m['len']
+            if pos >= mend:
+                return (m['start'] + m['cells']) + md_content_width(line, mend, pos)
+            if pos <= m['start']:
+                return md_content_width(line, 0, pos)
+            return m['start'] + (pos - m['start'])  # inside marker (approx)
         return md_content_width(line, 0, pos)
     if info['quote']:
         if pos >= 2:
             return 4 + md_content_width(line, 2, pos)  # +2px bar offset not modeled
         return md_content_width(line, 0, pos)
     return md_content_width(line, 0, pos)
+
+def md_vrow_x(line, info, pos, vrow_start):
+    """Mirror of markdown_render.cpp mdVrowX: continuation vrows repeat the
+    block prefix indent so wrapped content stays aligned under the first line."""
+    prefix = 0
+    if vrow_start > 0:
+        if info['headingLevel'] > 0:
+            prefix = 2
+        elif info['quote']:
+            prefix = 4
+        elif info['list'] or info['task']:
+            m = md_list_marker(line)
+            if m is not None:
+                prefix = m['start'] + m['cells']
+    return md_visual_x(line, info, pos) - md_visual_x(line, info, vrow_start) + prefix
 
 def md_content_width(line, frm, to):
     ln = len(line)
@@ -253,15 +309,20 @@ def md_parse_line(line, info):
             repl += b" "
         segs.append([0, n, dict(base), repl])
         pos = n
-    elif info['task']:
-        checked = ln >= 5 and line[3] in (ord('x'), ord('X'))
-        repl = (" ✓ " if checked else " ☐ ").encode('utf-8')
-        pe = task_prefix_end(line)
-        segs.append([0, pe, dict(base), repl])
-        pos = pe
-    elif info['list']:
-        segs.append([0, 2, dict(base), b" \xe2\x80\xa2 "])  # bullet at cell 2, content at cell 4
-        pos = 2
+    elif info['list'] or info['task']:
+        m = md_list_marker(line)
+        if m is not None:
+            mend = m['start'] + m['len']
+            if m['task']:
+                checked = (m['start'] + 3 < ln) and line[m['start'] + 3] in (ord('x'), ord('X'))
+                repl = (" ✓ " if checked else " ☐ ").encode('utf-8')
+                segs.append([0, mend, dict(base), line[0:m['start']] + repl])
+            elif m['ordered']:
+                nst = dict(base); nst['bold'] = True
+                segs.append([0, mend, nst, b" " + line[0:mend]])  # 前导补1格,序号随整体右移1格,与无序一致
+            else:
+                segs.append([0, mend, dict(base), line[0:m['start']] + b" \xe2\x80\xa2 "])  # bullet
+            pos = mend
     elif info['quote']:
         segs.append([0, 2, dict(base), b"    "])  # bar at cell 4, 1-space gap, content at cell 5
         pos = 2
@@ -279,42 +340,42 @@ def md_classify_lines(lines):
         if ln[0:3] == b'```':
             info['hr'] = True
             in_code = not in_code
-        elif in_code:
+            out.append(info)
+            continue
+        if in_code:
             info['inCodeBlock'] = True
-        else:
+            out.append(info)
+            continue
+        ws = 0
+        while ws < end and ln[ws] in (SP, ord('\t')): ws += 1
+        # heading / quote only at column 0; horizontal rule tolerates leading ws
+        if ws == 0:
             h = 0
             while h < end and ln[h] == HT: h += 1
             if 1 <= h <= 6 and h < end and ln[h] == SP:
                 info['headingLevel'] = h
-            elif end >= 3:
-                hr = True; cnt = 0
-                for k in range(end):
-                    c = ln[k]
-                    if c in (SP, ord('\t')): continue
-                    if c in (DD, ST, US): cnt += 1; continue
-                    hr = False; break
-                if hr and cnt >= 3:
-                    info['hr'] = True
-                elif end >= 5 and ln[0:5] == b'- [ ]':
-                    info['task'] = True
-                elif end >= 5 and ln[0:5] in (b'- [x]', b'- [X]'):
-                    info['task'] = True
-                elif end >= 2 and ln[0] == DD and ln[1] == SP:
-                    info['list'] = True
-                elif end >= 2 and ln[0] in (ST, PL) and ln[1] == SP:
-                    info['list'] = True
-                elif end >= 2 and ln[0] == GT and ln[1] == SP:
-                    info['quote'] = True
-            elif end >= 5 and ln[0:5] == b'- [ ]':
-                info['task'] = True
-            elif end >= 5 and ln[0:5] in (b'- [x]', b'- [X]'):
-                info['task'] = True
-            elif end >= 2 and ln[0] == DD and ln[1] == SP:
-                info['list'] = True
-            elif end >= 2 and ln[0] in (ST, PL) and ln[1] == SP:
-                info['list'] = True
-            elif end >= 2 and ln[0] == GT and ln[1] == SP:
-                info['quote'] = True
+                out.append(info)
+                continue
+        if end >= 3:
+            hr = True; cnt = 0
+            for k in range(end):
+                c = ln[k]
+                if c in (SP, ord('\t')): continue
+                if c in (DD, ST, US): cnt += 1; continue
+                hr = False; break
+            if hr and cnt >= 3:
+                info['hr'] = True
+                out.append(info)
+                continue
+        if ws == 0 and end >= 2 and ln[0] == GT and ln[1] == SP:
+            info['quote'] = True
+            out.append(info)
+            continue
+        # list family (unordered/ordered/task), allowed after leading ws = nested
+        m = md_list_marker(ln)
+        if m is not None:
+            info['task'] = m['task']
+            info['list'] = True
         out.append(info)
     return out
 
@@ -336,32 +397,36 @@ def check(line, info):
 
 # Mirror of ui_helpers.cpp mdPrefixLen (bytes).
 def md_prefix_len(line):
+    m = md_list_marker(line)
+    if m is not None: return m['start'] + m['len']
     if line[0:2] == b'> ': return 2
-    if line[0:5] in (b'- [ ]', b'- [x]', b'- [X]'):
-        return 6 if len(line) >= 6 and line[5] == SP else 5
-    if line[0:2] in (b'- ', b'* ', b'+ '): return 2
     h = 0
     while h < len(line) and h < 6 and line[h:h+1] == b'#': h += 1
     if h >= 1 and h < len(line) and line[h:h+1] == b' ': return h + 1
     return 0
 
+# Mirror of ui_helpers.cpp mdIndentCells: cells reserved per vrow for the
+# RENDERED block indent so wrapped content doesn't overrun the screen.
+def md_indent(line):
+    m = md_list_marker(line)
+    if m is not None: return m['start'] + m['cells']
+    if line[0:2] == b'> ': return 4
+    return 2 if md_prefix_len(line) > 0 else 0
+
 # Mirror of ui_helpers.cpp buildVrows (incl. mdIndentCells): reserves indent
 # cells for markdown block lines and never splits a leading marker.
 def build_vrows(line):
     maxc = 400 // 14  # SCREEN_W / halfAdvance @28pt
-    def indent():
-        if line[0:5] in (b'- [ ]', b'- [x]', b'- [X]'): return 3
-        if line[0:2] == b'> ': return 4
-        if line[0:2] in (b'- ', b'* ', b'+ '): return 3
-        return 2 if md_prefix_len(line) > 0 else 0
-    indent_cells = indent()
+    indent_cells = md_indent(line)
     prefix_end = md_prefix_len(line)
     vrows = []
     pos = 0
     while pos < len(line):
         cells = 0; end = pos; last = -1
         pe = prefix_end if pos == 0 else 0
-        cap = maxc - indent_cells + pe
+        # cap 用标记格数(byteToCells)而非字节数,镜像 C++:CJK 标记字节>格数
+        marker_cells = width(line[0:prefix_end]) if pos == 0 else 0
+        cap = maxc - indent_cells + marker_cells
         if cap > maxc: cap = maxc
         while end < len(line):
             n = utf8_len(line[end])
@@ -396,6 +461,26 @@ TEST_LINES = [
     "+ 加号列表",
     "- [ ] 待办事项",
     "- [x] 已完成任务",
+    "1. 有序第一项",
+    "10. 第十项",
+    "1、中文序号",
+    "1) 右括号列表",
+    "1.5 不是列表",
+    "2024年回顾",
+    "  - 嵌套列表",
+    "  * 嵌套星号",
+    "  - [x] 嵌套任务",
+    "  - [ ] 嵌套待办",
+    "  1. 嵌套有序",
+    "  3、嵌套中文序号",
+    "10、第十项",
+    "11、第十一项",
+    "20、第二十项",
+    "一、直接中文序号",
+    "十二、直接中文十二",
+    "100、超过百项",
+    "    - 深嵌套列表",
+    "  1.5 不是嵌套有序",
     "> 引用内容",
     "---",
     "***",
@@ -434,16 +519,16 @@ def main():
         except AssertionError as e:
             fails += 1
             print(f"FAIL {line.decode('utf-8'):<36} {info}\n      {e}")
-    # layout assertions: task content at cell 2, list/quote content at cell 3
+    # layout assertions: list/task content at start+cells, quote content at cell 4
     for line, info in zip(lines, infos):
-        if info['task']:
-            pe = task_prefix_end(line)
-            assert md_visual_x(line, info, pe) == 3, f"task content not at cell 3: {line!r}"
-            assert md_visual_x(line, info, len(line)) == 3 + md_content_width(line, pe, len(line)), \
-                f"task tail misaligned: {line!r}"
-        if info['list']:
-            assert md_visual_x(line, info, 2) == 3, f"list content not at cell 3: {line!r}"
-            assert md_visual_x(line, info, len(line)) == 3 + md_content_width(line, 2, len(line)), \
+        if info['task'] or info['list']:
+            m = md_list_marker(line)
+            assert m is not None, f"{line!r} classified as list/task but no marker"
+            mend = m['start'] + m['len']
+            cx = m['start'] + m['cells']
+            assert md_visual_x(line, info, mend) == cx, \
+                f"list content not at cell {cx}: {line!r} got {md_visual_x(line, info, mend)}"
+            assert md_visual_x(line, info, len(line)) == cx + md_content_width(line, mend, len(line)), \
                 f"list tail misaligned: {line!r}"
         if info['quote']:
             assert md_visual_x(line, info, 2) == 4, f"quote content not at cell 4: {line!r}"
@@ -451,7 +536,7 @@ def main():
                 f"quote tail misaligned: {line!r}"
     # wrap tests: a leading markdown marker must never split onto its own vrow
     # (that rendered as a bar / empty row), and continuation vrows carry text.
-    for wl in ["> ", "- ", "- [ ] ", "# "]:
+    for wl in ["> ", "- ", "- [ ] ", "# ", "1. ", "1、 ", "  - ", "  1. ", "  - [ ] "]:
         b = (wl + "内容很长需要折行显示" * 6).encode('utf-8')
         inf = md_classify_lines([b])[0]
         vrows = build_vrows(b)
@@ -463,6 +548,15 @@ def main():
                 drawn = [dr for st, en, ts, dr in md_parse_line(b, inf) if en > s and st < e]
                 assert any(dr.strip() for dr in drawn), \
                     f"continuation vrow empty: {wl!r} [{s},{e})"
+                if inf['list'] or inf['task'] or inf['quote'] or inf['headingLevel']:
+                    if inf['headingLevel']: expect = 2
+                    elif inf['quote']: expect = 4
+                    else:
+                        mm = md_list_marker(b)
+                        expect = mm['start'] + mm['cells']
+                    got = md_vrow_x(b, inf, s, s)
+                    assert got == expect, \
+                        f"continuation vrow x wrong: {wl!r} [{s},{e}) got {got} want {expect}"
     print("wrap split tests OK")
     # fence sanity: the 4 ```-related lines should toggle correctly
     fence = [i for i, l in enumerate(lines) if l[0:3] == b'```']
