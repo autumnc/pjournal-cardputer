@@ -4,10 +4,14 @@
 #include <cstdio>
 #include <algorithm>
 #include <esp_log.h>
-#include "nvs_flash.h"
+#include <sys/stat.h>
 
 static const char *IME_TAG = "IME";
 static const uint8_t IME_MAGIC[4] = {'I', 'M', 'E', '3'};
+
+// 用户词典持久化到 SD 卡(与设置同目录)。NVS 分区仅 24KB 且写入失败会静默
+// 丢失/启动时整区擦除,改用 SD 文件后容量无上限,重启与重刷固件均保留。
+static const char *USERDICT_PATH = "/sdcard/settings/userdict.txt";
 
 static void appendUtf8(uint32_t cp, std::string &out) {
     if (cp < 0x80) {
@@ -120,26 +124,19 @@ bool IME::begin() {
 
 void IME::loadUserDict() {
     _userWords.clear();
-    nvs_handle_t nvs;
-    if (nvs_open("ime_dict", NVS_READONLY, &nvs) != ESP_OK) return;
+    FILE *f = fopen(USERDICT_PATH, "r");
+    if (!f) return;
 
-    // Read all data chunks from NVS and concatenate
+    // Read the whole file
     std::string allData;
-    char key[16];
-    for (int i = 0; ; i++) {
-        snprintf(key, sizeof(key), "c%02d", i);
-        size_t len = 0;
-        if (nvs_get_str(nvs, key, NULL, &len) != ESP_OK) break;
-        std::string chunk(len, '\0');
-        nvs_get_str(nvs, key, &chunk[0], &len);
-        if (!chunk.empty() && chunk.back() == '\0') chunk.pop_back();
-        allData += chunk;
-    }
-    nvs_close(nvs);
+    char buf[256];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) allData.append(buf, n);
+    fclose(f);
     if (allData.empty()) return;
 
     // Parse lines (same format as before: "code word count" per line)
-    const size_t MAX_READ = 8192;
+    const size_t MAX_READ = 64 * 1024;
     bool hadDuplicates = false;
     size_t pos = 0;
     size_t bytesRead = 0;
@@ -202,37 +199,21 @@ void IME::loadUserDict() {
 
 void IME::saveUserDict() {
     if (!_userDirty) return;
-    nvs_handle_t nvs;
-    if (nvs_open("ime_dict", NVS_READWRITE, &nvs) != ESP_OK) return;
+    mkdir("/sdcard/settings", 0777);
+    FILE *f = fopen(USERDICT_PATH, "w");
+    if (!f) {
+        ESP_LOGE(IME_TAG, "failed to open userdict file %s", USERDICT_PATH);
+        return;
+    }
 
-    // Build full serialized string
-    std::string allData;
     for (auto &p : _userWords) {
-        allData += p.code + " " + p.word + " " + std::to_string(p.count)
-                 + (p.trad ? " 1" : "") + "\n";
+        std::string line = p.code + " " + p.word + " " + std::to_string(p.count)
+                         + (p.trad ? " 1" : "") + "\n";
+        fwrite(line.data(), 1, line.size(), f);
     }
 
-    // Write in chunks of 3800 bytes to stay within NVS string limits
-    const size_t CHUNK_SIZE = 3800;
-    char key[16];
-    int i = 0;
-    size_t offset = 0;
-    while (offset < allData.length()) {
-        snprintf(key, sizeof(key), "c%02d", i);
-        std::string chunk = allData.substr(offset, CHUNK_SIZE);
-        nvs_set_str(nvs, key, chunk.c_str());
-        offset += CHUNK_SIZE;
-        i++;
-    }
-
-    // Erase any remaining old chunks
-    for (;; i++) {
-        snprintf(key, sizeof(key), "c%02d", i);
-        if (nvs_erase_key(nvs, key) != ESP_OK) break;
-    }
-
-    nvs_commit(nvs);
-    nvs_close(nvs);
+    if (fclose(f) != 0)
+        ESP_LOGE(IME_TAG, "failed to flush userdict file");
     _userDirty = false;
 }
 
