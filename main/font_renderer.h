@@ -6,6 +6,14 @@
 #include "symbol_glyphs.h"
 
 // Font renderer: reads from embedded terminus28.fnt / terminus22.fnt blobs
+struct TextStyle {
+    bool bold = false;      // synthetic bold: glyph drawn twice, 1px offset
+    bool underline = false; // line below the whole segment
+    bool strike = false;    // line through vertical center
+    bool invert = false;    // reverse video: dark box + light glyphs
+    bool emph = false;      // emphasis dot (着重号) under each character
+};
+
 class FontRenderer {
 public:
     bool begin();
@@ -16,6 +24,10 @@ public:
     // Draw UTF-8 text at (x, y). y is baseline.
     // Returns width consumed.
     int drawText(int x, int y, const char *text, bool invert = false);
+
+    // Draw UTF-8 text with style flags (bold/underline/strike/invert/emph).
+    // Width is identical to drawText/textWidth — marker-free passthrough.
+    int drawTextStyled(int x, int y, const char *text, const TextStyle &ts);
 
     // Get text width in pixels (UTF-8)
     int textWidth(const char *text);

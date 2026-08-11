@@ -28,6 +28,7 @@ public:
     bool autoSave();
     bool autoSleep();
     bool sleepScreen();
+    bool markdownRender();
     int fontSize();
 
     void setFlomoEmail(const std::string &v);

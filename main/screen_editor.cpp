@@ -5,6 +5,7 @@
 #include "wifi_manager.h"
 #include "settings_manager.h"
 #include "ui_helpers.h"
+#include "markdown_render.h"
 #include "ime/IME.h"
 #include <cstdio>
 #include <cstring>
@@ -201,10 +202,17 @@ static void drawEditor() {
         g_editor.scroll = cursorVR - effectiveVisibleVrows + 1;
     if (g_editor.scroll < 0) g_editor.scroll = 0;
 
+    bool mdOn = g_settings.markdownRender();
+    mdSetRenderEnabled(mdOn);
+    std::vector<MdLineInfo> mdInfo;
+    if (mdOn) {
+        mdInfo = mdClassifyLines(g_editor.lines);
+    } else {
+        mdInfo.assign(g_editor.lines.size(), MdLineInfo{});
+    }
     for (int i = 0; i < visibleVrows && (g_editor.scroll + i) < (int)vrows.size(); i++) {
         auto &vr = vrows[g_editor.scroll + i];
-        std::string text = g_editor.lines[vr.lineIdx].substr(vr.start, vr.end - vr.start);
-        ui_draw_text(4, y + i * LINE_SPACING, text.c_str());
+        mdDrawVrow(4, y + i * LINE_SPACING, g_editor.lines[vr.lineIdx], vr.start, vr.end, mdInfo[vr.lineIdx]);
     }
 
     // Selection highlight
@@ -223,9 +231,9 @@ static void drawEditor() {
             if (lineIdx == selEnd.cy) hlEnd = std::min(hlEnd, selEnd.cx);
             if (hlStart >= hlEnd) continue;
             // Highlight range [hlStart, hlEnd) on this vrow
-            std::string before = g_editor.lines[lineIdx].substr(rowStart, hlStart - rowStart);
+            const MdLineInfo &mdi = mdInfo[lineIdx];
             std::string sel = g_editor.lines[lineIdx].substr(hlStart, hlEnd - hlStart);
-            int xOff = 4 + g_font.textWidth(before.c_str());
+            int xOff = 4 + mdVrowX(g_editor.lines[lineIdx], mdi, hlStart, rowStart);
             int selW = g_font.textWidth(sel.c_str());
             int ly = y + i * LINE_SPACING;
             u8g2_SetDrawColor(g_u8g2, 2);  // XOR mode
@@ -237,8 +245,8 @@ static void drawEditor() {
     if (cursorVR >= 0 && cursorVR >= g_editor.scroll && cursorVR < g_editor.scroll + visibleVrows) {
         auto &vr = vrows[cursorVR];
         const std::string &line = g_editor.lines[vr.lineIdx];
-        std::string prefix = line.substr(vr.start, g_editor.cx - vr.start);
-        int cx = 4 + g_font.textWidth(prefix.c_str());
+        const MdLineInfo &mdi = mdInfo[vr.lineIdx];
+        int cx = 4 + mdVrowX(line, mdi, g_editor.cx, vr.start);
         int cy_draw = y + (cursorVR - g_editor.scroll) * LINE_SPACING;
         int cw = g_font.halfAdvance();
         if (g_editor.cx < (int)line.length()) {

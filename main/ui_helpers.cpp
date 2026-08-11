@@ -179,6 +179,37 @@ int cellsToByte(const std::string &line, int start, int end, int targetCells) {
     return end;
 }
 
+// Leading markdown block marker length in bytes (0 if the line doesn't start
+// with one). Keeps the marker ("# ", "> ", "- ", "- [ ] ", ...) from being
+// split onto its own vrow by the space word-break below.
+static int mdPrefixLen(const std::string &line) {
+    int len = (int)line.size();
+    if (len >= 2 && line[0] == '>' && line[1] == ' ') return 2;
+    if (len >= 5 && (line.compare(0, 5, "- [ ]") == 0 || line.compare(0, 5, "- [x]") == 0 ||
+                     line.compare(0, 5, "- [X]") == 0))
+        return (len >= 6 && line[5] == ' ') ? 6 : 5;
+    if (len >= 2 && (line[0] == '-' || line[0] == '*' || line[0] == '+') && line[1] == ' ')
+        return 2;
+    int h = 0;
+    while (h < len && h < 6 && line[h] == '#') h++;
+    if (h >= 1 && h < len && line[h] == ' ') return h + 1;
+    return 0;
+}
+
+// Cells reserved per vrow for the RENDERED markdown block indent (task content
+// at cell 4, list at cell 4, quote at cell 5, heading at cell 2) so wrapped
+// content doesn't overrun the screen. Must match markdown_render.cpp layout.
+static int mdIndentCells(const std::string &line) {
+    int len = (int)line.size();
+    if (len >= 5 && (line.compare(0, 5, "- [ ]") == 0 || line.compare(0, 5, "- [x]") == 0 ||
+                     line.compare(0, 5, "- [X]") == 0))
+        return 3;  // task: content at cell 4 (shifted right 1 like lists)
+    if (len >= 2 && line[0] == '>' && line[1] == ' ') return 4;  // quote: content at cell 5
+    if (len >= 2 && (line[0] == '-' || line[0] == '*' || line[0] == '+') && line[1] == ' ')
+        return 3;  // list: bullet + text shifted right 1 cell
+    return mdPrefixLen(line) > 0 ? 2 : 0;  // heading
+}
+
 std::vector<VRow> buildVrows(const std::vector<std::string> &lines) {
     std::vector<VRow> vrows;
     for (int li = 0; li < (int)lines.size(); li++) {
@@ -188,17 +219,23 @@ std::vector<VRow> buildVrows(const std::vector<std::string> &lines) {
             vrows.push_back({li, 0, 0});
             continue;
         }
+        int maxc = SCREEN_W / g_font.halfAdvance();
+        int indent = mdIndentCells(line);
+        int prefixEnd = mdPrefixLen(line);
         int pos = 0;
         while (pos < len) {
             int cells = 0;
             int end = pos;
             int lastBreak = -1;
+            int pe = (pos == 0) ? prefixEnd : 0;  // only the first vrow has the marker
+            int cap = maxc - indent + pe;        // first vrow also counts the marker bytes
+            if (cap > maxc) cap = maxc;
             while (end < len) {
                 unsigned char c = (unsigned char)line[end];
                 int cc = charCellWidth(c);
-                if (cells + cc > (SCREEN_W / g_font.halfAdvance())) break;
+                if (cells + cc > cap) break;
                 cells += cc;
-                if (c == ' ') lastBreak = end + 1;
+                if (c == ' ' && end >= pe) lastBreak = end + 1;
                 if (c < 0x80) end++;
                 else if ((c & 0xE0) == 0xC0) end += 2;
                 else if ((c & 0xF0) == 0xE0) end += 3;

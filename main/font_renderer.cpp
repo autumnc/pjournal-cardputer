@@ -179,6 +179,7 @@ extern "C" {
     extern void u8g2_SetDrawColor(void *u8g2, int color);
     extern void u8g2_DrawPixel(void *u8g2, int x, int y);
     extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
+    extern void u8g2_DrawHLine(void *u8g2, int x, int y, int w);
     extern void *u8g2_st7305_get_u8g2(void *dev);
 }
 struct u8g2_struct;
@@ -256,4 +257,49 @@ int FontRenderer::drawText(int x, int y, const char *text, bool invert) {
         }
     }
     return x - orig_x;
+}
+
+int FontRenderer::drawTextStyled(int x, int y, const char *text, const TextStyle &ts) {
+    int orig_x = x;
+    int w = textWidth(text);
+    if (ts.invert) {
+        int asc = ascent_;
+        u8g2_SetDrawColor(g_u8g2, 0);  // dark box
+        u8g2_DrawBox(g_u8g2, x, y - asc, w, line_height_);
+        u8g2_SetDrawColor(g_u8g2, 1);  // light glyphs
+    }
+    while (*text) {
+        uint32_t cp = utf8Decode(text);
+        if (cp == 0) continue;
+        int adv;
+        auto *sym = getSymbolGlyph(cp, font_size_);
+        if (sym) {
+            if (ts.bold) drawSymbolGlyph(x + 1, y, sym, false);
+            drawSymbolGlyph(x, y, sym, false);
+            adv = sym->advance;
+        } else {
+            auto *meta = findGlyph(cp);
+            if (meta) {
+                if (ts.bold) drawGlyph(x + 1, y, meta, false);
+                drawGlyph(x, y, meta, false);
+                adv = meta->advance;
+            } else {
+                adv = line_height_ / 2;
+            }
+        }
+        if (ts.emph && cp != 0x20) {
+            int cx = x + adv / 2;
+            int cy = y + descent_ + 1;  // in the 4px gap below the em box
+            u8g2_DrawBox(g_u8g2, cx - 1, cy, 3, 2);
+        }
+        x += adv;
+    }
+    if (ts.underline) u8g2_DrawHLine(g_u8g2, orig_x, y + 5, w);
+    if (ts.strike) {
+        int sy = y - ascent_ + line_height_ / 2;
+        u8g2_DrawHLine(g_u8g2, orig_x, sy, w);
+        u8g2_DrawHLine(g_u8g2, orig_x, sy + 1, w);
+    }
+    if (ts.invert) u8g2_SetDrawColor(g_u8g2, 0);  // restore ink color
+    return w;
 }

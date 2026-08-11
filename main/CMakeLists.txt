@@ -24,6 +24,7 @@ idf_component_register(SRCS
     "screen_inspiration.cpp"
     "screen_voice.cpp"
     "voice_input.cpp"
+    "markdown_render.cpp"
     INCLUDE_DIRS "."
     EMBED_FILES
         "ime/ime_table_pinyin.bin"
@@ -55,4 +56,4 @@ idf_component_register(SRCS
         efuse
 )
 
-target_compile_definitions(${COMPONENT_LIB} PRIVATE PJOURNAL_VERSION="3.1.0")
+target_compile_definitions(${COMPONENT_LIB} PRIVATE PJOURNAL_VERSION="3.2.0")
