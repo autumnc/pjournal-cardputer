@@ -151,6 +151,7 @@ private:
 
     void reset();
     void lookup();
+    void lookupSegmented();  // 单引号分词编码的查词路径
     void buildPage();
     bool commit(int idx, std::string &out);
     bool handleFullwidthPunct(int key, std::string &out);

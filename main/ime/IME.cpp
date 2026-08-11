@@ -1,4 +1,5 @@
 #include "IME.h"
+#include "seg_table.h"
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
@@ -420,6 +421,13 @@ void IME::lookup() {
         return;
     }
 
+    // 单引号编码分词: 显式按音节分段匹配(词组/补充表/用户词典)
+    if (_code.find('\'') != std::string::npos) {
+        lookupSegmented();
+        buildPage();
+        return;
+    }
+
     const char *q = _code.c_str();
     int qlen = (int)_code.length();
 
@@ -576,6 +584,26 @@ void IME::lookup() {
     }
     if (_all.size() >= MAX_CANDIDATES) { buildPage(); return; }
 
+    // 补充词典表全码精确匹配: xian→西安, anguang→暗光 (优先级: 单字之后, 词组之前)
+    if (_all.size() < MAX_CANDIDATES) {
+        for (int i = 0; i < SEG_TABLE_COUNT && _all.size() < MAX_CANDIDATES; i++) {
+            std::string entryCode;
+            for (const char *p = SEG_TABLE[i].syllables; *p; p++)
+                if (*p != ' ') entryCode += *p;
+            if ((int)entryCode.length() != qlen ||
+                strncmp(entryCode.c_str(), q, qlen) != 0) continue;
+            std::string w = SEG_TABLE[i].word;
+            bool dup = false;
+            for (auto &e : _all) if (e == w) { dup = true; break; }
+            if (!dup) {
+                _all.push_back(w);
+                _candLen.push_back(qlen);
+                if (qlen > _maxMatchLen) _maxMatchLen = qlen;
+            }
+        }
+    }
+    if (_all.size() >= MAX_CANDIDATES) { buildPage(); return; }
+
     // Phase 3: user dict phrases — after dictionary single chars, before dictionary phrases
     {
         std::sort(userWordFreq.begin(), userWordFreq.end(),
@@ -670,6 +698,7 @@ void IME::lookup() {
         std::vector< std::pair<int, std::string> > userInitFreq;
         for (auto &p : _userWords) {
             if (p.trad != _trad) continue;
+            if (p.code.find('\'') != std::string::npos) continue;  // 撇号码只在分词路径匹配
             int cl = (int)p.code.length();
             if (cl < 2) continue;
             const char *wc = p.code.c_str();
@@ -949,6 +978,114 @@ void IME::lookup() {
     buildPage();
 }
 
+// 单引号分词查词: 编码形如 "xi'an" / "an'guang", 按 ' 切成音节段, 只匹配词组。
+// 1) 补充词典表(seg_table.h) 分段前缀匹配; 2) 用户词典带撇号码精确匹配;
+// 3) 主词典词组: 拼接码精确匹配且字数=段数。全部视为整码消费。
+void IME::lookupSegmented() {
+    std::vector<std::string> segs;
+    std::string cur;
+    for (char c : _code) {
+        if (c == '\'') {
+            if (!cur.empty()) segs.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty()) segs.push_back(cur);
+    if (segs.empty()) return;
+    std::string q;
+    for (auto &s : segs) q += s;
+    int fullLen = (int)_code.length();
+
+    // 1) 补充词典表
+    for (int i = 0; i < SEG_TABLE_COUNT && _all.size() < MAX_CANDIDATES; i++) {
+        const char *enc = SEG_TABLE[i].syllables;
+        std::vector<std::string> entrySyl;
+        {
+            std::string s;
+            for (const char *p = enc; *p; p++) {
+                if (*p == ' ') { if (!s.empty()) entrySyl.push_back(s); s.clear(); }
+                else s += *p;
+            }
+            if (!s.empty()) entrySyl.push_back(s);
+        }
+        if (segs.size() > entrySyl.size()) continue;
+        bool ok = true;
+        for (size_t k = 0; k < segs.size() && ok; k++) {
+            if (strncmp(segs[k].c_str(), entrySyl[k].c_str(), segs[k].length()) != 0)
+                ok = false;
+        }
+        if (!ok) continue;
+        std::string entryCode;
+        for (auto &s : entrySyl) entryCode += s;
+        if (strncmp(q.c_str(), entryCode.c_str(), q.length()) != 0) continue;
+        std::string w = SEG_TABLE[i].word;
+        bool dup = false;
+        for (auto &e : _all) if (e == w) { dup = true; break; }
+        if (!dup) {
+            _all.push_back(w);
+            _candLen.push_back(fullLen);
+        }
+    }
+
+    // 2) 用户词典: 带撇号码的整码精确匹配(用户曾用该分段码提交过的词)
+    for (auto &p : _userWords) {
+        if (_all.size() >= MAX_CANDIDATES) break;
+        if (p.trad != _trad) continue;
+        if (p.code.find('\'') == std::string::npos) continue;
+        if (p.code != _code) continue;
+        bool dup = false;
+        for (auto &e : _all) if (e == p.word) { dup = true; break; }
+        if (!dup) {
+            _all.push_back(p.word);
+            _candLen.push_back(fullLen);
+        }
+    }
+
+    // 3) 主词典词组: 拼接码精确匹配 + 字数/3 == 段数
+    if (_wordCount > 0 && _wordData && q.length() >= 2 && _all.size() < MAX_CANDIDATES) {
+        int k = (q[0] - 'a') * 26 + (q[1] - 'a');
+        size_t wlo = (k >= 0 && k < INDEX_ENTRIES) ? _wordIndex[k] : 0;
+        size_t whi = (k + 1 < INDEX_ENTRIES) ? _wordIndex[k + 1] : _wordDataSize;
+        size_t wpos = wlo;
+        int safety = 0;
+        while (wpos < whi && _all.size() < MAX_CANDIDATES && safety++ < 5000) {
+            uint8_t cl = _wordData[wpos];
+            if (cl == 0 || wpos + 1 + cl > whi) break;
+            const char *wc = (const char *)_wordData + wpos + 1;
+            wpos += 1 + cl;
+            if (wpos >= whi) break;
+            uint8_t n = _wordData[wpos++];
+            if ((int)cl == (int)q.length() && strncmp(wc, q.c_str(), cl) == 0) {
+                for (uint8_t j = 0; j < n && wpos < whi; j++) {
+                    uint8_t wl = _wordData[wpos++];
+                    if (wl == 0 || wpos + wl + 1 > whi) break;
+                    uint8_t wf = _wordData[wpos + wl];
+                    if ((int)wl == (int)segs.size() * 3 && (!_trad || wf == 0)) {
+                        std::string w((const char *)_wordData + wpos, wl);
+                        bool dup = false;
+                        for (auto &e : _all) if (e == w) { dup = true; break; }
+                        if (!dup) {
+                            _all.push_back(w);
+                            _candLen.push_back(fullLen);
+                        }
+                    }
+                    wpos += wl + 1;
+                }
+            } else {
+                for (uint8_t j = 0; j < n && wpos < whi; j++) {
+                    uint8_t wl = _wordData[wpos++];
+                    if (wpos + wl + 1 > whi) break;
+                    wpos += wl + 1;
+                }
+            }
+        }
+    }
+
+    _partialStart = (int)_all.size();
+}
+
 void IME::beginPredict(const std::string &text) {
     if (!_predData || _predDataSize < 3) return;
     reset();
@@ -1012,7 +1149,11 @@ bool IME::commit(int idx, std::string &out) {
     int partialRel = _partialStart - _pageStart;
     bool partial = (_remainder.length() > 0 && idx >= partialRel);
     int pLen = pinyinPrefixLen(_code);
-    bool hasUpperSuffix = (pLen < (int)_code.length());
+    // 大写后缀才拼进输出; 撇号码("xi'an")剩余部分是纯小写+分隔符, 不能当后缀
+    bool hasUpperSuffix = false;
+    for (int i = pLen; i < (int)_code.length(); i++) {
+        if (_code[i] >= 'A' && _code[i] <= 'Z') { hasUpperSuffix = true; break; }
+    }
     // Use per-candidate code length from _candLen for continuation
     int candIdx = idx + _pageStart;
     int consumedLen = (candIdx < (int)_candLen.size()) ? _candLen[candIdx] : 0;
@@ -1221,6 +1362,16 @@ bool IME::handleKey(int key, std::string &out) {
         if (_fullwidth && handleFullwidthChar(key, out)) return true;
         return false;
     }
+    // 单引号编码分词: 拼音模式下 ' 显式分隔音节(如 xi'an); 两分模式保留翻页
+    if (key == '\'' && !_lfMode) {
+        if (_code.back() == '\'') return true;
+        if ((int)_code.length() < _maxCode) {
+            _code += '\'';
+            _displayCodeDirty = true;
+            lookup();
+        }
+        return true;
+    }
     if (key >= '1' && key <= '9') {
         commit(key - '1', out);
         return true;
@@ -1267,7 +1418,7 @@ bool IME::handleKey(int key, std::string &out) {
         }
         return true;
     }
-    if (key == '=' || key == '\'' || key == '.') {
+    if (key == '=' || key == '.') {
         if (_pageStart + _pageSize < (int)_all.size()) {
             _pageStart += _pageSize;
             buildPage();
