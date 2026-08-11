@@ -186,6 +186,50 @@ struct u8g2_struct;
 typedef struct u8g2_struct u8g2_t;
 extern u8g2_t *g_u8g2;
 
+// True if the glyph's ink is made only of long horizontal bars (e.g. 一、二、三).
+// Such glyphs need an extra +1px vertical stroke in bold: the horizontal shift alone
+// only widens them, so the weight is invisible. Glyphs with vertical strokes or
+// diagonals (四、十、八、大…) already look bold from the horizontal shift and would
+// get too thick if we added a vertical stroke too.
+// A row is "bar-like" if its longest horizontal run spans >= half the glyph width.
+// The glyph qualifies if no column has a vertical run > 3 (no vertical stroke), and
+// every ink row is either bar-like or a tiny (<=4px) tick adjacent to a bar (the font
+// draws small end-ticks above CJK bars, e.g. row 0 of 一).
+static bool bitmapIsHorizontalOnly(const uint8_t *bits, int bw, int bh, int row_bytes) {
+    bool isBar[32] = {false};
+    int maxVRun = 0;
+
+    for (int row = 0; row < bh; row++) {
+        int best = 0, run = 0;
+        for (int col = 0; col < bw; col++) {
+            bool on = (bits[row * row_bytes + col / 8] >> (7 - (col % 8))) & 1;
+            if (on) { run++; if (run > best) best = run; }
+            else run = 0;
+        }
+        if (best * 2 >= bw) isBar[row] = true;
+    }
+
+    for (int col = 0; col < bw; col++) {
+        int run = 0;
+        for (int row = 0; row < bh; row++) {
+            bool on = (bits[row * row_bytes + col / 8] >> (7 - (col % 8))) & 1;
+            run = on ? run + 1 : 0;
+            if (run > maxVRun) maxVRun = run;
+        }
+    }
+    if (maxVRun > 3) return false;
+
+    for (int row = 0; row < bh; row++) {
+        int ink = 0;
+        for (int col = 0; col < bw; col++)
+            ink += (bits[row * row_bytes + col / 8] >> (7 - (col % 8))) & 1;
+        if (ink == 0 || isBar[row]) continue;
+        bool adj = (row > 0 && isBar[row - 1]) || (row + 1 < bh && isBar[row + 1]);
+        if (!adj || ink > 4) return false;
+    }
+    return true;
+}
+
 void FontRenderer::drawGlyph(int x, int y, const GlyphMeta *meta, bool invert) {
     if (!g_u8g2 || !meta) return;
 
@@ -281,6 +325,13 @@ int FontRenderer::drawTextStyled(int x, int y, const char *text, const TextStyle
             auto *meta = findGlyph(cp);
             if (meta) {
                 if (ts.bold) drawGlyph(x + 1, y, meta, false);
+                // 仅对纯横画字(一、二、三)额外向下描1px:水平位移只让它们变宽不变厚,
+                // 看不出加粗;含竖/斜笔画的字(四、十、八…)水平位移已足够,再加就过粗。
+                if (ts.bold &&
+                    bitmapIsHorizontalOnly(bitmap_data_ + meta->bitmap_offset,
+                                           meta->width, meta->height,
+                                           (meta->width + 7) / 8))
+                    drawGlyph(x, y + 1, meta, false);
                 drawGlyph(x, y, meta, false);
                 adv = meta->advance;
             } else {
