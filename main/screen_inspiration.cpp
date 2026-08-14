@@ -193,10 +193,9 @@ static void drawKeywordEdit() {
     // IME candidates
     if (g_ime.composing()) {
         std::string code = g_ime.displayCode();
-        int total = g_ime.totalCandidates();
         int pageSize = g_ime.pageSize();
         int curPage = g_ime.currentPage();
-        int totalPages = (total + pageSize - 1) / pageSize;
+        int totalPages = g_ime.totalPages();
         if (totalPages < 1) totalPages = 1;
         char pageInfo[32];
         snprintf(pageInfo, sizeof(pageInfo), "%d/%d", curPage, totalPages);
@@ -271,10 +270,9 @@ static void drawSearch() {
     int imeH = 0;
     if (g.searchImeActive && g_ime.composing()) {
         std::string code = g_ime.displayCode();
-        int total = g_ime.totalCandidates();
         int pageSize = g_ime.pageSize();
         int curPage = g_ime.currentPage();
-        int totalPages = (total + pageSize - 1) / pageSize;
+        int totalPages = g_ime.totalPages();
         if (totalPages < 1) totalPages = 1;
         char pageInfo[32];
         snprintf(pageInfo, sizeof(pageInfo), "%d/%d", curPage, totalPages);

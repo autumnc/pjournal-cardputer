@@ -338,6 +338,10 @@ extern "C" void app_main() {
     ime.begin();
     // Set candidate page size based on default 22pt font
     ime.setPageSize(7);
+    // 候选字按显示宽度动态分页: 宽度回调复用当前字体, 可用宽度与各界面
+    // 候选行渲染的 curW+partW+8>SCREEN_W 截断阈值一致(SCREEN_W=400)。
+    ime.setWidthFn([](const char *s) -> int { return g_font.textWidth(s); });
+    ime.setDisplayWidth(SCREEN_W - 8);
 
     // Initialize Bluetooth keyboard in background (non-blocking, faster boot)
     xTaskCreatePinnedToCore(btInitTask, "bt_init", 8192, NULL, 5, NULL, 1);

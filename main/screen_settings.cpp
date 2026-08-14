@@ -125,8 +125,7 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
                     auto &cands = g_ime.candidates();
                     int pageSize = g_ime.pageSize();
                     int curPage = g_ime.currentPage();
-                    int total = g_ime.totalCandidates();
-                    int totalPages = (total + pageSize - 1) / pageSize;
+                    int totalPages = g_ime.totalPages();
                     if (totalPages < 1) totalPages = 1;
 
                     char pageInfo[32];
@@ -286,8 +285,7 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
             auto &cands = g_ime.candidates();
             int pageSize = g_ime.pageSize();
             int curPage = g_ime.currentPage();
-            int total = g_ime.totalCandidates();
-            int totalPages = (total + pageSize - 1) / pageSize;
+            int totalPages = g_ime.totalPages();
             if (totalPages < 1) totalPages = 1;
 
             char pageInfo[32];

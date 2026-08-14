@@ -369,6 +369,7 @@ void IME::reset() {
     if (_page.capacity() > _pageSize * 2) _page.shrink_to_fit();
     else if (_page.capacity() < _pageSize) _page.reserve(_pageSize);
     _pageStart = 0;
+    _curPage = 0;
     _prefix.clear();
     _remainder.clear();
     _lfMode = false;
@@ -402,6 +403,7 @@ void IME::lookup() {
     _all.clear();
     _candLen.clear();
     _pageStart = 0;
+    _curPage = 0;
     _maxMatchLen = 0;
     if (_prefix.length() == 0) _codeOrig = _code;
     static bool dictLoaded = false;
@@ -1159,8 +1161,46 @@ void IME::beginPredict(const std::string &text) {
 
 void IME::buildPage() {
     _page.clear();
-    for (int i = _pageStart; i < (int)_all.size() && (int)_page.size() < _pageSize; i++)
-        _page.push_back(_all[i]);
+    if (_all.empty()) {
+        _pageStart = 0;
+        _curPage = 0;
+        _pageStarts.clear();
+        return;
+    }
+    if (_widthFn && _displayWidth > 0) {
+        // 按显示宽度分页: 与各界面候选行渲染一致, " 编号." 前缀 + 候选文本,
+        // 一行放不下则把该候选归入下一页, 保证候选不被隐藏。
+        _pageStarts.clear();
+        _pageStarts.push_back(0);
+        int lineW = 0;
+        for (int i = 0; i < (int)_all.size(); i++) {
+            char num[16];
+            snprintf(num, sizeof(num), " %d.", i - (int)_pageStarts.back() + 1);
+            std::string part = std::string(num) + _all[i];
+            int partW = _widthFn(part.c_str());
+            if (lineW > 0 && lineW + partW > _displayWidth) {
+                _pageStarts.push_back(i);
+                lineW = 0;
+                snprintf(num, sizeof(num), " 1.");
+                partW = _widthFn((std::string(num) + _all[i]).c_str());
+            }
+            lineW += partW;
+        }
+        if (_curPage < 0) _curPage = 0;
+        if (_curPage >= (int)_pageStarts.size()) _curPage = (int)_pageStarts.size() - 1;
+        _pageStart = _pageStarts[_curPage];
+        int end = (_curPage + 1 < (int)_pageStarts.size()) ? _pageStarts[_curPage + 1] : (int)_all.size();
+        for (int i = _pageStart; i < end; i++) _page.push_back(_all[i]);
+    } else {
+        // 退化: 未注册宽度回调时按固定每页数量分页
+        _pageStarts.clear();
+        for (int i = 0; i < (int)_all.size(); i += _pageSize) _pageStarts.push_back(i);
+        if (_curPage < 0) _curPage = 0;
+        if (_curPage >= (int)_pageStarts.size()) _curPage = (int)_pageStarts.size() - 1;
+        _pageStart = _pageStarts[_curPage];
+        for (int i = _pageStart; i < (int)_all.size() && (int)_page.size() < _pageSize; i++)
+            _page.push_back(_all[i]);
+    }
 }
 
 bool IME::commit(int idx, std::string &out) {
@@ -1342,17 +1382,11 @@ bool IME::handleKey(int key, std::string &out) {
             return true;
         }
         if (key == '-' || key == ';' || key == ',') {
-            if (_pageStart - _pageSize >= 0) {
-                _pageStart -= _pageSize;
-                buildPage();
-            }
+            if (_curPage > 0) { _curPage--; buildPage(); }
             return true;
         }
         if (key == '=' || key == '\'' || key == '.') {
-            if (_pageStart + _pageSize < (int)_all.size()) {
-                _pageStart += _pageSize;
-                buildPage();
-            }
+            if (_curPage + 1 < (int)_pageStarts.size()) { _curPage++; buildPage(); }
             return true;
         }
         if (key == '\b' || key == 27 || key == '\n') {
@@ -1445,17 +1479,11 @@ bool IME::handleKey(int key, std::string &out) {
         return true;
     }
     if (key == '-' || key == ';' || key == ',') {
-        if (_pageStart - _pageSize >= 0) {
-            _pageStart -= _pageSize;
-            buildPage();
-        }
+        if (_curPage > 0) { _curPage--; buildPage(); }
         return true;
     }
     if (key == '=' || key == '.') {
-        if (_pageStart + _pageSize < (int)_all.size()) {
-            _pageStart += _pageSize;
-            buildPage();
-        }
+        if (_curPage + 1 < (int)_pageStarts.size()) { _curPage++; buildPage(); }
         return true;
     }
     if (_page.size() > 0) {

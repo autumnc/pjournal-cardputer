@@ -62,9 +62,16 @@ public:
     IME &operator=(const IME &) = delete;
 
     void setPageSize(int n) { _pageSize = n; }
-    int pageSize() const { return _pageSize; }
+    // 返回当前页实际候选数量(界面用 (i % pageSize)+1 编号, 页内从 1 起)
+    int pageSize() const { int n = (int)_page.size(); return n >= 1 ? n : 1; }
     int totalCandidates() const { return (int)_all.size(); }
-    int currentPage() const { return _pageStart / _pageSize + 1; }
+    int totalPages() const { return _pageStarts.empty() ? 1 : (int)_pageStarts.size(); }
+    int currentPage() const { return _curPage + 1; }
+
+    using WidthFn = int (*)(const char *text);
+    void setWidthFn(WidthFn fn) { _widthFn = fn; }
+    // 候选行可用像素宽度(与各界面渲染 curW+partW+8>SCREEN_W 的 8px 余量一致)
+    void setDisplayWidth(int w) { _displayWidth = w; }
 
 private:
     IME() {}
@@ -139,6 +146,10 @@ private:
     std::vector<std::string> _page;
     int _pageStart = 0;
     int _pageSize = 9;
+    int _curPage = 0;                    // 当前页索引(第 _curPage+1 页)
+    std::vector<int> _pageStarts;        // 每页起始候选索引; 按实测宽度分页时由 buildPage 重建
+    WidthFn _widthFn = nullptr;          // 候选文本宽度测量回调
+    int _displayWidth = 0;               // 候选行可用像素宽度(0=退化为固定 _pageSize 分页)
 
     mutable std::string _displayCodeCache;
     mutable bool _displayCodeDirty = true;

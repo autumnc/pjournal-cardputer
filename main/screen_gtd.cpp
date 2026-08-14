@@ -1129,13 +1129,11 @@ static void drawIMEStatus() {
 
     std::string code = g_ime.displayCode();
 
-    int total = g_ime.totalCandidates();
-
     int pageSize = g_ime.pageSize();
 
     int curPage = g_ime.currentPage();
 
-    int totalPages = (total + pageSize - 1) / pageSize;
+    int totalPages = g_ime.totalPages();
 
     if (totalPages < 1) totalPages = 1;
 
@@ -1895,13 +1893,11 @@ static void drawAdd() {
 
         std::string code = g_ime.displayCode();
 
-        int total = g_ime.totalCandidates();
-
         int pageSize = g_ime.pageSize();
 
         int curPage = g_ime.currentPage();
 
-        int totalPages = (total + pageSize - 1) / pageSize;
+        int totalPages = g_ime.totalPages();
 
         if (totalPages < 1) totalPages = 1;
 
@@ -3038,13 +3034,11 @@ static void drawNoteEditor() {
 
         std::string code = g_ime.displayCode();
 
-        int total = g_ime.totalCandidates();
-
         int pageSize = g_ime.pageSize();
 
         int curPage = g_ime.currentPage();
 
-        int totalPages = (total + pageSize - 1) / pageSize;
+        int totalPages = g_ime.totalPages();
 
         if (totalPages < 1) totalPages = 1;
 
