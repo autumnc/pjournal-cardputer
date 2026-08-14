@@ -1,5 +1,6 @@
 #include "IME.h"
 #include "seg_table.h"
+#include "trad_table.h"
 #include <cstring>
 #include <cstdio>
 #include <algorithm>
@@ -24,6 +25,33 @@ static void appendUtf8(uint32_t cp, std::string &out) {
         out += (char)(0x80 | ((cp >> 6) & 0x3F));
         out += (char)(0x80 | (cp & 0x3F));
     }
+}
+
+// 词组是否含繁体字形(trad_table.h 位图, U+346E-U+9FD3)。
+static bool wordHasTrad(const std::string &w) {
+    const char *p = w.c_str();
+    while (*p) {
+        unsigned char c = (unsigned char)*p;
+        uint32_t cp;
+        if (c < 0x80) { cp = c; p += 1; }
+        else if ((c & 0xE0) == 0xC0) { cp = ((c & 0x1F) << 6) | ((unsigned char)p[1] & 0x3F); p += 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = ((c & 0x0F) << 12) | (((unsigned char)p[1] & 0x3F) << 6) | ((unsigned char)p[2] & 0x3F); p += 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = ((c & 0x07) << 18) | (((unsigned char)p[1] & 0x3F) << 12) | (((unsigned char)p[2] & 0x3F) << 6) | ((unsigned char)p[3] & 0x3F); p += 4; }
+        else { p += 1; continue; }
+        if (cp >= kTradLo && cp <= kTradHi) {
+            uint32_t off = cp - kTradLo;
+            if ((kTradBitmap[off / 8] >> (off % 8)) & 1) return true;
+        }
+    }
+    return false;
+}
+
+// 词组在当前显示模式下是否显示: 繁体模式隐藏含简体字形的词组(wf!=0);
+// 简体模式隐藏含繁体字形的词组; 单字(≤3字节)不受影响。
+static bool wordVisible(bool trad, const std::string &w, uint8_t wf) {
+    if (trad) return wf == 0;
+    if (w.size() <= 3) return true;
+    return !wordHasTrad(w);
 }
 
 // Embedded dictionary symbols (from CMakeLists EMBED_FILES "ime/ime_table_pinyin.bin")
@@ -641,9 +669,9 @@ void IME::lookup() {
                         wpos += wl + 1;
                         continue;
                     }
-                    if (!_trad || wf == 0) {
-                        std::string w;
-                        w.append((const char *)_wordData + wpos, wl);
+                    std::string w;
+                    w.append((const char *)_wordData + wpos, wl);
+                    if (wordVisible(_trad, w, wf)) {
                         bool dup = false;
                         for (auto &e : _all) if (e == w) { dup = true; break; }
                         if (!dup) {
@@ -787,9 +815,9 @@ void IME::lookup() {
                     uint8_t wl = _wordData[spos++];
                     if (wl == 0 || spos + wl + 1 > shi) break;
                     uint8_t wf = _wordData[spos + wl];
-                    if (_all.size() < MAX_CANDIDATES && (!_trad || wf == 0)) {
-                        std::string w;
-                        w.append((const char *)_wordData + spos, wl);
+                    std::string w;
+                    w.append((const char *)_wordData + spos, wl);
+                    if (_all.size() < MAX_CANDIDATES && wordVisible(_trad, w, wf)) {
                         bool dup = false;
                         for (auto &e : _all) if (e == w) { dup = true; break; }
                         if (!dup) {
@@ -913,9 +941,9 @@ void IME::lookup() {
                     uint8_t wl = _wordData[spos++];
                     if (wl == 0 || spos + wl + 1 > shi) break;
                     uint8_t wf = _wordData[spos + wl];
-                    if (_all.size() < MAX_CANDIDATES && (!_trad || wf == 0)) {
-                        std::string w;
-                        w.append((const char *)_wordData + spos, wl);
+                    std::string w;
+                    w.append((const char *)_wordData + spos, wl);
+                    if (_all.size() < MAX_CANDIDATES && wordVisible(_trad, w, wf)) {
                         bool dup = false;
                         for (auto &e : _all) if (e == w) { dup = true; break; }
                         if (!dup) {
@@ -1057,8 +1085,8 @@ void IME::lookupSegmented() {
                     uint8_t wl = _wordData[wpos++];
                     if (wl == 0 || wpos + wl + 1 > whi) break;
                     uint8_t wf = _wordData[wpos + wl];
-                    if ((int)wl == (int)segs.size() * 3 && (!_trad || wf == 0)) {
-                        std::string w((const char *)_wordData + wpos, wl);
+                    std::string w((const char *)_wordData + wpos, wl);
+                    if ((int)wl == (int)segs.size() * 3 && wordVisible(_trad, w, wf)) {
                         bool dup = false;
                         for (auto &e : _all) if (e == w) { dup = true; break; }
                         if (!dup) {
