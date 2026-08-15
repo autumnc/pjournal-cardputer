@@ -6,36 +6,18 @@ static const char *TAG = "Font";
 FontRenderer g_font;
 
 // Embedded font data from CMakeLists EMBED_FILES
-extern const uint8_t terminus28_fnt_start[] asm("_binary_terminus28_fnt_start");
-extern const uint8_t terminus28_fnt_end[]   asm("_binary_terminus28_fnt_end");
 extern const uint8_t terminus22_fnt_start[] asm("_binary_terminus22_fnt_start");
 extern const uint8_t terminus22_fnt_end[]   asm("_binary_terminus22_fnt_end");
 
 bool FontRenderer::begin() {
-    blob_28_ = terminus28_fnt_start;
     blob_22_ = terminus22_fnt_start;
-    // Default to 28pt
-    return setSize(28);
+    return setSize(22);
 }
 
 bool FontRenderer::setSize(int fontSize) {
-    if (fontSize == font_size_) return true;
-
-    const uint8_t *blob = nullptr;
-    size_t sz = 0;
-
-    if (fontSize == 28) {
-        blob = blob_28_;
-        sz = terminus28_fnt_end - terminus28_fnt_start;
-    } else if (fontSize == 22) {
-        blob = blob_22_;
-        sz = terminus22_fnt_end - terminus22_fnt_start;
-    } else {
-        return false;
-    }
-    if (!blob) return false;
-
-    return parseBlob(blob, sz);
+    if (fontSize == font_size_ && loaded_) return true;
+    (void)fontSize;  // 28pt 字体已删除,任何请求都固定用 22pt
+    return parseBlob(blob_22_, terminus22_fnt_end - terminus22_fnt_start);
 }
 
 bool FontRenderer::parseBlob(const uint8_t *blob, size_t sz) {
@@ -180,7 +162,6 @@ extern "C" {
     extern void u8g2_DrawPixel(void *u8g2, int x, int y);
     extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
     extern void u8g2_DrawHLine(void *u8g2, int x, int y, int w);
-    extern void *u8g2_st7305_get_u8g2(void *dev);
 }
 struct u8g2_struct;
 typedef struct u8g2_struct u8g2_t;

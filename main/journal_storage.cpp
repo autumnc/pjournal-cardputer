@@ -8,7 +8,8 @@
 #include <sys/stat.h>
 #include <esp_vfs_fat.h>
 #include <sdmmc_cmd.h>
-#include <driver/sdmmc_host.h>
+#include <driver/sdspi_host.h>
+#include <driver/spi_master.h>
 #include <esp_log.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -27,10 +28,12 @@ static SemaphoreHandle_t s_sd_mutex = nullptr;
 
 SemaphoreHandle_t JournalStorage::sdMutex() { return s_sd_mutex; }
 
-// SDMMC pin configuration for ESP32-S3-RLCD-4.2
-#define SDMMC_CLK GPIO_NUM_38
-#define SDMMC_CMD GPIO_NUM_21
-#define SDMMC_D0  GPIO_NUM_39
+// Cardputer SD card over SPI (SPI2_HOST): SCLK=40, MOSI=14, MISO=39, CS=12
+#define SD_SPI_HOST SPI2_HOST
+#define SD_CLK     GPIO_NUM_40
+#define SD_MOSI    GPIO_NUM_14
+#define SD_MISO    GPIO_NUM_39
+#define SD_CS      GPIO_NUM_12
 
 JournalStorage g_journal;
 
@@ -40,17 +43,32 @@ bool JournalStorage::begin() {
     mount_config.max_files = 16;
     mount_config.allocation_unit_size = 16 * 1024;
 
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    spi_bus_config_t bus_cfg = {};
+    bus_cfg.mosi_io_num = SD_MOSI;
+    bus_cfg.miso_io_num = SD_MISO;
+    bus_cfg.sclk_io_num = SD_CLK;
+    bus_cfg.quadwp_io_num = -1;
+    bus_cfg.quadhd_io_num = -1;
+    bus_cfg.max_transfer_sz = 16384;
 
-    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.width = 1;
-    slot_config.clk   = SDMMC_CLK;
-    slot_config.cmd   = SDMMC_CMD;
-    slot_config.d0    = SDMMC_D0;
-    slot_config.flags = SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+    esp_err_t ret = spi_bus_initialize(SD_SPI_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "SD SPI bus already initialized, reusing host %d", SD_SPI_HOST);
+    } else if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SD SPI bus init failed: %d", ret);
+        mounted_ = false;
+        return false;
+    }
+
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = SD_CS;
+    slot_config.host_id = SD_SPI_HOST;
+
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = SD_SPI_HOST;
 
     sdmmc_card_t *card = nullptr;
-    esp_err_t ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &mount_config, &card);
+    ret = esp_vfs_fat_sdspi_mount("/sdcard", &host, &slot_config, &mount_config, &card);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "SD card mount failed: %d", ret);
         mounted_ = false;
@@ -71,6 +89,7 @@ bool JournalStorage::begin() {
 void JournalStorage::deinit() {
     if (mounted_) {
         esp_vfs_fat_sdcard_unmount("/sdcard", nullptr);
+        spi_bus_free(SD_SPI_HOST);
         mounted_ = false;
     }
 }
@@ -268,6 +287,57 @@ std::string JournalStorage::readEntry(const std::string &filename) {
     fclose(f);
     if (s_sd_mutex) xSemaphoreGiveRecursive(s_sd_mutex);
     return result;
+}
+
+// ── 快捷编辑文件(SD根目录)───────────────────────────────────────────────
+std::string JournalStorage::readQuickFile(int index) {
+    if (!mounted_ || index < 0 || index > 9) return "";
+    char fname[16];
+    snprintf(fname, sizeof(fname), "/sdcard/%d.txt", index);
+    if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
+    FILE *f = fopen(fname, "r");
+    std::string result;
+    if (f) {
+        char buf[256];
+        int n;
+        while ((n = fread(buf, 1, sizeof(buf) - 1, f)) > 0) {
+            buf[n] = 0;
+            result += buf;
+        }
+        fclose(f);
+    }
+    if (s_sd_mutex) xSemaphoreGiveRecursive(s_sd_mutex);
+    return result;
+}
+
+bool JournalStorage::saveQuickFile(int index, const std::string &content) {
+    if (!mounted_ || index < 0 || index > 9) return false;
+    char fname[16];
+    snprintf(fname, sizeof(fname), "/sdcard/%d.txt", index);
+    if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
+    FILE *f = fopen(fname, "w");
+    if (!f) { if (s_sd_mutex) xSemaphoreGiveRecursive(s_sd_mutex); return false; }
+    fwrite(content.data(), 1, content.size(), f);
+    fclose(f);
+    if (s_sd_mutex) xSemaphoreGiveRecursive(s_sd_mutex);
+    return true;
+}
+
+void JournalStorage::ensureQuickFiles() {
+    if (!mounted_) return;
+    if (s_sd_mutex) xSemaphoreTakeRecursive(s_sd_mutex, portMAX_DELAY);
+    for (int i = 0; i < 10; i++) {
+        char fname[16];
+        snprintf(fname, sizeof(fname), "/sdcard/%d.txt", i);
+        FILE *f = fopen(fname, "r");
+        if (!f) {
+            f = fopen(fname, "w");
+            if (f) fclose(f);
+        } else {
+            fclose(f);
+        }
+    }
+    if (s_sd_mutex) xSemaphoreGiveRecursive(s_sd_mutex);
 }
 
 bool JournalStorage::deleteEntry(const std::string &filename) {

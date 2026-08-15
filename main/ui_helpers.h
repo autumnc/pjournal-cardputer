@@ -13,9 +13,9 @@ typedef struct u8g2_struct u8g2_t;
 // VRow structure for word-wrap rendering
 struct VRow { int lineIdx; int start; int end; };
 
-// UI constants - screen dimensions are fixed
-#define SCREEN_W 400
-#define SCREEN_H 300
+// UI constants - screen dimensions (Cardputer ST7789 240x135 landscape)
+#define SCREEN_W 240
+#define SCREEN_H 135
 
 // Font-dependent metrics (dynamic via g_font)
 #define FONT_H (g_font.lineHeight())

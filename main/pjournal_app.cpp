@@ -5,6 +5,7 @@
 #include "builtin_prompts.h"
 #include "settings_manager.h"
 #include "markdown_render.h"
+#include "u8g2_st7789.h"
 #include <cstdlib>
 #include <cstdio>
 #include <ctime>
@@ -18,11 +19,8 @@ std::string g_clipboard;  // global clipboard definition
 std::string g_flomoPendingText;
 AppState g_flomoReturnTo = APP_EDITOR;
 
-extern "C" {
-    extern void u8g2_SetDrawColor(void *g_u8g2, int color);
-    extern void u8g2_DrawHLine(void *g_u8g2, int x, int y, int w);
-    extern void u8g2_SendBuffer(void *g_u8g2);
-}
+bool g_quickEdit = false;   // 编辑模式:快捷编辑(true)/个人日记(false)
+int g_quickFile = 0;        // 当前快捷编辑文件 0-9
 
 // ── Screen state ─────────────────────────────────────────────────────────
 static struct { int selection = 0; int scroll = 0; } g_browser;
@@ -47,47 +45,94 @@ void screen_main_init() {
     }
 }
 
-AppState screen_main_handle(int key, ScreenContext &ctx) {
-    ui_clear(); int y = FONT_H;
+// 主菜单:保留原样式(居中 [键] 标签),滚动条 + 方向键选择,快捷键直达
+static int g_mainMenuSel = 0;
+static int g_mainMenuScroll = 0;
 
+static const struct { char key; const char *label; } MAIN_MENU[] = {
+    {'p', "提示写作"},
+    {'f', "自由写作"},
+    {'v', "查看过往日记"},
+    {'w', "同步WebDAV"},
+    {'o', "大纲写作"},
+    {'s', "设置"},
+};
+static const int MAIN_MENU_COUNT = (int)(sizeof(MAIN_MENU) / sizeof(MAIN_MENU[0]));
+
+AppState screen_main_handle(int key, ScreenContext &ctx) {
+    // `;` `.` `,` `/` 模拟方向键(右下角菱形按键簇)
+    if (key == ';') key = KEY_UP;
+    else if (key == ',') key = KEY_LEFT;
+    else if (key == '.') key = KEY_DOWN;
+    else if (key == '/') key = KEY_RIGHT;
+
+    // Ctrl+= / Ctrl+- 亮度调节(0x8E/0x8F 不匹配任何菜单键,落入 activate 无动作)
+    if (key == KEY_CTRL_EQUALS && g_lcd_dev) {
+        int nb = (int)u8g2_st7789_get_backlight(g_lcd_dev) + 32;
+        if (nb > 255) nb = 255;
+        u8g2_st7789_set_backlight(g_lcd_dev, (uint8_t)nb);
+    }
+    if (key == KEY_CTRL_MINUS && g_lcd_dev) {
+        int nb = (int)u8g2_st7789_get_backlight(g_lcd_dev) - 32;
+        if (nb < 32) nb = 32;
+        u8g2_st7789_set_backlight(g_lcd_dev, (uint8_t)nb);
+    }
+
+    auto activate = [&](char k) {
+        if (k=='p'||k=='P') { ctx.promptMode=true; ctx.promptText=BUILTIN_PROMPTS[rand()%BUILTIN_PROMPT_COUNT]; ctx.prevState=APP_MAIN; ctx.nextState=APP_EDITOR; }
+        else if (k=='f'||k=='F') { ctx.promptMode=false; ctx.promptText=""; ctx.prevState=APP_MAIN; ctx.nextState=APP_EDITOR; }
+        else if ((k=='v'||k=='V') && g_journal.totalEntries()>0) ctx.nextState=APP_BROWSER;
+        else if (k=='w'||k=='W') ctx.nextState=APP_SYNC_WEBDAV;
+        else if (k=='s'||k=='S') ctx.nextState=APP_SETTINGS;
+        else if (k=='o'||k=='O') ctx.nextState=APP_OUTLINE;
+        else if (k=='q'||k=='Q') ctx.nextState=APP_QUIT;
+    };
+
+    if (key == KEY_UP) { if (g_mainMenuSel > 0) g_mainMenuSel--; }
+    else if (key == KEY_DOWN) { if (g_mainMenuSel < MAIN_MENU_COUNT-1) g_mainMenuSel++; }
+    else if (key == 0x0A || key == 0x0D) { activate(MAIN_MENU[g_mainMenuSel].key); }
+    else activate(key);
+
+    ui_clear(); int y = 18;
     time_t now_t; time(&now_t); struct tm *tm = localtime(&now_t);
     char dateStr[32]; strftime(dateStr, sizeof(dateStr), "%Y-%m-%d", tm);
     char title[64]; snprintf(title, sizeof(title), "个人日记 %s", dateStr);
     ui_draw_text_centered(y, title, false, true); y += FONT_H;
-    int daysSinceMon = (tm->tm_wday == 0) ? 6 : tm->tm_wday - 1;
-    time_t monday = now_t - daysSinceMon * 86400;
-    const char *dnames[7] = {"一","二","三","四","五","六","日"};
-    const int colWidth = SCREEN_W / 7;
-    const int colStartX = (SCREEN_W - colWidth * 7) / 2;
-    for (int i = 0; i < 7; i++) {
-        time_t d = monday + i * 86400; struct tm *dtm = localtime(&d);
-        char ds[16]; strftime(ds, sizeof(ds), "%Y-%m-%d", dtm);
-        bool isToday = (i == daysSinceMon);
-        bool has = g_journal.hasEntry(ds);
-        char dayStr[8];
-        if (isToday) snprintf(dayStr, sizeof(dayStr), "[%s]", dnames[i]);
-        else snprintf(dayStr, sizeof(dayStr), " %s ", dnames[i]);
-        int cx = colStartX + i * colWidth + (colWidth - g_font.textWidth(dayStr)) / 2;
-        g_font.drawText(cx, y, dayStr, false);
-        const char *mark = has ? "✓" : (d <= now_t ? "·" : " ");
-        int mx = colStartX + i * colWidth + (colWidth - g_font.textWidth(mark)) / 2;
-        g_font.drawText(mx, y + FONT_H, mark, false);
-    }
-    y += FONT_H * 2;
 
-    char buf[48]; snprintf(buf, sizeof(buf), "连续:%d天 总计:%d篇", g_journal.getStreak(), g_journal.totalEntries());
+    char buf[48];
+    snprintf(buf, sizeof(buf), "连续:%d天 总计:%d篇", g_journal.getStreak(), g_journal.totalEntries());
     ui_draw_text_centered(y, buf); y += FONT_H;
     int tc = g_journal.countToday();
     if (tc > 0) { snprintf(buf, sizeof(buf), "✓ 今日已写%d篇", tc); ui_draw_text_centered(y, buf, false, true); }
     else ui_draw_text_centered(y, "今日尚未写日记");
     y += FONT_H;
-    ui_draw_text_centered(y, "[p] 提示写作"); y += FONT_H;
-    ui_draw_text_centered(y, "[f] 自由写作"); y += FONT_H;
-    if (g_journal.totalEntries() > 0) { ui_draw_text_centered(y, "[v] 查看过往日记"); y += FONT_H; }
-    ui_draw_text_centered(y, "[w] 同步WebDAV"); y += FONT_H;
-    ui_draw_text_centered(y, "[t] GTD任务管理"); y += FONT_H;
-    ui_draw_text_centered(y, "[o] 大纲写作"); y += FONT_H;
-    ui_draw_text_centered(y, "[s] 设置"); y += FONT_H;
+
+    // 居中菜单(保留原样式):滚动条 + 方向键选择,选中项高亮
+    int menuY = y;
+    int vis = (STATUS_Y - menuY + FONT_H - 1) / FONT_H;
+    if (vis < 1) vis = 1;
+    if (vis > MAIN_MENU_COUNT) vis = MAIN_MENU_COUNT;
+    if (g_mainMenuSel < g_mainMenuScroll) g_mainMenuScroll = g_mainMenuSel;
+    if (g_mainMenuSel >= g_mainMenuScroll + vis) g_mainMenuScroll = g_mainMenuSel - vis + 1;
+    if (g_mainMenuScroll > MAIN_MENU_COUNT - vis) g_mainMenuScroll = MAIN_MENU_COUNT - vis;
+    if (g_mainMenuScroll < 0) g_mainMenuScroll = 0;
+
+    for (int i = 0; i < vis; i++) {
+        int idx = g_mainMenuScroll + i;
+        char item[40]; snprintf(item, sizeof(item), "[%c] %s", MAIN_MENU[idx].key, MAIN_MENU[idx].label);
+        ui_draw_text_centered(menuY + i * FONT_H, item, idx == g_mainMenuSel);
+    }
+
+    // 右侧滚动条
+    if (MAIN_MENU_COUNT > vis) {
+        int trackH = vis * FONT_H;
+        int thumbH = trackH * vis / MAIN_MENU_COUNT;
+        if (thumbH < 4) thumbH = 4;
+        int thumbY = menuY + (trackH - thumbH) * g_mainMenuScroll / (MAIN_MENU_COUNT - vis);
+        u8g2_SetDrawColor(g_u8g2, 0);
+        u8g2_DrawBox(g_u8g2, SCREEN_W - 4, thumbY, 3, thumbH);
+        u8g2_SetDrawColor(g_u8g2, 0);
+    }
 
     std::string batteryGroup = battery_status_text();
     if (!batteryGroup.empty()) {
@@ -96,14 +141,6 @@ AppState screen_main_handle(int key, ScreenContext &ctx) {
     }
     ui_commit();
 
-    if (key == 'p'||key=='P') { ctx.promptMode=true; ctx.promptText=BUILTIN_PROMPTS[rand()%BUILTIN_PROMPT_COUNT]; ctx.prevState=APP_MAIN; ctx.nextState=APP_EDITOR; }
-    else if (key == 'f'||key=='F') { ctx.promptMode=false; ctx.promptText=""; ctx.prevState=APP_MAIN; ctx.nextState=APP_EDITOR; }
-    else if ((key=='v'||key=='V') && g_journal.totalEntries()>0) ctx.nextState=APP_BROWSER;
-    else if (key=='w'||key=='W') ctx.nextState=APP_SYNC_WEBDAV;
-    else if (key=='s'||key=='S') ctx.nextState=APP_SETTINGS;
-    else if (key=='t'||key=='T') ctx.nextState=APP_GTD;
-    else if (key=='o'||key=='O') ctx.nextState=APP_OUTLINE;
-    else if (key=='q'||key=='Q') ctx.nextState=APP_QUIT;
     return ctx.nextState;
 }
 
@@ -116,8 +153,8 @@ AppState screen_browser_handle(int key, ScreenContext &ctx) {
     if (g_browser.selection >= (int)entries.size()) g_browser.selection = (int)entries.size() - 1;
 
     if (key == 'q' || key == 'Q' || key == 0x1B) { ctx.nextState = APP_MAIN; return APP_MAIN; }
-    if (key == 'j' || key == KEY_DOWN) { g_browser.selection++; if (g_browser.selection>=(int)entries.size()) g_browser.selection=(int)entries.size()-1; }
-    if (key == 'k' || key == KEY_UP) { g_browser.selection--; if (g_browser.selection<0) g_browser.selection=0; }
+    if (key == 'j' || key == '.' || key == KEY_DOWN) { g_browser.selection++; if (g_browser.selection>=(int)entries.size()) g_browser.selection=(int)entries.size()-1; }
+    if (key == 'k' || key == ';' || key == KEY_UP) { g_browser.selection--; if (g_browser.selection<0) g_browser.selection=0; }
     if (key == 0x0A || key == 0x0D) { ctx.selectedEntry = entries[g_browser.selection].filename; ctx.nextState = APP_VIEWER; return APP_VIEWER; }
     if (key == 'd' || key == 'D') {
         g_journal.deleteEntry(entries[g_browser.selection].filename);
@@ -193,8 +230,8 @@ void screen_viewer_init(const std::string &filename) {
 
 AppState screen_viewer_handle(int key, ScreenContext &ctx) {
     if (key == 'q' || key == 'Q' || key == 0x1B) { ctx.nextState = APP_BROWSER; return APP_BROWSER; }
-    if (key == 'j' || key == KEY_DOWN) g_viewer.scroll++;
-    if (key == 'k' || key == KEY_UP) { if (g_viewer.scroll > 0) g_viewer.scroll--; }
+    if (key == 'j' || key == '.' || key == KEY_DOWN) g_viewer.scroll++;
+    if (key == 'k' || key == ';' || key == KEY_UP) { if (g_viewer.scroll > 0) g_viewer.scroll--; }
     if (key == 'e' || key == 'E') {
         ctx.prevState = APP_VIEWER;
         ctx.selectedEntry = g_viewer.filename;

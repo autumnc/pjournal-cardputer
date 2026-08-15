@@ -1,37 +1,27 @@
 #pragma once
 
-// Display pin definitions for ESP32-S3 RLCD-4.2
-// (matching original 11_U8G2_Test naming)
-#define LCD_WIDTH      400
-#define LCD_HEIGHT     300
+// M5Stack Cardputer hardware definitions.
 
-#define RLCD_MOSI_PIN  GPIO_NUM_12
-#define RLCD_SCK_PIN   GPIO_NUM_11
-#define RLCD_DC_PIN    GPIO_NUM_5
-#define RLCD_CS_PIN    GPIO_NUM_40
-#define RLCD_RST_PIN   GPIO_NUM_41
+// Display: ST7789, Cardputer 240x135 landscape (GRAM 240x320, visible 240x135)
+#define LCD_WIDTH      240
+#define LCD_HEIGHT     135
 
-// I2C pins
-#define ESP32_I2C_SDA_PIN  GPIO_NUM_13
-#define ESP32_I2C_SCL_PIN  GPIO_NUM_14
+#define TFT_MOSI_PIN  GPIO_NUM_35
+#define TFT_SCLK_PIN  GPIO_NUM_36
+#define TFT_DC_PIN    GPIO_NUM_34
+#define TFT_CS_PIN    GPIO_NUM_37
+#define TFT_RST_PIN   GPIO_NUM_33
+#define TFT_BL_PIN    GPIO_NUM_38  // LCD 背光(LEDC PWM)
 
-// Button pins
+// Buttons
 #define PIN_BOOT     GPIO_NUM_0
-#define PIN_USER_BTN GPIO_NUM_18
 
-// SD card (SDMMC 1-line mode)
-#define SDMMC_CLK_PIN  GPIO_NUM_38
-#define SDMMC_CMD_PIN  GPIO_NUM_21
-#define SDMMC_D0_PIN   GPIO_NUM_39
+// SD card over SPI2: SCLK=40, MOSI=14, MISO=39, CS=12
+#define SD_SPI_HOST  SPI2_HOST
+#define SD_CLK_PIN   GPIO_NUM_40
+#define SD_MOSI_PIN  GPIO_NUM_14
+#define SD_MISO_PIN  GPIO_NUM_39
+#define SD_CS_PIN    GPIO_NUM_12
 
-// Battery ADC (ADC1_CH3 = GPIO4, voltage divider 3:1)
-#define BATTERY_ADC_CHAN ADC_CHANNEL_3
-
-// Audio (ES7210 mic ADC + ES8311 DAC + MAX98357A amp, matching xiaozhi waveshare-s3-rlcd-4.2 board)
-#define AUDIO_I2S_GPIO_MCLK  GPIO_NUM_16
-#define AUDIO_I2S_GPIO_WS    GPIO_NUM_45
-#define AUDIO_I2S_GPIO_BCLK  GPIO_NUM_9
-#define AUDIO_I2S_GPIO_DIN   GPIO_NUM_10
-#define AUDIO_I2S_GPIO_DOUT  GPIO_NUM_8
-#define AUDIO_CODEC_PA_PIN   GPIO_NUM_46
-#define AUDIO_SAMPLE_RATE    16000
+// Battery ADC: ADC1_CH9 = GPIO10, voltage divider 2:1
+#define BATTERY_ADC_CHAN ADC_CHANNEL_9

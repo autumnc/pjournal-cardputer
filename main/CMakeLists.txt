@@ -4,11 +4,10 @@ idf_component_register(SRCS
     "ui_helpers.cpp"
     "screen_editor.cpp"
     "screen_settings.cpp"
-    "screen_bt_manage.cpp"
     "screen_file_manager.cpp"
     "file_manager_server.cpp"
     "font_renderer.cpp"
-    "bt_keyboard.cpp"
+    "cardputer_keyboard.cpp"
     "journal_storage.cpp"
     "settings_manager.cpp"
     "wifi_manager.cpp"
@@ -19,17 +18,14 @@ idf_component_register(SRCS
     "json_parser.cpp"
     "json_utils.cpp"
     "ime/IME.cpp"
-    "screen_gtd.cpp"
     "screen_outline.cpp"
     "screen_inspiration.cpp"
-    "screen_voice.cpp"
-    "voice_input.cpp"
     "markdown_render.cpp"
+    "usb_drive.cpp"
     INCLUDE_DIRS "."
     EMBED_FILES
         "ime/ime_table_pinyin.bin"
         "ime/liangfen.bin"
-        "terminus28.fnt"
         "terminus22.fnt"
     PRIV_REQUIRES
         spi_flash
@@ -40,20 +36,19 @@ idf_component_register(SRCS
         esp_http_client
         esp_http_server
         esp_event
-        bt
-        esp_hid
         lwip
         mbedtls
         fatfs
         sdmmc
         driver
+        esp_driver_i2c
         u8g2
-        u8g2_st7305
+        u8g2_st7789
+        esp_timer
+        esp_pm
         esp_adc
-        esp_websocket_client
-        esp_codec_dev
-        esp_audio_codec
+        esp_tinyusb
         efuse
 )
 
-target_compile_definitions(${COMPONENT_LIB} PRIVATE PJOURNAL_VERSION="3.5.5")
+target_compile_definitions(${COMPONENT_LIB} PRIVATE PJOURNAL_VERSION="1.0.0")

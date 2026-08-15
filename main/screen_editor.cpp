@@ -25,7 +25,7 @@ extern "C" {
 
 #include "clipboard.h"
 
-#define IME_CODE_Y (STATUS_Y - 2*FONT_H + g_font.ascent())
+// 组合输入时正文区下边界(候选栏+码行占状态栏行,正文只留 3 行)
 #define IME_CAND_Y (STATUS_Y - FONT_H + g_font.ascent() - 3)
 #define EDITOR_MAX_CELLS (SCREEN_W / g_font.halfAdvance())
 
@@ -35,6 +35,7 @@ static struct {
     std::vector<std::string> lines;
     int cx = 0, cy = 0;
     int scroll = 0;
+    bool wantPromptView = false;  // 光标滚回顶部时把提示区拉回视野(一次性)
     int targetCx = -1;
     std::string promptText;
     bool promptMode = false;
@@ -154,34 +155,19 @@ static bool s_skipStatusBarAndIme = false;
 static void drawEditor() {
     int y = FONT_H;
 
+    // 提示区:作为文档顶部可滚动块(提示行 + 一条分隔线),滚动时随正文一起滚出
+    std::vector<VRow> pvrows;
+    std::string promptStr;
     if (g_editor.promptMode && !g_editor.promptText.empty()) {
-        const int maxW = SCREEN_W - 8;
-        const char *p = g_editor.promptText.c_str();
-        while (*p) {
-            const char *rowStart = p;
-            int rowW = 0;
-            while (*p) {
-                const char *next = p;
-                uint32_t cp = FontRenderer::utf8Decode(next);
-                if (cp == 0) { p = next; continue; }
-                int cw = g_font.charWidth(cp);
-                if (rowW + cw > maxW && rowW > 0) break;
-                rowW += cw;
-                p = next;
-            }
-            std::string line(rowStart, p - rowStart);
-            if (!line.empty()) {
-                ui_draw_text(4, y, line.c_str(), false, true);
-                y += LINE_SPACING;
-            }
-        }
-        u8g2_DrawHLine(g_u8g2, 0, y, SCREEN_W);
-        y += LINE_SPACING;
+        promptStr = g_editor.promptText;
+        pvrows = buildVrows({promptStr});
     }
+    int promptN = (int)pvrows.size();
+    int headerN = promptN + (promptN > 0 ? 1 : 0);  // + 分隔线行
 
     const auto& vrows = getVrows();
     bool composing = g_ime.composing() && !s_skipStatusBarAndIme;
-    int contentEndY = composing ? IME_CODE_Y : STATUS_Y;
+    int contentEndY = composing ? IME_CAND_Y : STATUS_Y;
     int visibleVrows = (contentEndY - y + LINE_SPACING - 1) / LINE_SPACING;
     if (visibleVrows < 1) visibleVrows = 1;
 
@@ -194,12 +180,21 @@ static void drawEditor() {
     }
 
     int normalVisibleVrows = (STATUS_Y - y + LINE_SPACING - 1) / LINE_SPACING;
-    int effectiveVisibleVrows = composing ? (normalVisibleVrows - 2) : normalVisibleVrows;
+    // 组合输入时底部只占一行(候选栏并入状态栏行),正文比旧布局多出一行
+    int effectiveVisibleVrows = composing ? (normalVisibleVrows - 1) : normalVisibleVrows;
     if (effectiveVisibleVrows < 1) effectiveVisibleVrows = 1;
 
-    if (cursorVR < g_editor.scroll) g_editor.scroll = cursorVR;
-    if (cursorVR >= g_editor.scroll + effectiveVisibleVrows)
-        g_editor.scroll = cursorVR - effectiveVisibleVrows + 1;
+    // scroll 索引"提示区 + 正文"联合行;光标在正文,坐标为 headerN + cursorVR
+    int cursorAll = headerN + (cursorVR >= 0 ? cursorVR : 0);
+    if (g_editor.wantPromptView && cursorVR >= 0) {
+        // 光标滚回顶部时尽量把提示区拉回视野(同时保证光标可见)
+        g_editor.scroll = std::max(0, headerN - effectiveVisibleVrows + 1);
+        g_editor.wantPromptView = false;
+    } else {
+        if (cursorAll < g_editor.scroll) g_editor.scroll = cursorAll;
+    }
+    if (cursorVR >= 0 && cursorAll >= g_editor.scroll + effectiveVisibleVrows)
+        g_editor.scroll = cursorAll - effectiveVisibleVrows + 1;
     if (g_editor.scroll < 0) g_editor.scroll = 0;
 
     bool mdOn = g_settings.markdownRender();
@@ -210,18 +205,29 @@ static void drawEditor() {
     } else {
         mdInfo.assign(g_editor.lines.size(), MdLineInfo{});
     }
-    for (int i = 0; i < visibleVrows && (g_editor.scroll + i) < (int)vrows.size(); i++) {
-        auto &vr = vrows[g_editor.scroll + i];
-        mdDrawVrow(4, y + i * LINE_SPACING, g_editor.lines[vr.lineIdx], vr.start, vr.end, mdInfo[vr.lineIdx]);
+    int allN = headerN + (int)vrows.size();
+    for (int i = 0; i < visibleVrows && (g_editor.scroll + i) < allN; i++) {
+        int allIdx = g_editor.scroll + i;
+        if (allIdx < promptN) {
+            auto &pvr = pvrows[allIdx];
+            std::string rowText = promptStr.substr(pvr.start, pvr.end - pvr.start);
+            ui_draw_text(4, y + i * LINE_SPACING, rowText.c_str(), false, true);
+        } else if (promptN > 0 && allIdx == promptN) {
+            u8g2_DrawHLine(g_u8g2, 0, y + i * LINE_SPACING, SCREEN_W);
+        } else {
+            auto &vr = vrows[allIdx - headerN];
+            mdDrawVrow(4, y + i * LINE_SPACING, g_editor.lines[vr.lineIdx], vr.start, vr.end, mdInfo[vr.lineIdx]);
+        }
     }
 
     // Selection highlight
     if (g_editor.hasSelection) {
         TextPos selStart, selEnd;
         getSelRange(selStart, selEnd);
-        for (int i = 0; i < visibleVrows && (g_editor.scroll + i) < (int)vrows.size(); i++) {
-            int vrIdx = g_editor.scroll + i;
-            auto &vr = vrows[vrIdx];
+        for (int i = 0; i < visibleVrows && (g_editor.scroll + i) < allN; i++) {
+            int allIdx = g_editor.scroll + i;
+            if (allIdx < headerN) continue;  // 提示区/分隔线不参与选区
+            auto &vr = vrows[allIdx - headerN];
             int lineIdx = vr.lineIdx;
             int rowStart = vr.start, rowEnd = vr.end;
             if (lineIdx < selStart.cy || lineIdx > selEnd.cy) continue;
@@ -242,12 +248,12 @@ static void drawEditor() {
         }
     }
 
-    if (cursorVR >= 0 && cursorVR >= g_editor.scroll && cursorVR < g_editor.scroll + visibleVrows) {
+    if (cursorVR >= 0 && cursorAll >= g_editor.scroll && cursorAll < g_editor.scroll + visibleVrows) {
         auto &vr = vrows[cursorVR];
         const std::string &line = g_editor.lines[vr.lineIdx];
         const MdLineInfo &mdi = mdInfo[vr.lineIdx];
         int cx = 4 + mdVrowX(line, mdi, g_editor.cx, vr.start);
-        int cy_draw = y + (cursorVR - g_editor.scroll) * LINE_SPACING;
+        int cy_draw = y + (cursorAll - g_editor.scroll) * LINE_SPACING;
         int cw = g_font.halfAdvance();
         if (g_editor.cx < (int)line.length()) {
             const char *cp = line.c_str() + g_editor.cx;
@@ -272,30 +278,9 @@ static void drawEditor() {
         if (totalPages < 1) totalPages = 1;
         char pageInfo[32];
         snprintf(pageInfo, sizeof(pageInfo), "%d/%d", curPage, totalPages);
-        int sepY = IME_CODE_Y - 4;
-        int codeBaseline = sepY - 7;
-        {
-            int cw = g_font.textWidth(code.c_str()) + 8;
-            u8g2_SetDrawColor(g_u8g2, 1);
-            u8g2_DrawBox(g_u8g2, 4, codeBaseline - g_font.ascent(), cw, FONT_H);
-            u8g2_SetDrawColor(g_u8g2, 0);
-            g_font.drawText(4, codeBaseline, code.c_str(), false);
-            u8g2_SetDrawColor(g_u8g2, 1);
-        }
-        {
-            int tw = g_font.textWidth(pageInfo);
-            int pw = tw + 8;
-            int px = SCREEN_W - pw - 4;
-            u8g2_SetDrawColor(g_u8g2, 1);
-            u8g2_DrawBox(g_u8g2, px, codeBaseline - g_font.ascent(), pw, FONT_H);
-            u8g2_SetDrawColor(g_u8g2, 0);
-            g_font.drawText(px + 4, codeBaseline, pageInfo, false);
-            u8g2_SetDrawColor(g_u8g2, 1);
-        }
-        u8g2_SetDrawColor(g_u8g2, 0);
-        u8g2_DrawHLine(g_u8g2, 0, sepY, SCREEN_W);
-        u8g2_SetDrawColor(g_u8g2, 1);
 
+        // 候选栏直接占用状态栏位置(整行同状态栏样式),此状态下不再画状态栏。
+        // 其顶线(STATUS_Y)即唯一分割线,码行浮在它上面。
         auto &cands = g_ime.candidates();
         std::string candLine;
         for (int i = 0; i < (int)cands.size(); i++) {
@@ -307,21 +292,43 @@ static void drawEditor() {
             if (curW + partW + 8 > SCREEN_W) break;
             candLine += part;
         }
+        u8g2_SetDrawColor(g_u8g2, 0);
+        u8g2_DrawHLine(g_u8g2, 0, STATUS_Y, SCREEN_W);
+        u8g2_SetDrawColor(g_u8g2, 1);
+        u8g2_DrawBox(g_u8g2, 0, STATUS_Y + 1, SCREEN_W, FONT_H + 3);
+        u8g2_SetDrawColor(g_u8g2, 0);
+        g_font.drawText(4, STATUS_Y + 1 + g_font.ascent(), candLine.c_str(), false);
+        u8g2_SetDrawColor(g_u8g2, 1);
+
+        // 码行下移到候选栏上方(顶沿盖住候选栏顶线),给正文多出一行。
+        // 基线取 STATUS_Y - descent - 1:字形+下伸的总底端=108,不越分割线(109)
+        int codeBaseline = STATUS_Y - g_font.descent() - 1;
+        int codeBoxTop = STATUS_Y - FONT_H;  // 85:框顶固定,不随文字抬升盖住第3行光标
         {
-            int cw = g_font.textWidth(candLine.c_str()) + 8;
+            int cw = g_font.textWidth(code.c_str()) + 8;
             u8g2_SetDrawColor(g_u8g2, 1);
-            u8g2_DrawBox(g_u8g2, 4, IME_CAND_Y - g_font.ascent(), cw, FONT_H);
+            u8g2_DrawBox(g_u8g2, 4, codeBoxTop, cw, FONT_H);
             u8g2_SetDrawColor(g_u8g2, 0);
-            g_font.drawText(4, IME_CAND_Y, candLine.c_str(), false);
+            g_font.drawText(4, codeBaseline, code.c_str(), false);
+            u8g2_SetDrawColor(g_u8g2, 1);
+        }
+        {
+            int tw = g_font.textWidth(pageInfo);
+            int pw = tw + 8;
+            int px = SCREEN_W - pw - 4;
+            u8g2_SetDrawColor(g_u8g2, 1);
+            u8g2_DrawBox(g_u8g2, px, codeBoxTop, pw, FONT_H);
+            u8g2_SetDrawColor(g_u8g2, 0);
+            g_font.drawText(px + 4, codeBaseline, pageInfo, false);
             u8g2_SetDrawColor(g_u8g2, 1);
         }
     }
 
-    if (!s_skipStatusBarAndIme) {
-        const char *mode = g_editor.promptMode ? "提示写作" : "自由写作";
+    if (!s_skipStatusBarAndIme && !composing) {
         int wc = getWordCount();
         char left[48];
-        snprintf(left, sizeof(left), "%s", mode);
+        if (g_quickEdit) snprintf(left, sizeof(left), "[%d]", g_quickFile);
+        else snprintf(left, sizeof(left), "%s", g_editor.promptMode ? "提示" : "自由");
         std::string imeLabel;
         if (!g_editor.imeActive) imeLabel = "EN";
         else if (g_ime.english()) imeLabel = "[英]";
@@ -332,7 +339,7 @@ static void drawEditor() {
         }
         std::string right = std::to_string(wc) + "字 " + imeLabel;
         std::string bt = battery_icon_status_text();
-        if (!bt.empty()) right += " " + bt;
+        if (!bt.empty()) right += bt;  // 与 [中]●繁 之间不留空格,空间留给字数
 
         ui_draw_status(left, right.c_str());
     }
@@ -348,15 +355,15 @@ void screen_editor_draw_voice_bg() {
 }
 
 static void drawConfirmDialog() {
-    int bw = 280, bh = 120;
-    int bx = (SCREEN_W - bw) / 2, by = (SCREEN_H - bh) / 2 - 20;
+    int bw = SCREEN_W - 16, bh = 82;  // 240x135 屏内居中
+    int bx = (SCREEN_W - bw) / 2, by = (SCREEN_H - bh) / 2 - 10;
     u8g2_SetDrawColor(g_u8g2, 1);
     u8g2_DrawBox(g_u8g2, bx, by, bw, bh);
     u8g2_SetDrawColor(g_u8g2, 0);
     u8g2_DrawFrame(g_u8g2, bx, by, bw, bh);
     ui_draw_text_centered(by + 28, "是否保存当前内容？");
-    ui_draw_text_centered(by + 58, "Enter=保存");
-    ui_draw_text_centered(by + 88, "ESC=放弃");
+    ui_draw_text_centered(by + 52, "Enter=保存");
+    ui_draw_text_centered(by + 76, "ESC=放弃");
     u8g2_SetDrawColor(g_u8g2, 1);
 }
 
@@ -365,6 +372,11 @@ static bool saveCurrentContent() {
     std::string text;
     for (auto &l : g_editor.lines) { text += l; text += '\n'; }
     while (!text.empty() && text.back() == '\n') text.pop_back();
+
+    // 快捷编辑:原文写入 SD 根目录 0.txt..9.txt,不加日记头部
+    if (g_quickEdit) {
+        return g_journal.saveQuickFile(g_quickFile, text);
+    }
     if (text.empty()) return false;
 
     time_t now; time(&now); struct tm *tm = localtime(&now);
@@ -398,23 +410,39 @@ static AppState finishEditor(ScreenContext &ctx) {
     return ctx.prevState;
 }
 
+// 把文本按行拆进编辑器,光标落末尾(空内容 → 单个空行)
+static void editorLoadText(const std::string &content) {
+    g_editor.lines.clear();
+    if (content.empty()) {
+        g_editor.lines.push_back("");
+        g_editor.cx = g_editor.cy = 0;
+        return;
+    }
+    size_t pos = 0;
+    while (pos < content.length()) {
+        size_t nl = content.find('\n', pos);
+        g_editor.lines.push_back((nl == std::string::npos) ? content.substr(pos) : content.substr(pos, nl - pos));
+        if (nl == std::string::npos) break;
+        pos = nl + 1;
+    }
+    while (g_editor.lines.size() > 1 && g_editor.lines.back().empty())
+        g_editor.lines.pop_back();
+    g_editor.cx = (int)g_editor.lines.back().length();
+    g_editor.cy = (int)g_editor.lines.size() - 1;
+    g_editor.hasSelection = false;
+    g_editor.targetCx = -1;
+}
+
 // ── Screen entry points ──────────────────────────────────────────────────
 void screen_editor_init(ScreenContext &ctx) {
     g_editor.lines.clear();
     g_editor.autoSaveTime = 0;
 
-    if (!ctx.editContent.empty()) {
-        size_t pos = 0;
-        while (pos < ctx.editContent.length()) {
-            size_t nl = ctx.editContent.find('\n', pos);
-            g_editor.lines.push_back((nl == std::string::npos) ? ctx.editContent.substr(pos) : ctx.editContent.substr(pos, nl - pos));
-            if (nl == std::string::npos) break;
-            pos = nl + 1;
-        }
-        while (g_editor.lines.size() > 1 && g_editor.lines.back().empty())
-            g_editor.lines.pop_back();
-        g_editor.cx = (int)g_editor.lines.back().length();
-        g_editor.cy = (int)g_editor.lines.size() - 1;
+    if (g_quickEdit) {
+        editorLoadText(g_journal.readQuickFile(g_quickFile));
+        ctx.editContent.clear();
+    } else if (!ctx.editContent.empty()) {
+        editorLoadText(ctx.editContent);
         ctx.editContent.clear();
     } else {
         g_editor.lines.push_back("");
@@ -422,6 +450,7 @@ void screen_editor_init(ScreenContext &ctx) {
     }
 
     g_editor.scroll = 0;
+    g_editor.wantPromptView = false;
     g_editor.targetCx = -1;
     g_editor.imeActive = false;
     g_ime.setActive(false);
@@ -453,6 +482,26 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         return APP_EDITOR;
     }
 
+    // ── 快捷编辑:Fn+0..9 切换文件(先自动保存当前,再加载新文件) ────────
+    if (g_quickEdit && key >= KEY_QUICK_BASE && key < KEY_QUICK_BASE + 10) {
+        int newFile = key - KEY_QUICK_BASE;
+        if (newFile != g_quickFile) {
+            if (g_editor.modifiedSinceSave) saveCurrentContent();
+            g_editor.modifiedSinceSave = false;
+            g_editor.autoSaveTime = 0;
+            g_ime.cancelComposition();
+            g_ime.setActive(false);
+            g_editor.imeActive = false;
+            g_quickFile = newFile;
+            g_settings.setQuickFile(newFile);
+            editorLoadText(g_journal.readQuickFile(newFile));
+            g_editor.scroll = 0;
+            g_editor.vrowsDirty = true;
+            g_editor.wordCountDirty = true;
+        }
+        ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
+    }
+
     if (g_editor.imeActive && key != 0) {
         std::string imeOut;
         if (g_ime.handleKey(key, imeOut)) {
@@ -470,7 +519,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         g_editor.modifiedSinceSave = true;
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
-    if (key == 0x10) { // Ctrl+P
+    if (key == 0x10 && !g_quickEdit) { // Ctrl+P (快捷编辑不生成 AI 提示)
         bool wifiWasConnected = g_wifi.isConnected();
         if (ensure_wifi_connected()) {
             g_editor.promptMode = true;
@@ -498,6 +547,12 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         return APP_EDITOR;
     }
     if (key == 0x1B) {
+        if (g_quickEdit) {
+            // 快捷编辑:自动保存,直接回设置面板
+            if (g_editor.modifiedSinceSave) saveCurrentContent();
+            g_editor.modifiedSinceSave = false;
+            ctx.nextState = ctx.prevState; return ctx.prevState;
+        }
         bool hasContent = g_editor.lines.size() > 1 ||
             (g_editor.lines.size() == 1 && !g_editor.lines[0].empty());
         if (hasContent && g_editor.modifiedSinceSave) {
@@ -556,8 +611,8 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
 
-    // ── Shift+arrow: extend selection ─────────────────────────────────
-    if (key == KEY_SHIFT_LEFT) {
+    // ── Ctrl+;.,/: extend selection (Ctrl+;=上 . =下 , =左 / =右) ─────
+    if (key == KEY_CTRL_LEFT) {
         if (g_editor.cx > 0) {
             extendSelection();
             g_editor.cx--;
@@ -571,7 +626,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         g_editor.vrowsDirty = true;
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
-    if (key == KEY_SHIFT_RIGHT) {
+    if (key == KEY_CTRL_RIGHT) {
         if (g_editor.cx < (int)g_editor.lines[g_editor.cy].length()) {
             extendSelection();
             g_editor.cx++;
@@ -585,7 +640,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         g_editor.vrowsDirty = true;
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
-    if (key == KEY_SHIFT_UP) {
+    if (key == KEY_CTRL_UP) {
         if (g_editor.cy > 0) {
             extendSelection();
         }
@@ -608,7 +663,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         g_editor.vrowsDirty = true;
         ui_clear(); drawEditor(); ui_commit(); return APP_EDITOR;
     }
-    if (key == KEY_SHIFT_DOWN) {
+    if (key == KEY_CTRL_DOWN) {
         if (g_editor.cy < (int)g_editor.lines.size() - 1) {
             extendSelection();
         }
@@ -714,6 +769,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         } else if (g_editor.cy > 0) {
             g_editor.cy--;
             g_editor.cx = (int)g_editor.lines[g_editor.cy].length();
+            if (g_editor.cy == 0) g_editor.wantPromptView = true;
         }
         g_editor.targetCx = -1;
     } else if (key == KEY_RIGHT) {
@@ -744,6 +800,7 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
             int targetCells = vrowStartCells + visualCol;
             g_editor.cx = cellsToByte(g_editor.lines[g_editor.cy], prev.start, prev.end, targetCells);
         }
+        if (g_editor.cy == 0) g_editor.wantPromptView = true;  // 回到顶部,把提示区滚回来
     } else if (key == KEY_DOWN) {
         clearSelection();
         int curVR = -1;
@@ -765,10 +822,10 @@ AppState screen_editor_handle(int key, ScreenContext &ctx) {
         }
     }
 
-    // Auto-save on idle ticks
+    // Auto-save on idle ticks (快捷编辑无视 auto_save 开关,始终自动保存)
     if (key == 0 && g_editor.autoSaveTime > 0 && esp_timer_get_time() > g_editor.autoSaveTime) {
         g_editor.autoSaveTime = 0;
-        if (g_settings.autoSave()) {
+        if (g_settings.autoSave() || g_quickEdit) {
             if (saveCurrentContent()) g_editor.modifiedSinceSave = false;
         }
     }

@@ -7,9 +7,6 @@ build/
 .idea/
 *.fnt
 *.bin
-!/main/terminus28.fnt
-!/main/terminus24.fnt
 !/main/terminus22.fnt
-!/main/terminus20.fnt
 managed_components/
 __pycache__/

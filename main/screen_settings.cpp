@@ -6,6 +6,7 @@
 #include "ime/IME.h"
 #include "pcf85063.h"
 #include "ui_helpers.h"
+#include "u8g2_st7789.h"
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -14,17 +15,11 @@
 
 extern u8g2_t *g_u8g2;
 
-extern "C" {
-    extern void u8g2_SetDrawColor(void *u8g2, int color);
-    extern void u8g2_DrawBox(void *u8g2, int x, int y, int w, int h);
-    extern void u8g2_DrawHLine(void *u8g2, int x, int y, int w);
-}
 
 // ── Settings state ────────────────────────────────────────────────────────
 struct SettingField { const char *key; const char *label; bool masked; bool action; };
 static const SettingField SETTINGS_FIELDS[] = {
     {"_file_mgr", "文件管理", false, true},
-    {"_bt_manage", "蓝牙设备管理", false, true},
     {"deepseek_key", "Deepseek Key", false, false},
     {"flomo_email", "Flomo 邮箱", false, false},
     {"flomo_pass", "Flomo 密码", false, false},
@@ -42,7 +37,8 @@ static const SettingField SETTINGS_FIELDS[] = {
     {"auto_sleep", "自动休眠", false, false},
     {"sleep_screen", "休眠保留画面", false, false},
     {"md_render", "Markdown渲染", false, false},
-    {"_font_size", "字体大小", false, true},
+    {"dark_mode", "显示模式", false, false},
+    {"edit_mode", "编辑模式", false, false},
     {"_sync_time", "网络同步时间", false, true},
 };
 static const int NUM_SETTINGS = sizeof(SETTINGS_FIELDS) / sizeof(SETTINGS_FIELDS[0]);
@@ -50,13 +46,15 @@ static const int NUM_SETTINGS = sizeof(SETTINGS_FIELDS) / sizeof(SETTINGS_FIELDS
 // 布尔型开关项:显示 开/关,Enter 在 "0"/"1" 间切换
 static bool isToggleField(const char *key) {
     return strcmp(key, "auto_save") == 0 || strcmp(key, "auto_sleep") == 0 ||
-           strcmp(key, "sleep_screen") == 0 || strcmp(key, "md_render") == 0;
+           strcmp(key, "sleep_screen") == 0 || strcmp(key, "md_render") == 0 ||
+           strcmp(key, "dark_mode") == 0 || strcmp(key, "edit_mode") == 0;
 }
 
 static bool toggleValue(const char *key) {
     std::string v = g_settings.getString(key);
     if (strcmp(key, "auto_sleep") == 0) return v != "0";  // 默认开
     if (strcmp(key, "md_render") == 0) return v != "0";   // 默认开
+    if (strcmp(key, "dark_mode") == 0) return v == "1";   // 默认关(白底黑字)
     return v == "1";  // auto_save: 默认关
 }
 
@@ -68,6 +66,11 @@ static struct {
     int editCursor = 0;
     bool imeActive = false;
 } g_settingsState;
+
+// 是否处于文本值输入子界面(供主循环判断 ` 应否当作"返回")
+bool settings_in_edit_mode() {
+    return g_settingsState.editing;
+}
 
 static bool connect_wifi_from_settings() {
     std::string ssid = g_settings.wifiSsid();
@@ -336,7 +339,13 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
     }
 
     // ── Browse mode ────────────────────────────────────────────────────
-    if (key == 'q' || key == 'Q' || key == 0x1B) { ctx.nextState = APP_MAIN; return APP_MAIN; }
+    // `;` `.` `,` `/` 模拟方向键(编辑模式仍可输入这些字符,不受影响)
+    if (key == ';') key = KEY_UP;
+    else if (key == ',') key = KEY_LEFT;
+    else if (key == '.') key = KEY_DOWN;
+    else if (key == '/') key = KEY_RIGHT;
+
+    if (key == 'q' || key == 'Q' || key == 0x1B) { ctx.nextState = g_quickEdit ? APP_EDITOR : APP_MAIN; return ctx.nextState; }
     if (key == 'k' || key == KEY_UP) { if (g_settingsState.selection > 0) g_settingsState.selection--; }
     if (key == 'j' || key == KEY_DOWN) { if (g_settingsState.selection < NUM_SETTINGS-1) g_settingsState.selection++; }
     if (key == 'd' || key == 'D') {
@@ -427,19 +436,14 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
                 ctx.nextState = APP_FILE_MANAGER;
                 return APP_FILE_MANAGER;
             }
-            if (strcmp(f.key, "_bt_manage") == 0) {
-                ctx.nextState = APP_BT_MANAGE;
-                return APP_BT_MANAGE;
-            }
-            if (strcmp(f.key, "_font_size") == 0) {
-                int curSize = g_settings.fontSize();
-                int newSize = (curSize == 28) ? 22 : 28;
-                g_settings.setString("font_size", std::to_string(newSize));
-                return APP_SETTINGS;
-            }
         } else if (isToggleField(f.key)) {
             // 开/关切换:存 "1"(开) 或 "0"(关)
-            g_settings.setString(f.key, toggleValue(f.key) ? "0" : "1");
+            bool newVal = !toggleValue(f.key);
+            g_settings.setString(f.key, newVal ? "1" : "0");
+            if (strcmp(f.key, "dark_mode") == 0 && g_lcd_dev)
+                u8g2_st7789_set_dark_mode(g_lcd_dev, newVal);  // 立即生效
+            if (strcmp(f.key, "edit_mode") == 0)
+                ctx.statusMessage = "重启后生效";
         } else {
             g_settingsState.editBuffer = g_settings.getString(f.key);
             g_settingsState.editCursor = (int)g_settingsState.editBuffer.length();
@@ -460,13 +464,14 @@ AppState screen_settings_handle(int key, ScreenContext &ctx) {
         bool sel = (idx == g_settingsState.selection);
         char buf[80];
         if (f.action) {
-            if (strcmp(f.key, "_font_size") == 0) {
-                snprintf(buf, sizeof(buf), "▶ %s: %dpt", f.label, g_settings.fontSize());
-            } else {
-                snprintf(buf, sizeof(buf), "▶ %s", f.label);
-            }
+            snprintf(buf, sizeof(buf), "▶ %s", f.label);
         } else if (isToggleField(f.key)) {
-            snprintf(buf, sizeof(buf), "%s:%s", f.label, toggleValue(f.key) ? "开" : "关");
+            if (strcmp(f.key, "dark_mode") == 0)
+                snprintf(buf, sizeof(buf), "%s:%s", f.label, toggleValue(f.key) ? "黑底白字" : "白底黑字");
+            else if (strcmp(f.key, "edit_mode") == 0)
+                snprintf(buf, sizeof(buf), "%s:%s", f.label, toggleValue(f.key) ? "快捷编辑" : "个人日记");
+            else
+                snprintf(buf, sizeof(buf), "%s:%s", f.label, toggleValue(f.key) ? "开" : "关");
         } else {
             std::string value = g_settings.getString(f.key);
             std::string display;

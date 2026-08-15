@@ -57,6 +57,11 @@ static struct {
     bool preservePos = false;  // 发送到Flomo返回后保留列表位置
 } g;
 
+// 是否处于文本输入子界面(供主循环判断 ` 应否当作"返回")
+bool inspiration_in_edit_mode() {
+    return g.mode == IM_EDIT_KEYWORD || g.mode == IM_SEARCH;
+}
+
 static void loadData() {
     g.data = JsonValue::loadFromFile(INSPIRATION_FILE);
     if (g.data.isNull() || !g.data.has("items") || !g.data["items"].isArray()) {

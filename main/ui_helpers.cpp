@@ -4,7 +4,6 @@
 #include "wifi_manager.h"
 #include "settings_manager.h"
 #include "ime/IME.h"
-#include "bt_keyboard.h"
 #include <cstdlib>
 #include <cstring>
 #include <esp_log.h>
@@ -36,7 +35,7 @@ void battery_init() {
     adc_oneshot_chan_cfg_t config = {};
     config.bitwidth = ADC_BITWIDTH_12;
     config.atten = ADC_ATTEN_DB_12;
-    if (adc_oneshot_config_channel(s_adc_handle, ADC_CHANNEL_3, &config) != ESP_OK) return;
+    if (adc_oneshot_config_channel(s_adc_handle, ADC_CHANNEL_9, &config) != ESP_OK) return;
     s_battery_inited = true;
 }
 
@@ -49,10 +48,11 @@ int battery_pct() {
         return cached;
     last_read_us = now;
     int raw;
-    if (adc_oneshot_read(s_adc_handle, ADC_CHANNEL_3, &raw) != ESP_OK) return cached;
+    if (adc_oneshot_read(s_adc_handle, ADC_CHANNEL_9, &raw) != ESP_OK) return cached;
     int mv;
     if (adc_cali_raw_to_voltage(s_cali_handle, raw, &mv) != ESP_OK) return cached;
-    float v = mv * 0.001f * 3.0f;
+    // Cardputer 电池分压比 2.0 (M5Unified Power_Class, ADC1_GPIO10_CHANNEL, ratio 2.0)
+    float v = mv * 0.001f * 2.0f;
     static const float lut[][2] = {
         {4.12f, 100}, {4.08f, 92}, {4.02f, 82},
         {3.96f, 70},  {3.90f, 58}, {3.84f, 47},
@@ -86,34 +86,19 @@ std::string battery_text() {
 }
 
 // 设备电量 + 有蓝牙键盘时追加 " [蓝牙图标] 键盘电量"
+// (Cardputer 无蓝牙,仅设备电量)
 std::string battery_status_text() {
     std::string s = battery_text();
     if (s.empty()) return "";
-    if (g_bt.isConnected()) {
-        int kb = g_bt.keyboardBatteryPct();
-        // U+E002 蓝牙图标,前导空格作为与电池组的间隔
-        char buf[24];
-        if (kb >= 0)
-            snprintf(buf, sizeof(buf), " \xEE\x80\x82%d%%", kb);
-        else
-            snprintf(buf, sizeof(buf), " \xEE\x80\x82--");
-        s += buf;
-    }
     return s;
 }
 
-// ── 纯图标电量(电平图标,无数字) ──────────────────────────────────────
+// 纯图标电量(电平图标,无数字) ──────────────────────────────────────
 // U+E018..E022 设备充电电平: 0=不足10%, 1..9=10%~90%, 10=100%
 static const char *const s_devBatteryIcons[11] = {
     "\xEE\x80\x98", "\xEE\x80\x99", "\xEE\x80\x9A", "\xEE\x80\x9B",
     "\xEE\x80\x9C", "\xEE\x80\x9D", "\xEE\x80\x9E", "\xEE\x80\x9F",
     "\xEE\x80\xA0", "\xEE\x80\xA1", "\xEE\x80\xA2",
-};
-// U+E023..E02D 蓝牙键盘电平: 0=不足10%, 1..9=10%~90%, 10=100%
-static const char *const s_btBatteryIcons[11] = {
-    "\xEE\x80\xA3", "\xEE\x80\xA4", "\xEE\x80\xA5", "\xEE\x80\xA6",
-    "\xEE\x80\xA7", "\xEE\x80\xA8", "\xEE\x80\xA9", "\xEE\x80\xAA",
-    "\xEE\x80\xAB", "\xEE\x80\xAC", "\xEE\x80\xAD",
 };
 
 static const char *batteryLevelIcon(int pct, const char *const icons[11]) {
@@ -132,15 +117,10 @@ std::string battery_icon_text() {
 }
 
 // 设备电平图标 + 有蓝牙键盘时追加 " [蓝牙电平图标]"
+// (Cardputer 无蓝牙,仅设备电平图标)
 std::string battery_icon_status_text() {
     std::string s = battery_icon_text();
     if (s.empty()) return "";
-    if (g_bt.isConnected()) {
-        int kb = g_bt.keyboardBatteryPct();
-        const char *ic = (kb >= 0) ? batteryLevelIcon(kb, s_btBatteryIcons) : s_btBatteryIcons[0];
-        s += " ";
-        s += ic;
-    }
     return s;
 }
 
@@ -324,8 +304,8 @@ void ui_clear() {
 
 // ── Idle refresh optimization ─────────────────────────────────────────────
 // 空闲时屏幕内容逐字节不变(仅键盘输入/日期翻页/电量变化会改变内容),
-// 通过快照对比跳过重复的 SPI 刷新。ST7305 是 GRAM 型控制器,图像可长期
-// 保持,保留低频 KEEPALIVE_US 兜底以防 RLCD 残影。
+// 通过快照对比跳过重复的 SPI 刷新。ST7789 是 GRAM 型控制器,图像可长期
+// 保持,保留低频 KEEPALIVE_US 兜底以防长期不刷。
 static uint8_t *s_frame_snapshot = nullptr;
 static int64_t s_last_send_us = 0;
 static const int64_t KEEPALIVE_US = 5 * 1000000;  // 5s
@@ -337,7 +317,8 @@ void ui_commit() {
     size_t size = u8g2_GetBufferSize(g_u8g2);
 
     if (!s_frame_snapshot) {
-        s_frame_snapshot = (uint8_t *)heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        // 初代 Cardputer 无 PSRAM,快照放内部 RAM
+        s_frame_snapshot = (uint8_t *)heap_caps_malloc(size, MALLOC_CAP_8BIT);
         if (!s_frame_snapshot) {
             u8g2_SendBuffer(g_u8g2);  // 无快照时退回无条件发送
             return;

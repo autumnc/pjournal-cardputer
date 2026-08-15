@@ -30,6 +30,9 @@ public:
     bool sleepScreen();
     bool markdownRender();
     int fontSize();
+    bool quickEditMode();  // 编辑模式:true=快捷编辑
+    int quickFile();       // 当前快捷编辑文件 0-9
+    void setQuickFile(int v);
 
     void setFlomoEmail(const std::string &v);
     void setFlomoPassword(const std::string &v);

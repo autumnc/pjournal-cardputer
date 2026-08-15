@@ -1,6 +1,7 @@
 #include "settings_manager.h"
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <sys/stat.h>
 #include <esp_log.h>
@@ -123,4 +124,19 @@ int SettingsManager::fontSize() {
     if (v == "22") return 22;
     if (v == "20") return 20;
     return 28;
+}
+
+bool SettingsManager::quickEditMode() { return getString("edit_mode") == "1"; }
+
+int SettingsManager::quickFile() {
+    std::string v = get("quick_file");
+    if (v.empty()) return 0;
+    int n = atoi(v.c_str());
+    return (n >= 0 && n <= 9) ? n : 0;
+}
+
+void SettingsManager::setQuickFile(int v) {
+    char b[8];
+    snprintf(b, sizeof(b), "%d", v);
+    setString("quick_file", b);
 }

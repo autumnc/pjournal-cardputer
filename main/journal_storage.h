@@ -54,6 +54,11 @@ public:
     // SD card status
     bool isMounted() const { return mounted_; }
 
+    // 快捷编辑文件(SD根目录 0.txt..9.txt)
+    std::string readQuickFile(int index);
+    bool saveQuickFile(int index, const std::string &content);
+    void ensureQuickFiles();  // 缺哪个文件就创建哪个(空文件)
+
     // Get SD card mutex for thread-safe access from external callers
     static SemaphoreHandle_t sdMutex();
 

@@ -1,6 +1,6 @@
 #include "user_config.h"
 #include "font_renderer.h"
-#include "bt_keyboard.h"
+#include "cardputer_keyboard.h"
 #include "wifi_manager.h"
 #include "settings_manager.h"
 #include "journal_storage.h"
@@ -10,14 +10,11 @@
 #include "pjournal_app.h"
 #include "screen_editor.h"
 #include "screen_settings.h"
-#include "screen_gtd.h"
 #include "screen_outline.h"
-#include "screen_bt_manage.h"
 #include "screen_file_manager.h"
-#include "screen_voice.h"
-#include "voice_input.h"
-#include "u8g2_st7305.h"
+#include "u8g2_st7789.h"
 #include "pcf85063.h"
+#include "usb_drive.h"
 
 #include <esp_log.h>
 #include <esp_system.h>
@@ -33,72 +30,47 @@
 static const char *TAG = "Main";
 
 // Display device (global, used by font_renderer.cpp)
-static u8g2_st7305_t s_lcd_dev;
+static u8g2_st7789_t s_lcd_dev;
 u8g2_t *g_u8g2 = nullptr;
 
 static bool initDisplay() {
     ESP_LOGI(TAG, "Initializing display...");
-    u8g2_st7305_config_t cfg = u8g2_st7305_default_config();
-    cfg.mosi_io = RLCD_MOSI_PIN;
-    cfg.sclk_io = RLCD_SCK_PIN;
-    cfg.dc_io   = RLCD_DC_PIN;
-    cfg.cs_io   = RLCD_CS_PIN;
-    cfg.reset_io = RLCD_RST_PIN;
-    cfg.rotation = U8G2_R1;
-    cfg.tile_buf_height = U8G2_ST7305_TILE_BUF_FULL;
+    u8g2_st7789_config_t cfg = u8g2_st7789_default_config();
+    cfg.rotation = U8G2_R0;  // 旋转由驱动 MADCTL=0x6C 完成,软件侧 R0
+    cfg.tile_buf_height = U8G2_ST7789_TILE_BUF_FULL;
 
-    esp_err_t ret = u8g2_st7305_init(&s_lcd_dev, &cfg);
+    esp_err_t ret = u8g2_st7789_init(&s_lcd_dev, &cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Display init failed: %d", ret);
         return false;
     }
-    g_u8g2 = u8g2_st7305_get_u8g2(&s_lcd_dev);
+    g_u8g2 = u8g2_st7789_get_u8g2(&s_lcd_dev);
+    g_lcd_dev = &s_lcd_dev;
     return true;
 }
 
-// BLE stack init + auto-connect in a background task so the main UI
-// renders immediately instead of waiting ~1s for the BT controller.
-static void btInitTask(void *arg) {
-    ESP_LOGI(TAG, "Starting Bluetooth...");
-    if (g_bt.init() == ESP_OK) {
-        g_bt.loadPairedDevices();
-        if (g_bt.pairedDeviceCount() > 0) {
-            ESP_LOGI(TAG, "Found %d saved keyboard(s), will auto-connect...",
-                     g_bt.pairedDeviceCount());
-            const BtPairedDevice *p = g_bt.getPairedDevice(0);
-            g_bt.connectBDA(p->bda, p->addr_type);
-        }
-    } else {
-        ESP_LOGE(TAG, "Bluetooth init failed");
-    }
-    vTaskDelete(NULL);
-}
-
 // ── Light sleep 空闲休眠 ────────────────────────────────────────────────
-// 键盘/物理按键无输入 ≥10 分钟后进入 ESP light sleep(RAM 保留、BLE 射频关闭),
-// 空闲电流从 ~2-5mA 降到 ~0.15mA。休眠期间 BLE 射频关闭,键盘无法唤醒,
-// 只能按物理按键(GPIO18/GPIO0)唤醒;唤醒后后台重新 init BLE 并自动重连。
+// 键盘输入 ≥10 分钟无动作后进入 ESP light sleep(RAM 保留),空闲电流显著下降。
+// 休眠期间键盘扫描任务挂起,只能按 BOOT 键(GPIO0)唤醒。
 #define AUTO_SLEEP_TIMEOUT_US   (10 * 60 * 1000000LL)
 #define AUTO_SLEEP_GRACE_US     (2 * 60 * 1000000LL)
-#define SLEEP_WAKE_MASK         ((1ULL << PIN_USER_BTN) | (1ULL << PIN_BOOT))
+#define SLEEP_WAKE_MASK         (1ULL << PIN_BOOT)
 
-// 最近一次用户输入(BLE 键或物理按键)的时间,0 表示启动后尚未记录
+// 最近一次用户输入(键盘或物理按键)的时间,0 表示启动后尚未记录
 static int64_t s_last_activity_us = 0;
 // BOOT 唤醒后的首次短按释放不应再次触发休眠(唤醒按键与休眠按键是同一个键)
 static bool s_boot_wake_release_pending = false;
 
-// 物理按键时间判定(不依赖主循环节拍,各界面循环速度不同)
+// 物理按键时间判定(不依赖主循环节拍)
 #define BTN_DEBOUNCE_US       (30000)     // 30ms 防抖
 #define BTN_LONG_PRESS_US     (1000000)   // 1s 判定长按
-#define BTN_DOUBLE_WINDOW_US  (300000)    // 300ms 双击窗口
 
-// 单击动作排队: 松开后等待双击窗口确认非双击再执行,避免双击第一下误发导航键
-static struct { int key = 0; int64_t queued_us = 0; } s_pending_single;
+// 按住 E 开机进入 USB 存储模式的检测窗口
+#define BOOT_E_DETECT_MS      700
 
 static void enterLightSleep(void) {
-    // 休眠提示画在底部状态栏位置、居中,不遮挡/清空上方画面——
-    // 保留画面模式下,最后画面 + 底部提示在整个休眠期间持续显示(RLCD 零功耗)
-    const char *hint = "休眠中 按键唤醒";
+    // 休眠提示画在底部状态栏位置、居中,不遮挡/清空上方画面
+    const char *hint = "休眠中 按BOOT键唤醒";
     u8g2_SetDrawColor(g_u8g2, 0);
     u8g2_DrawHLine(g_u8g2, 0, STATUS_Y, SCREEN_W);
     u8g2_SetDrawColor(g_u8g2, 1);
@@ -111,18 +83,18 @@ static void enterLightSleep(void) {
 
     // 休眠屏保策略:保留画面(开)时让显示相关 GPIO 在休眠期间保持原状态,
     // 防止 GPIO 隔离工作区把面板 RST 浮空导致复位清空 GRAM;白屏(关)则恢复隔离(默认)。
-    const gpio_num_t display_pins[] = {RLCD_RST_PIN, RLCD_CS_PIN, RLCD_DC_PIN,
-                                       RLCD_SCK_PIN, RLCD_MOSI_PIN};
+    const gpio_num_t display_pins[] = {TFT_RST_PIN, TFT_CS_PIN, TFT_DC_PIN,
+                                       TFT_SCLK_PIN, TFT_MOSI_PIN, TFT_BL_PIN};
     bool retain = g_settings.sleepScreen();
     for (size_t i = 0; i < sizeof(display_pins) / sizeof(display_pins[0]); i++) {
         if (retain) gpio_sleep_sel_dis(display_pins[i]);
         else        gpio_sleep_sel_en(display_pins[i]);
     }
 
-    // 完全关断 BLE 射频(若键盘已连接,deinit 会同时断开 HID 连接)
-    g_bt.deinit();
+    // 挂起键盘扫描任务,键盘 GPIO 不再变化
+    g_keyboard.deinit();
 
-    // 物理按键唤醒:两键都是 RTC GPIO、内部上拉、低电平有效,任意按下唤醒
+    // BOOT 键(GPIO0)是 RTC GPIO、内部上拉、低电平有效,按下唤醒
     esp_err_t ext1_ret = esp_sleep_enable_ext1_wakeup(SLEEP_WAKE_MASK, ESP_EXT1_WAKEUP_ANY_LOW);
     if (ext1_ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_sleep_enable_ext1_wakeup failed: %d", ext1_ret);
@@ -144,22 +116,26 @@ static void enterLightSleep(void) {
     u8g2_InitDisplay(g_u8g2);
     u8g2_SetPowerSave(g_u8g2, 0);
     ui_invalidate_snapshot();
+    // InitDisplay 会复位为 INVON(白底),dark mode 开启时需重新应用
+    if (g_lcd_dev) {
+        u8g2_st7789_set_dark_mode(g_lcd_dev, g_settings.getString("dark_mode") == "1");
+    }
 
-    // 软件时钟在休眠期间冻结,从电池供电的 RTC 重同步,保证日记时间戳正确
+    // 软件时钟在休眠期间冻结,从持久 RTC 重同步,保证日记时间戳正确
     time_t t = g_rtc.getTime();
     if (t > 0) {
         struct timeval tv = {(time_t)t, 0};
         settimeofday(&tv, NULL);
     }
 
-    // 后台重新 init BLE + 自动重连键盘(即使休眠失败也恢复 BT 栈)
-    xTaskCreatePinnedToCore(btInitTask, "bt_init", 8192, NULL, 5, NULL, 1);
+    // 恢复键盘扫描任务
+    g_keyboard.resume();
 }
 
 static void checkLightSleep(AppState state) {
+    (void)state;
     if (!g_settings.autoSleep()) return;
     if (g_wifi.isConnected()) return;  // 网络操作中不休眠
-    if (state == APP_BT_MANAGE) return;  // 用户在蓝牙管理界面
 
     static int64_t s_last_wake_us = 0;
     int64_t now = esp_timer_get_time();
@@ -170,10 +146,10 @@ static void checkLightSleep(AppState state) {
         return;
     }
 
-    // 唤醒后 2 分钟 grace,覆盖 BLE 重连窗口 + 用户操作
+    // 唤醒后 2 分钟 grace,覆盖用户操作
     if (s_last_wake_us != 0 && (now - s_last_wake_us) < AUTO_SLEEP_GRACE_US) return;
 
-    // 键盘/按键空闲超过 10 分钟 → 进入休眠
+    // 键盘空闲超过 10 分钟 → 进入休眠
     if (now - s_last_activity_us >= AUTO_SLEEP_TIMEOUT_US) {
         enterLightSleep();
         s_last_wake_us = esp_timer_get_time();
@@ -184,7 +160,7 @@ static void checkLightSleep(AppState state) {
 // ── Application Main Loop ──────────────────────────────────────────────
 
 extern "C" void app_main() {
-    ESP_LOGI(TAG, "pjournal-esp32 v" PJOURNAL_VERSION " starting...");
+    ESP_LOGI(TAG, "pjournal-cardputer v" PJOURNAL_VERSION " starting...");
 
     // Initialize NVS
     esp_err_t ret = nvs_flash_init();
@@ -198,7 +174,7 @@ extern "C" void app_main() {
     }
 
     // Dynamic frequency scaling: CPU drops to 80MHz when idle (main loop delay),
-    // ramps back to 240MHz while WiFi/BT are active (they hold PM locks).
+    // ramps back to 240MHz while WiFi is active (holds PM locks).
     esp_pm_config_t pm_cfg = {
         .max_freq_mhz = 240,
         .min_freq_mhz = 80,
@@ -208,17 +184,50 @@ extern "C" void app_main() {
         ESP_LOGW(TAG, "esp_pm_configure failed");
     }
 
-    // Initialize buttons with pull-up for stable reading
-    gpio_reset_pin(PIN_USER_BTN);
-    gpio_set_direction(PIN_USER_BTN, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(PIN_USER_BTN, GPIO_PULLUP_ONLY);
+    // BOOT button (GPIO0) with pull-up for stable reading (also light-sleep wake)
     gpio_reset_pin(PIN_BOOT);
     gpio_set_direction(PIN_BOOT, GPIO_MODE_INPUT);
     gpio_set_pull_mode(PIN_BOOT, GPIO_PULLUP_ONLY);
 
+    // 字体 + 显示必须先于 SD 挂载:USB 模式需要屏显,且该模式不挂 FAT
+    g_font.begin();
+    g_font.setSize(22);
+    initDisplay();
+    ui_clear();
+    ui_commit();
+
+    // 键盘(纯 GPIO 扫描,不占 SPI;先于 SD,用于检测按住 E)
+    g_keyboard.init();
+
+    // ── 按住 E 开机 → USB 存储模式 ─────────────────────────────────────
+    // 检测窗口不显示任何提示,开机即黑屏直进应用(E 检测仍有效)
+    {
+        ui_clear();
+        ui_commit();
+
+        bool wantUsb = false;
+        int64_t deadline = esp_timer_get_time() + BOOT_E_DETECT_MS * 1000LL;
+        while (esp_timer_get_time() < deadline) {
+            uint8_t k = g_keyboard.readKey();
+            if (k == 'e' || k == 'E') { wantUsb = true; break; }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+        if (wantUsb) {
+            ESP_LOGI(TAG, "E held at boot, entering USB drive mode");
+            u8g2_st7789_set_backlight(g_lcd_dev, 255);  // USB 模式状态屏需要背光(默认关闭)
+            g_keyboard.deinit();
+            if (usb_drive_begin()) {
+                usb_drive_run();  // never returns
+            }
+            ESP_LOGE(TAG, "USB drive init failed, falling back to normal boot");
+            g_keyboard.resume();  // deinit() 已挂起扫描任务,init() 因队列存在会直接返回
+        }
+    }
+
     // Initialize SD card (needed before settings on SD)
     if (!g_journal.begin()) {
         ESP_LOGE(TAG, "SD card initialization failed! System halted.");
+        u8g2_st7789_set_backlight(g_lcd_dev, 255);  // 错误提示需要背光(默认关闭)
         ui_clear();
         ui_draw_text_centered(100, "SD卡初始化失败");
         ui_draw_text_centered(135, "请检查SD卡");
@@ -229,106 +238,107 @@ extern "C" void app_main() {
 
     // Initialize settings (stored on SD card)
     g_settings.begin();
+    // 快捷编辑模式跳过时间同步,开机以最短时间进入编辑器
+    g_quickEdit = g_settings.quickEditMode();
 
-    // Initialize RTC
-    if (g_rtc.begin()) {
-        ESP_LOGI(TAG, "PCF85063 RTC initialized");
-    } else {
-        ESP_LOGW(TAG, "PCF85063 RTC not available or invalid time");
+    // 应用显示模式(黑底白字/白底黑字),以正确底色画出首帧后再开背光,避免开机白屏
+    if (g_lcd_dev) {
+        u8g2_st7789_set_dark_mode(g_lcd_dev, g_settings.getString("dark_mode") == "1");
+    }
+    ui_clear();
+    ui_commit();
+    u8g2_st7789_set_backlight(g_lcd_dev, 255);
+
+    // 快捷编辑模式不需要时间,跳过 RTC 初始化与时间同步,最快进入编辑器
+    if (!g_quickEdit) {
+        // Initialize soft RTC
+        if (g_rtc.begin()) {
+            ESP_LOGI(TAG, "Soft RTC initialized");
+        } else {
+            ESP_LOGW(TAG, "Soft RTC not available or invalid time");
+        }
     }
 
     // Initialize battery ADC
     battery_init();
 
-    // Initialize font renderer (default 22pt for non-editor screens)
-    g_font.begin();
-    g_font.setSize(22);
+    // 时间同步仅个人日记模式需要;快捷编辑跳过
+    if (!g_quickEdit) {
+        // Set timezone from settings (for local time display)
+        {
+            std::string tz = g_settings.timezone();
+            if (tz.empty()) tz = "CST-8";
+            setenv("TZ", tz.c_str(), 1);
+            tzset();
+        }
 
-    // Initialize display
-    initDisplay();
-    ui_clear();
-    ui_draw_text_centered(100, "个人日记");
-    char ver[32];
-    snprintf(ver, sizeof(ver), "v" PJOURNAL_VERSION);
-    ui_draw_text_centered(135, ver);
-    ui_commit();
-
-    // Initialize WiFi manager (但不自动连接)
-    // WiFi 将在需要时按需连接（WebDAV同步、Flomo发送、Deepseek提示生成等）
-
-    // Set timezone from settings (for local time display)
-    {
-        std::string tz = g_settings.timezone();
-        if (tz.empty()) tz = "CST-8";
-        setenv("TZ", tz.c_str(), 1);
-        tzset();
-    }
-
-    // Time sync: prefer RTC if its time is recent (>= July 2026), otherwise NTP
-    {
-        time_t rtcTime = g_rtc.getTime();
-        bool rtcRecent = (rtcTime >= 1782864000); // July 1, 2026 00:00:00 UTC
-
-        if (rtcRecent) {
-            struct timeval tv = {(time_t)rtcTime, 0};
-            settimeofday(&tv, NULL);
-            struct tm *tm = localtime(&rtcTime);
-            char ts[32];
-            strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
-            ESP_LOGI(TAG, "RTC time is recent, using directly: %s", ts);
-        } else {
-            ESP_LOGW(TAG, "RTC time (%lld) is before July 2026, attempting NTP sync...", (long long)rtcTime);
-            std::string ssid = g_settings.wifiSsid();
-            if (!ssid.empty()) {
-                std::string ntp = g_settings.ntpServer();
-                if (ntp.empty()) ntp = "pool.ntp.org";
-
-                ui_draw_text_centered(165, "正在同步时间...");
-                ui_commit();
-
-                std::string pass = g_settings.wifiPassword();
-                g_wifi.begin();
-                if (g_wifi.connect(ssid.c_str(), pass.c_str())) {
-                    vTaskDelay(pdMS_TO_TICKS(500));
-                    esp_sntp_stop();
-                    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-                    esp_sntp_setservername(0, ntp.c_str());
-                    esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
-                    esp_sntp_init();
-
-                    time_t now = 0;
-                    for (int i = 0; i < 100; i++) {
-                        vTaskDelay(pdMS_TO_TICKS(200));
-                        if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
-                            time(&now);
-                            break;
-                        }
-                    }
-                    if (now > 1782864000) {
-                        struct tm *tm = localtime(&now);
-                        char ts[32];
-                        strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
-                        ESP_LOGI(TAG, "NTP sync succeeded: %s", ts);
-                        g_rtc.setTime(now);
-                    } else {
-                        ESP_LOGW(TAG, "NTP sync timeout (%s)", ntp.c_str());
-                    }
-                    esp_sntp_stop();
-                } else {
-                    ESP_LOGW(TAG, "WiFi connection failed for NTP sync");
-                }
-                g_wifi.disconnect();
-            } else {
-                ESP_LOGW(TAG, "WiFi not configured, cannot NTP sync");
-            }
-            // Fallback: use whatever RTC has, even if old
-            if (rtcTime > 1704067200) {
+        // Time sync: prefer RTC if its time is recent (>= July 2026), otherwise NTP
+        {
+            time_t rtcTime = g_rtc.getTime();
+            bool rtcRecent = (rtcTime >= 1782864000); // July 1, 2026 00:00:00 UTC
+    
+            if (rtcRecent) {
                 struct timeval tv = {(time_t)rtcTime, 0};
                 settimeofday(&tv, NULL);
-                ESP_LOGW(TAG, "Fallback to RTC time");
+                struct tm *tm = localtime(&rtcTime);
+                char ts[32];
+                strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
+                ESP_LOGI(TAG, "RTC time is recent, using directly: %s", ts);
+            } else {
+                ESP_LOGW(TAG, "RTC time (%lld) is before July 2026, attempting NTP sync...", (long long)rtcTime);
+                std::string ssid = g_settings.wifiSsid();
+                if (!ssid.empty()) {
+                    std::string ntp = g_settings.ntpServer();
+                    if (ntp.empty()) ntp = "pool.ntp.org";
+    
+                    ui_clear();
+                    ui_draw_text_centered(90, "正在同步时间...");
+                    ui_commit();
+    
+                    std::string pass = g_settings.wifiPassword();
+                    g_wifi.begin();
+                    if (g_wifi.connect(ssid.c_str(), pass.c_str())) {
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                        esp_sntp_stop();
+                        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+                        esp_sntp_setservername(0, ntp.c_str());
+                        esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+                        esp_sntp_init();
+    
+                        time_t now = 0;
+                        for (int i = 0; i < 100; i++) {
+                            vTaskDelay(pdMS_TO_TICKS(200));
+                            if (esp_sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED) {
+                                time(&now);
+                                break;
+                            }
+                        }
+                        if (now > 1782864000) {
+                            struct tm *tm = localtime(&now);
+                            char ts[32];
+                            strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm);
+                            ESP_LOGI(TAG, "NTP sync succeeded: %s", ts);
+                            g_rtc.setTime(now);
+                        } else {
+                            ESP_LOGW(TAG, "NTP sync timeout (%s)", ntp.c_str());
+                        }
+                        esp_sntp_stop();
+                    } else {
+                        ESP_LOGW(TAG, "WiFi connection failed for NTP sync");
+                    }
+                    g_wifi.disconnect();
+                } else {
+                    ESP_LOGW(TAG, "WiFi not configured, cannot NTP sync");
+                }
+                // Fallback: use whatever RTC has, even if old
+                if (rtcTime > 1704067200) {
+                    struct timeval tv = {(time_t)rtcTime, 0};
+                    settimeofday(&tv, NULL);
+                    ESP_LOGW(TAG, "Fallback to RTC time");
+                }
             }
         }
-    }
+    }  // !g_quickEdit: 个人日记模式时间同步结束
 
     // Seed RNG with hardware random for prompt selection
     srand(esp_random());
@@ -336,43 +346,62 @@ extern "C" void app_main() {
     // Initialize IME
     auto &ime = IME::getInstance();
     ime.begin();
-    // Set candidate page size based on default 22pt font
+    // Candidate page size based on the fixed 22pt font
     ime.setPageSize(7);
-    // 候选字按显示宽度动态分页: 宽度回调复用当前字体, 可用宽度与各界面
-    // 候选行渲染的 curW+partW+8>SCREEN_W 截断阈值一致(SCREEN_W=400)。
+    // 候选字按显示宽度动态分页: 宽度回调复用当前字体, 可用宽度与候选行渲染的
+    // curW+partW+8>SCREEN_W 截断阈值一致。
     ime.setWidthFn([](const char *s) -> int { return g_font.textWidth(s); });
     ime.setDisplayWidth(SCREEN_W - 8);
 
-    // Initialize Bluetooth keyboard in background (non-blocking, faster boot)
-    xTaskCreatePinnedToCore(btInitTask, "bt_init", 8192, NULL, 5, NULL, 1);
+    // 清掉 E 检测窗口与挂载/同步期间积累的按键
+    g_keyboard.flushKeys();
 
     ESP_LOGI(TAG, "Ready!");
 
     // ── App State Machine ────────────────────────────────────────────────
-    // Always start at main screen; BT connects in background
-    AppState currentState = APP_MAIN;
+    // 编辑模式:个人日记(默认) / 快捷编辑(重启生效);g_quickEdit 已在设置加载后赋值
+    g_quickFile = g_settings.quickFile();
+    if (g_quickEdit) g_journal.ensureQuickFiles();  // 预创建 SD 根目录 0-9.txt
+
+    AppState currentState;
     ScreenContext ctx;
     static AppState inspReturnTo = APP_MAIN;
+    if (g_quickEdit) {
+        // 快捷编辑:开机直接进编辑器,Esc ↔ 设置面板
+        currentState = APP_EDITOR;
+        ctx.promptMode = false;
+        ctx.promptText = "";
+        ctx.editContent = "";
+        ctx.editFilename = "";
+        ctx.prevState = APP_SETTINGS;
+    } else {
+        currentState = APP_MAIN;
+        ctx.prevState = APP_MAIN;
+    }
 
-    // 物理按键状态(时间制,不依赖主循环节拍)
-    struct BtnState {
-        int64_t press_start_us = 0;   // 当前按下起始时刻(0=未按下)
-        int64_t last_release_us = 0;  // 上次松开时刻(双击窗口基准)
-        bool is_double = false;       // 本次按下为双击第二下
-        bool long_fired = false;      // 本次按下已触发长按
-    } btn_user, btn_boot;
+    // BOOT 键状态(时间制,不依赖主循环节拍): 长按(≥1s)松开进入休眠,单击无动作
+    struct { int64_t press_start_us = 0; bool long_fired = false; } btn_boot;
+    #define PIN_LOW(gpio) (gpio_get_level(gpio) == 0)
 
     while (currentState != APP_QUIT) {
         checkLightSleep(currentState);
 
-        int key = g_bt.readKey();
+        int key = g_keyboard.readKey();
         if (key < 0) key = 0;
 
-        // BLE 键盘输入视为活动,重置空闲休眠计时
+        // ` 在非编辑界面充当 Esc 返回(编辑器/各输入子界面保留为字符)
+        if (key == '`' && currentState != APP_EDITOR
+            && !(currentState == APP_OUTLINE && outline_in_edit_mode())
+            && !(currentState == APP_SETTINGS && settings_in_edit_mode())
+            && !(currentState == APP_INSPIRATION && inspiration_in_edit_mode())) {
+            key = 0x1b;
+        }
+
+        // 键盘输入视为活动,重置空闲休眠计时
         if (key > 0) s_last_activity_us = esp_timer_get_time();
 
-        // Check for key repeat events
-        g_bt.checkKeyRepeat();
+        // Key repeat (no-op: 连击由扫描任务产生)
+        g_keyboard.checkKeyRepeat();
 
         // Global Ctrl+Space IME toggle (only for editor)
         if (key == KEY_IME_TOGGLE && currentState == APP_EDITOR) {
@@ -395,169 +424,24 @@ extern "C" void app_main() {
             key = 0;
         }
 
-        // ── BT auto-reconnect retry ──────────────────────────────────────
-        // 多设备: 断线后按最近使用顺序轮询已配对设备, 谁在线连谁
-        // 面板内暂停自动重连, 避免干扰扫描/管理
-        {
-            static int64_t last_bt_retry_us = 0;
-            static int64_t last_bt_reload_us = 0;
-            static bool bt_list_loaded = false;
-            static int bt_try_idx = 0;
-            static bool bt_was_connected = false;
-
-            if (currentState == APP_BT_MANAGE) {
-                // 用户正在管理面板, 暂停自动重连
-                bt_was_connected = false;
-                last_bt_retry_us = 0;
-            } else if (g_bt.isConnected()) {
-                if (!bt_was_connected) {
-                    ESP_LOGI(TAG, "Bluetooth connected, stopping retry logic");
-                }
-                bt_was_connected = true;
-                last_bt_retry_us = 0;
-            } else {
-                if (bt_was_connected) {
-                    ESP_LOGW(TAG, "Bluetooth disconnected");
-                    bt_was_connected = false;
-                }
-
-                if (!bt_was_connected) {
-                    // Periodically reload paired device list (反映面板增删/新连接)
-                    if (g_bt.isInitialized()) {
-                        int64_t now_us = esp_timer_get_time();
-                        if (last_bt_reload_us == 0 || (now_us - last_bt_reload_us) > 30000000) {
-                            last_bt_reload_us = now_us;
-                            g_bt.loadPairedDevices();
-                            bt_list_loaded = g_bt.pairedDeviceCount() > 0;
-                            bt_try_idx = 0;
-                            if (bt_list_loaded)
-                                ESP_LOGI(TAG, "Loaded %d paired device(s)", g_bt.pairedDeviceCount());
-                        }
-                    }
-
-                    if (bt_list_loaded && !g_bt.isConnecting()) {
-                        int64_t now_us = esp_timer_get_time();
-                        if (last_bt_retry_us == 0 || (now_us - last_bt_retry_us) > 2000000) {
-                            last_bt_retry_us = now_us;
-                            int n = g_bt.pairedDeviceCount();
-                            if (n > 0) {
-                                if (bt_try_idx >= n) bt_try_idx = 0;
-                                const BtPairedDevice *p = g_bt.getPairedDevice(bt_try_idx);
-                                ESP_LOGI(TAG, "BT auto-reconnect retry %d/%d...",
-                                         bt_try_idx + 1, n);
-                                g_bt.connectBDA(p->bda, p->addr_type);
-                                bt_try_idx = (bt_try_idx + 1) % n;
-                            }
-                        }
-                    }
-                }
-            }
+        // Global Ctrl+I → inspiration panel (works from any screen including editor)
+        if (key == KEY_CTRL_I && currentState != APP_INSPIRATION) {
+            inspReturnTo = currentState;
+            currentState = APP_INSPIRATION;
+            key = 0;
         }
 
-        // ── Physical button handling ──────────────────────────────────────
-        // With pull-up: 1=released, 0=pressed (active LOW)
-        #define PIN_LOW(gpio) (gpio_get_level(gpio) == 0)
-
-        // 单击动作在双击窗口结束后才生效(防止双击第一下误发导航键,仅蓝牙管理面板有双击动作)
-        if (s_pending_single.key != 0) {
-            if (esp_timer_get_time() - s_pending_single.queued_us >= BTN_DOUBLE_WINDOW_US) {
-                if (currentState == APP_BT_MANAGE ||
-                    (currentState == APP_GTD && screen_gtd_accept_physical_buttons())) {
-                    key = s_pending_single.key;
-                }
-                s_pending_single.key = 0;
-            }
-        }
-
-        // USER button (GPIO 18)
-        {
-            bool held = PIN_LOW(PIN_USER_BTN);
-            if (held) {
-                if (btn_user.press_start_us == 0) {
-                    btn_user.press_start_us = esp_timer_get_time();
-                    s_last_activity_us = btn_user.press_start_us;
-                    // 上次松开后的双击窗口内再次按下 → 双击第二下,取消第一下的单击排队
-                    btn_user.is_double = (btn_user.last_release_us > 0 &&
-                        (btn_user.press_start_us - btn_user.last_release_us) < BTN_DOUBLE_WINDOW_US);
-                    if (btn_user.is_double) s_pending_single.key = 0;
-                }
-                if (!btn_user.long_fired &&
-                    (esp_timer_get_time() - btn_user.press_start_us) >= BTN_LONG_PRESS_US) {
-                    btn_user.long_fired = true;
-                    s_pending_single.key = 0;
-                    if (currentState == APP_BT_MANAGE) {
-                        // 蓝牙管理面板: 长按→连接选中设备(不经过短按,避免错位)
-                        key = 0x0A;
-                    } else if (currentState == APP_GTD && screen_gtd_accept_physical_buttons()) {
-                        // GTD任务管理: 长按→Tab 切换标签
-                        key = '\t';
-                    } else {
-                        currentState = APP_BT_MANAGE;
-                        key = 0;
-                    }
-                }
-            } else {
-                if (btn_user.press_start_us != 0) {
-                    int64_t now = esp_timer_get_time();
-                    int64_t dur = now - btn_user.press_start_us;
-                    btn_user.press_start_us = 0;
-                    if (dur >= BTN_DEBOUNCE_US && !btn_user.long_fired) {
-                        bool gtdBrowse = (currentState == APP_GTD && screen_gtd_accept_physical_buttons());
-                        bool gtdProjList = (currentState == APP_GTD && screen_gtd_in_project_list());
-                        if (currentState == APP_BT_MANAGE && btn_user.is_double) {
-                            // 双击: 管理模式→添加, 扫描模式→返回
-                            key = screen_bt_manage_scan_mode() ? 0x1B : 'a';
-                        } else if (currentState == APP_BT_MANAGE) {
-                            // 单击: 上移,等待双击窗口确认非双击后生效
-                            s_pending_single.key = KEY_UP;
-                            s_pending_single.queued_us = now;
-                        } else if (currentState == APP_EDITOR && btn_user.is_double) {
-                            // 编辑器双击: 进入语音听写(会话在screen_voice_init启动)
-                            currentState = APP_VOICE;
-                            key = 0;
-                        } else if (currentState == APP_VOICE && btn_user.is_double) {
-                            // 语音听写双击: 注入ESC,由voice屏停止会话并返回编辑器
-                            key = 0x1B;
-                        } else if (gtdBrowse && btn_user.is_double) {
-                            // GTD任务管理双击: 项目列表→进入选中项目; 平铺/项目树→切换任务状态
-                            key = gtdProjList ? 0x0A : ' ';
-                        } else if (gtdBrowse) {
-                            // GTD任务管理单击: 上移,等待双击窗口确认非双击后生效
-                            s_pending_single.key = KEY_UP;
-                            s_pending_single.queued_us = now;
-                        }
-                    }
-                    btn_user.last_release_us = now;
-                    btn_user.long_fired = false;
-                    btn_user.is_double = false;
-                }
-            }
-        }
-
-        // BOOT button (GPIO 0)
+        // ── BOOT button (GPIO0) ──────────────────────────────────────────
         {
             bool held = PIN_LOW(PIN_BOOT);
             if (held) {
                 if (btn_boot.press_start_us == 0) {
                     btn_boot.press_start_us = esp_timer_get_time();
                     s_last_activity_us = btn_boot.press_start_us;
-                    btn_boot.is_double = (btn_boot.last_release_us > 0 &&
-                        (btn_boot.press_start_us - btn_boot.last_release_us) < BTN_DOUBLE_WINDOW_US);
-                    if (btn_boot.is_double) s_pending_single.key = 0;
                 }
                 if (!btn_boot.long_fired &&
                     (esp_timer_get_time() - btn_boot.press_start_us) >= BTN_LONG_PRESS_US) {
-                    if (currentState == APP_BT_MANAGE) {
-                        // 长按→Esc(管理模式退出/扫描模式返回)
-                        btn_boot.long_fired = true;
-                        s_pending_single.key = 0;
-                        key = 0x1B;
-                    } else if (currentState == APP_GTD && screen_gtd_accept_physical_buttons()) {
-                        // GTD任务管理: BOOT 长按不动作,避免面板内误触发休眠
-                        btn_boot.long_fired = true;
-                        s_pending_single.key = 0;
-                    }
-                    // 其他界面: 长按 BOOT 在松开时进入休眠(单击不再休眠)
+                    btn_boot.long_fired = true;
                 }
             } else {
                 // 唤醒按键可能已在扫描间隙松开,直接清除挂起的唤醒保护标记
@@ -568,47 +452,20 @@ extern "C" void app_main() {
                     int64_t now = esp_timer_get_time();
                     int64_t dur = now - btn_boot.press_start_us;
                     btn_boot.press_start_us = 0;
-                    if (dur >= BTN_DEBOUNCE_US && !btn_boot.long_fired) {
-                        if (currentState == APP_BT_MANAGE) {
-                            if (btn_boot.is_double) {
-                                // 双击: 管理模式→删除, 扫描模式→返回
-                                key = screen_bt_manage_scan_mode() ? 0x1B : 'd';
-                            } else {
-                                // 单击: 下移,等待双击窗口确认非双击后生效
-                                s_pending_single.key = KEY_DOWN;
-                                s_pending_single.queued_us = now;
-                            }
-                        } else if (currentState == APP_GTD && screen_gtd_accept_physical_buttons()) {
-                            if (btn_boot.is_double) {
-                                // GTD任务管理双击: 项目树→返回项目选择菜单; 其他→无动作
-                                screen_gtd_physical_double_boot();
-                            } else {
-                                // GTD任务管理单击: 下移(不触发休眠)
-                                s_pending_single.key = KEY_DOWN;
-                                s_pending_single.queued_us = now;
-                            }
-                        } else if (s_boot_wake_release_pending) {
+                    if (dur >= BTN_DEBOUNCE_US && btn_boot.long_fired) {
+                        if (s_boot_wake_release_pending) {
                             // 这是 BOOT 唤醒按键的释放,不进入休眠,避免唤醒即再睡
                             s_boot_wake_release_pending = false;
-                        } else if (dur >= BTN_LONG_PRESS_US) {
+                        } else {
                             // 长按 BOOT → 进入休眠(单击不再休眠)
                             enterLightSleep();
                             key = 0;  // 丢弃休眠前遗留的按键
                             s_last_activity_us = esp_timer_get_time();
                         }
                     }
-                    btn_boot.last_release_us = now;
                     btn_boot.long_fired = false;
-                    btn_boot.is_double = false;
                 }
             }
-        }
-
-        // Global Ctrl+I → inspiration panel (works from any screen including editor)
-        if (key == KEY_CTRL_I && currentState != APP_INSPIRATION) {
-            inspReturnTo = currentState;
-            currentState = APP_INSPIRATION;
-            key = 0;
         }
 
         switch (currentState) {
@@ -630,7 +487,6 @@ extern "C" void app_main() {
             if (key > 0) currentState = screen_editor_handle(key, ctx);
             else { screen_editor_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
             // Preserve editorInited when going to inspiration via Ctrl+I (editor should resume)
-            // Reset editorInited when editor is opened FROM another screen (new content)
             if (currentState != APP_EDITOR && currentState != APP_SYNC_SEND_FLOMO) {
                 if (currentState == APP_INSPIRATION) {
                     // Ctrl+I from editor → preserve editor state
@@ -672,16 +528,6 @@ extern "C" void app_main() {
             break;
         }
 
-        case APP_BT_MANAGE: {
-            g_font.setSize(22);
-            static bool btInited = false;
-            if (!btInited) { screen_bt_manage_init(); btInited = true; }
-            if (key > 0) currentState = screen_bt_manage_handle(key, ctx);
-            else { screen_bt_manage_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(100)); }
-            if (currentState != APP_BT_MANAGE) btInited = false;
-            break;
-        }
-
         case APP_FILE_MANAGER: {
             g_font.setSize(22);
             static bool fileMgrInited = false;
@@ -689,17 +535,6 @@ extern "C" void app_main() {
             if (key > 0) currentState = screen_file_manager_handle(key, ctx);
             else { screen_file_manager_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(200)); }
             if (currentState != APP_FILE_MANAGER) fileMgrInited = false;
-            break;
-        }
-
-        case APP_GTD: {
-            g_font.setSize(22);
-            IME::getInstance().setPageSize(7);
-            static bool gtdInited = false;
-            if (!gtdInited) { screen_gtd_init(); gtdInited = true; }
-            if (key > 0) currentState = screen_gtd_handle(key, ctx);
-            else { screen_gtd_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(100)); }
-            if (currentState != APP_GTD) gtdInited = false;
             break;
         }
 
@@ -857,16 +692,6 @@ extern "C" void app_main() {
             break;
         }
 
-        case APP_VOICE: {
-            g_font.setSize(g_settings.fontSize());
-            static bool voiceInited = false;
-            if (!voiceInited) { screen_voice_init(); voiceInited = true; }
-            if (key > 0) currentState = screen_voice_handle(key, ctx);
-            else { screen_voice_handle(0, ctx); vTaskDelay(pdMS_TO_TICKS(50)); }
-            if (currentState != APP_VOICE) voiceInited = false;
-            break;
-        }
-
         default:
             currentState = APP_MAIN;
             break;
@@ -878,9 +703,6 @@ extern "C" void app_main() {
             ctx.statusMessage.clear();
             vTaskDelay(pdMS_TO_TICKS(1500));
         }
-
-        // Voice session WiFi idle: 5 min after the session ends, shut the radio.
-        g_voice.update();
     }
 
     ESP_LOGI(TAG, "Goodbye.");

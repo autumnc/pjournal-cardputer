@@ -134,6 +134,24 @@ static struct {
     std::set<int> pickerToggled;
 } g;
 
+// 大纲是否处于文本输入子界面(此时 ` 应作为字符,而非"返回")
+bool outline_in_edit_mode() {
+    switch (g.mode) {
+    case M_ADD_PROJECT:
+    case M_ADD_HEADING:
+    case M_ADD_SUB:
+    case M_FILTER:
+    case M_EDIT_NOTE:
+    case M_EDIT_NOTE_ML:
+    case M_ADD_TAG:
+    case M_RENAME_TAG:
+    case M_PICKER:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 static std::vector<std::string> listProjects() {
@@ -601,7 +619,7 @@ static void drawHelp() {
     else if (g.mode == M_HELP && g.helpPrevMode == M_DETAIL) drawOutlineDetail();
     else drawOutline();
 
-    int boxW = 300, boxH = 250;
+    int boxW = SCREEN_W - 8, boxH = SCREEN_H - 8;
     int boxX = (SCREEN_W - boxW) / 2;
     int boxY = (SCREEN_H - boxH) / 2;
     u8g2_SetDrawColor(g_u8g2, 1);
@@ -703,9 +721,9 @@ static void drawOutlineDetail() {
 }
 
 static void drawSummary() {
-    int boxX = (SCREEN_W - 300) / 2;
-    int boxY = (SCREEN_H - 250) / 2;
-    int boxW = 300, boxH = 250;
+    int boxX = (SCREEN_W - (SCREEN_W - 8)) / 2;
+    int boxY = (SCREEN_H - (SCREEN_H - 8)) / 2;
+    int boxW = SCREEN_W - 8, boxH = SCREEN_H - 8;
     u8g2_SetDrawColor(g_u8g2, 1);
     u8g2_DrawBox(g_u8g2, boxX, boxY, boxW, boxH);
     u8g2_SetDrawColor(g_u8g2, 0);
@@ -720,7 +738,7 @@ static void drawSummary() {
 
     // Separator under title
     u8g2_DrawHLine(g_u8g2, boxX + 4, y, boxW - 8);
-    y += 8 + 15;
+    y += 8;
 
     // Status
     std::string st = node["status"].asString("draft");
@@ -730,13 +748,13 @@ static void drawSummary() {
     char line[128];
     snprintf(line, sizeof(line), "状态: %s", stDisp);
     ui_draw_text(textX, y, line, false);
-    y += LINE_SPACING;
+    y += FONT_H;
 
     // Keywords
     std::string kw = node["keywords"].asString();
     snprintf(line, sizeof(line), "关键词: %s", kw.empty() ? "(无)" : kw.c_str());
     ui_draw_text(textX, y, line, false);
-    y += LINE_SPACING;
+    y += FONT_H;
 
     // Tags
     auto &tt = node["tags"];
@@ -1320,8 +1338,8 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             drawOutlineDetailInner();
             int n = (int)g.pickerOpts.size();
             if (n == 0) { ui_commit(); return APP_OUTLINE; }
-            int maxVis = 6;
-            int boxW = 250;
+            int maxVis = 3;
+            int boxW = SCREEN_W - 16;
             int boxH = maxVis * LINE_SPACING + 24 + 15;
             int boxX = (SCREEN_W - boxW) / 2;
             int boxY = (SCREEN_H - boxH) / 2;
@@ -1798,10 +1816,10 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             g_ime.setActive(false);
             ctx.nextState = APP_MAIN; return APP_MAIN;
         }
-        if (key == 'j' || key == KEY_DOWN) {
+        if (key == 'j' || key == '.' || key == KEY_DOWN) {
             if (g.sel < (int)g.projects.size() - 1) g.sel++;
         }
-        if (key == 'k' || key == KEY_UP) {
+        if (key == 'k' || key == ';' || key == KEY_UP) {
             if (g.sel > 0) g.sel--;
         }
         if (key == 'n' || key == 'N') {
@@ -1867,10 +1885,10 @@ AppState screen_outline_handle(int key, ScreenContext &ctx) {
             }
         }
 
-        if (key == KEY_UP) {
+        if (key == KEY_UP || key == ';') {
             if (g.sel > 0) g.sel--;
         }
-        if (key == KEY_DOWN) {
+        if (key == KEY_DOWN || key == '.') {
             int maxIdx = g.filterText.empty() ? (int)g.nodeCount : (int)g_filteredIdx.size();
             if (g.sel < maxIdx - 1) g.sel++;
         }
